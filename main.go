@@ -46,6 +46,9 @@ type Store struct {
 	SubscriptionURLs []string `json:"subscription_urls"`
 	Mode             string   `json:"mode"`
 	ProxyPort        int      `json:"proxy_port"`
+	SelectedNode     string   `json:"selected_node"`
+	UpdateHours      int      `json:"update_hours"`
+	LogLevel         string   `json:"log_level"`
 }
 
 func parseSubscription(raw string) []Node {
@@ -240,6 +243,14 @@ func config(s Store) map[string]any {
 	if len(s.Nodes) > 0 {
 		proxy = s.Nodes[0].ID
 	}
+	if s.SelectedNode != "" {
+		for _, n := range s.Nodes {
+			if n.ID == s.SelectedNode {
+				proxy = n.ID
+				break
+			}
+		}
+	}
 	rules := []any{map[string]any{"ip_is_private": true, "outbound": "direct"}, map[string]any{"rule_set": []string{"geosite-ads"}, "outbound": "block"}}
 	ruleSets := []any{map[string]any{"type": "remote", "tag": "geosite-ads", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs", "download_detour": "direct"}}
 	final := proxy
@@ -260,7 +271,11 @@ func config(s Store) map[string]any {
 	if tproxyEnabled {
 		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": tproxyPort})
 	}
-	return map[string]any{"log": map[string]any{"level": "info"}, "inbounds": inbounds, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}}
+	level := s.LogLevel
+	if level == "" {
+		level = "info"
+	}
+	return map[string]any{"log": map[string]any{"level": level}, "inbounds": inbounds, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}}
 }
 func writeConfig(s Store) error {
 	b, _ := json.MarshalIndent(config(s), "", "  ")
@@ -372,6 +387,38 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(s)
+	case "/api/node/select":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ ID string }
+		json.NewDecoder(r.Body).Decode(&v)
+		found := false
+		for _, n := range s.Nodes {
+			if n.ID == v.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "node not found", 404)
+			return
+		}
+		s.SelectedNode = v.ID
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := save(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := restartProxy(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
 	case "/api/subscription":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -443,6 +490,44 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"cleared": true})
+	case "/api/subscription/update":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		if err := updateSubscriptions(); err != nil {
+			http.Error(w, err.Error(), 502)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"updated": true})
+	case "/api/subscription/schedule":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ Hours int }
+		if json.NewDecoder(r.Body).Decode(&v) != nil || v.Hours < 1 || v.Hours > 168 {
+			http.Error(w, "hours must be 1-168", 400)
+			return
+		}
+		s.UpdateHours = v.Hours
+		if err := save(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		dir := "/etc/systemd/system/armwall-subscription-update.timer.d"
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		override := fmt.Sprintf("[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=%dh\n", v.Hours)
+		if err := os.WriteFile(filepath.Join(dir, "interval.conf"), []byte(override), 0644); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		exec.Command("systemctl", "daemon-reload").Run()
+		exec.Command("systemctl", "restart", "armwall-subscription-update.timer").Run()
+		json.NewEncoder(w).Encode(s)
 	case "/api/mode":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -501,7 +586,50 @@ func api(w http.ResponseWriter, r *http.Request) {
 	case "/api/service/status":
 		run(w, "systemctl", "is-active", "armwall-sing-box.service")
 	case "/api/logs":
+		if r.URL.Query().Get("download") == "1" {
+			w.Header().Set("Content-Disposition", "attachment; filename=armwall.log")
+		}
 		run(w, "journalctl", "-u", "armwall-sing-box.service", "-n", "120", "--no-pager")
+	case "/api/log/level":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ Level string }
+		json.NewDecoder(r.Body).Decode(&v)
+		if v.Level != "trace" && v.Level != "debug" && v.Level != "info" && v.Level != "warn" && v.Level != "error" {
+			http.Error(w, "invalid level", 400)
+			return
+		}
+		s.LogLevel = v.Level
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		save(s)
+		if err := restartProxy(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/network/test":
+		targets := map[string]string{"google": "https://www.google.com/generate_204", "youtube": "https://www.youtube.com/generate_204", "github": "https://github.com/", "facebook": "https://www.facebook.com/"}
+		name := r.URL.Query().Get("target")
+		target, ok := targets[name]
+		if !ok {
+			http.Error(w, "invalid target", 400)
+			return
+		}
+		transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", proxyPort)})}
+		client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+		start := time.Now()
+		resp, err := client.Get(target)
+		if err != nil {
+			http.Error(w, err.Error(), 502)
+			return
+		}
+		resp.Body.Close()
+		json.NewEncoder(w).Encode(map[string]any{"target": name, "status": resp.StatusCode, "ms": time.Since(start).Milliseconds()})
 	case "/api/gateway/status":
 		run(w, "/usr/local/bin/armwall-gateway", "status")
 	case "/api/gateway/enable":
@@ -672,5 +800,5 @@ var indexHTML = `<!doctype html><html><head><meta charset="utf-8"><title>ArmWall
 
 var indexHTML2 = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ArmWall</title><style>
 :root{font:14px system-ui,sans-serif;color:#202735;background:#eef1f5}*{box-sizing:border-box}body{margin:0}.top{height:58px;background:#172335;color:#fff;display:flex;align-items:center;padding:0 24px;gap:28px}.brand{font-size:20px;font-weight:650}.top small{color:#aebbd0}.layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:calc(100vh - 58px)}aside{background:#fff;border-right:1px solid #d9dee7;padding:18px 12px}aside button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:11px 13px;color:#4b5667;border-radius:5px;cursor:pointer}aside button.active,aside button:hover{background:#e8edf6;color:#1c4c98;font-weight:600}.main{padding:24px;max-width:1200px;width:100%}.view{display:none}.view.active{display:block}.title{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}.title h1{font-size:23px;margin:0}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{background:#fff;border:1px solid #d9dee7;border-radius:6px;padding:17px}.card h3{margin:0 0 12px;font-size:15px}.metric{font-size:25px;font-weight:650}.muted{color:#687487}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}label{display:block;color:#5c6879;font-size:13px;margin:12px 0 5px}input,select,textarea{border:1px solid #cbd3df;border-radius:4px;padding:9px;background:#fff;min-width:180px}textarea{width:100%;min-height:85px}button.primary,button.danger{border:0;border-radius:4px;padding:9px 14px;color:#fff;cursor:pointer}button.primary{background:#2765b8}button.danger{background:#b84a4a}table{border-collapse:collapse;width:100%;background:#fff}th,td{padding:10px;border-bottom:1px solid #e5e8ee;text-align:left}th{background:#f7f8fa;color:#566275;font-weight:600}pre{white-space:pre-wrap;background:#172335;color:#d8e2f2;padding:12px;border-radius:4px;min-height:50px}.status{display:inline-block;border-radius:10px;padding:3px 9px;background:#e4f5e9;color:#18753a;font-size:12px}@media(max-width:760px){.layout{grid-template-columns:1fr}aside{display:flex;overflow:auto;border-right:0;border-bottom:1px solid #d9dee7}.grid{grid-template-columns:1fr}.main{padding:15px}}
-</style></head><body><header class="top"><span class="brand">ArmWall</span><small>Armbian proxy gateway</small><span style="margin-left:auto" id="badge">未连接</span></header><div class="layout"><aside><button class="active" data-tab="dashboard">概览</button><button data-tab="nodes">节点管理</button><button data-tab="subscriptions">订阅管理</button><button data-tab="routing">分流与 DNS</button><button data-tab="service">服务与组件</button><button data-tab="logs">运行日志</button></aside><main class="main"><section id="dashboard" class="view active"><div class="title"><h1>概览</h1><button class="primary" onclick="service('start')">启动 / 重启</button></div><div class="grid"><div class="card"><h3>代理服务</h3><div class="metric" id="svc">检查中</div><p class="muted">mixed SOCKS5 / HTTP · 11080</p></div><div class="card"><h3>节点数量</h3><div class="metric" id="nodeCount">-</div><p class="muted">当前配置中的出站节点</p></div><div class="card"><h3>运行模式</h3><div class="metric" id="modeText">-</div><p class="muted">可在“分流与 DNS”中调整</p></div></div><div class="card" style="margin-top:14px"><h3>快速连接</h3><p>SOCKS5 / HTTP mixed：<input id="proxyPort" type="number" value="11080" style="min-width:100px"><button class="primary" onclick="savePort()">应用端口</button></p><p class="muted">透明网关端口：11081（需要手动启用 nftables 网关规则）</p></div></section><section id="nodes" class="view"><div class="title"><h1>节点管理</h1><button class="primary" onclick="document.getElementById('nodeForm').hidden=!document.getElementById('nodeForm').hidden">添加节点</button></div><div class="card" id="nodeForm" hidden><div class="row"><input id="nName" placeholder="备注名称"><select id="nType"><option>vless</option><option>trojan</option><option>hysteria2</option><option>anytls</option><option>vmess</option><option>naive</option></select><input id="nServer" placeholder="服务器地址"><input id="nPort" type="number" value="443"><input id="nUser" placeholder="用户名"><input id="nSecret" placeholder="密码 / UUID"><input id="nSNI" placeholder="TLS SNI"><input id="nHost" placeholder="HTTP Host"><input id="nPath" placeholder="路径"><input id="nALPN" placeholder="ALPN, 逗号分隔"><input id="nFlow" placeholder="VLESS Flow"><input id="nMethod" placeholder="SS 加密方法"><label><input id="nInsecure" type="checkbox">跳过证书验证</label></div><button class="primary" onclick="addNode()">保存节点</button><label>分享链接导入（每行一个）</label><textarea id="shareLinks" placeholder="vless://... 或 naive://..."></textarea><button class="primary" onclick="importLinks()">导入分享链接</button></div><div class="card" style="margin-top:14px;padding:0;overflow:auto"><table><thead><tr><th>备注</th><th>协议</th><th>服务器</th><th>端口</th><th>操作</th></tr></thead><tbody id="nodesTable"></tbody></table></div></section><section id="subscriptions" class="view"><div class="title"><h1>订阅管理</h1></div><div class="card"><label>HTTPS 订阅地址</label><input id="subURL" style="width:75%" placeholder="https://..."><div class="row"><button class="primary" onclick="importSubscription()">立即更新并导入</button><span class="muted">更新成功后会自动生成并校验 sing-box 配置</span></div></div></section><section id="routing" class="view"><div class="title"><h1>分流与 DNS</h1><button class="primary" onclick="saveRouting()">保存并重启</button></div><div class="card"><label>代理模式</label><select id="routeMode"><option value="bypass_cn">绕过国内：国内直连，其余代理</option><option value="gfw">GFW：规则匹配代理，其余直连</option><option value="global">全局代理</option></select><label>DNS 说明</label><p class="muted">当前使用 sing-box DNS 和远程 GeoIP/Geosite 规则集。透明网关部署时请将客户端 DNS 指向本机。</p><label>透明网关</label><div class="row"><input id="lanIf" value="eth0" placeholder="LAN 接口"><input id="wanIf" value="eth0" placeholder="WAN 接口"><button class="primary" onclick="gatewayEnable()">启用网关</button><button class="primary" onclick="gateway('status')">查看状态</button><button class="danger" onclick="gateway('disable')">关闭网关规则</button><span class="muted">启用前请确认 LAN/WAN 接口，避免影响现有网络。</span></div><pre id="gatewayOut"></pre></div></section><section id="service" class="view"><div class="title"><h1>服务与组件</h1></div><div class="grid"><div class="card"><h3>ArmWall Web</h3><span class="status">运行中</span><p class="muted">systemd · :8080</p></div><div class="card"><h3>sing-box</h3><p id="coreVersion">检查中</p><button class="primary" onclick="updateCore('sing-box','version')">检查版本</button><button class="primary" onclick="updateCore('sing-box','latest')">更新</button></div><div class="card"><h3>代理服务</h3><button class="primary" onclick="service('start')">启动</button><button class="danger" onclick="service('stop')">停止</button><p id="serviceOut" class="muted"></p></div></div></section><section id="logs" class="view"><div class="title"><h1>运行日志</h1><button class="primary" onclick="service('status')">刷新状态</button></div><pre id="logOut">点击服务状态按钮查看 sing-box 状态。</pre></section><pre id="out" style="margin-top:16px"></pre></main></div><script>
-const $=id=>document.getElementById(id);let token=localStorage.armwallToken||'';function api(path,opt={}){opt.headers=Object.assign({},opt.headers,{'Authorization':'Bearer '+token});return fetch(path,opt)}function show(msg){$('out').textContent=typeof msg==='string'?msg:JSON.stringify(msg,null,2)}document.querySelectorAll('aside button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));document.querySelectorAll('aside button').forEach(x=>x.classList.remove('active'));$(b.dataset.tab).classList.add('active');b.classList.add('active')});async function state(){let r=await api('/api/state');if(r.status===401){token=prompt('请输入 ArmWall 管理 Token')||'';localStorage.armwallToken=token;r=await api('/api/state')}let s=await r.json();$('nodeCount').textContent=(s.nodes||[]).length;$('modeText').textContent={bypass_cn:'绕过国内',gfw:'GFW 模式',global:'全局代理'}[s.mode]||s.mode;$('routeMode').value=s.mode;renderNodes(s.nodes||[]);$('badge').textContent='已连接';service('status')}function renderNodes(ns){let b=document.getElementById("nodesTable");b.textContent="";ns.forEach(function(n){let r=b.insertRow();[n.Name||n.name||"未命名",n.Type||n.type,n.Server||n.server,n.Port||n.port].forEach(function(v){r.insertCell().textContent=v});let c=r.insertCell(),x=document.createElement("button");x.className="danger";x.textContent="删除";x.onclick=function(){deleteNode(n.ID||n.id)};c.appendChild(x)})}function esc(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function service(a){let r=await api('/api/service/'+a,{method:'POST'});let t=await r.text();$('svc').textContent=t.trim()||'已提交';$('serviceOut').textContent=t;$('logOut').textContent=t}async function addNode(){let d={Name:$('nName').value,Type:$('nType').value,Server:$('nServer').value,Port:+$('nPort').value,Username:$('nUser').value,UUID:$('nSecret').value,ServerName:$('nSNI').value,Host:$('nHost').value,Path:$('nPath').value,ALPN:$('nALPN').value,Flow:$('nFlow').value,Method:$('nMethod').value,Insecure:$('nInsecure').checked,TLS:true};let r=await api('/api/node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});show(await r.text());state()}async function importLinks(){let r=await api("/api/node/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Links:$("shareLinks").value})});show(await r.text());state()}async function savePort(){let r=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ProxyPort:+$("proxyPort").value})});show(await r.text());state()}async function importSubscription(){let r=await api('/api/subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({URL:$('subURL').value})});show(await r.text());state()}async function saveRouting(){let r=await api('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Mode:$('routeMode').value})});show(await r.text());state()}async function deleteNode(id){let r=await api('/api/node/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ID:id})});show(await r.text());state()}async function gatewayEnable(){let r=await api("/api/gateway/enable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({LAN:document.getElementById("lanIf").value,WAN:document.getElementById("wanIf").value})});document.getElementById("gatewayOut").textContent=await r.text()}async function gateway(a){let r=await api("/api/gateway/"+a,{method:a==="status"?"GET":"POST"});document.getElementById("gatewayOut").textContent=await r.text()}async function refreshLogs(){let r=await api("/api/logs");document.getElementById("logOut").textContent=await r.text()}async function updateCore(c,a){let r=await api('/api/core/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Core:c,Action:a})});$('coreVersion').textContent=await r.text()}state();</script></body></html>`
+</style></head><body><header class="top"><span class="brand">ArmWall</span><small>Armbian proxy gateway</small><span style="margin-left:auto" id="badge">未连接</span></header><div class="layout"><aside><button class="active" data-tab="dashboard">概览</button><button data-tab="nodes">节点管理</button><button data-tab="subscriptions">订阅管理</button><button data-tab="routing">分流与 DNS</button><button data-tab="service">服务与组件</button><button data-tab="logs">运行日志</button></aside><main class="main"><section id="dashboard" class="view active"><div class="title"><h1>概览</h1><button class="primary" onclick="service('start')">启动 / 重启</button></div><div class="grid"><div class="card"><h3>代理服务</h3><div class="metric" id="svc">检查中</div><p class="muted">mixed SOCKS5 / HTTP · 11080</p></div><div class="card"><h3>节点数量</h3><div class="metric" id="nodeCount">-</div><p class="muted">当前配置中的出站节点</p></div><div class="card"><h3>运行模式</h3><div class="metric" id="modeText">-</div><p class="muted">可在“分流与 DNS”中调整</p></div></div><div class="card" style="margin-top:14px"><h3>当前运行节点</h3><select id="activeNode" style="min-width:360px"></select><button class="primary" onclick="selectNode()">切换节点</button><h3 style="margin-top:18px">网络测试</h3><div class="row"><button class="primary" onclick="netTest('google',this)">Google</button><button class="primary" onclick="netTest('youtube',this)">YouTube</button><button class="primary" onclick="netTest('github',this)">GitHub</button><button class="primary" onclick="netTest('facebook',this)">Facebook</button></div></div><div class="card" style="margin-top:14px"><h3>快速连接</h3><p>SOCKS5 / HTTP mixed：<input id="proxyPort" type="number" value="11080" style="min-width:100px"><button class="primary" onclick="savePort()">应用端口</button></p><p class="muted">透明网关端口：11081（需要手动启用 nftables 网关规则）</p></div></section><section id="nodes" class="view"><div class="title"><h1>节点管理</h1><button class="primary" onclick="document.getElementById('nodeForm').hidden=!document.getElementById('nodeForm').hidden">添加节点</button></div><div class="card" id="nodeForm" hidden><div class="row"><input id="nName" placeholder="备注名称"><select id="nType"><option>vless</option><option>trojan</option><option>hysteria2</option><option>anytls</option><option>vmess</option><option>naive</option></select><input id="nServer" placeholder="服务器地址"><input id="nPort" type="number" value="443"><input id="nUser" placeholder="用户名"><input id="nSecret" placeholder="密码 / UUID"><input id="nSNI" placeholder="TLS SNI"><input id="nHost" placeholder="HTTP Host"><input id="nPath" placeholder="路径"><input id="nALPN" placeholder="ALPN, 逗号分隔"><input id="nFlow" placeholder="VLESS Flow"><input id="nMethod" placeholder="SS 加密方法"><label><input id="nInsecure" type="checkbox">跳过证书验证</label></div><button class="primary" onclick="addNode()">保存节点</button><label>分享链接导入（每行一个）</label><textarea id="shareLinks" placeholder="vless://... 或 naive://..."></textarea><button class="primary" onclick="importLinks()">导入分享链接</button></div><div class="card" style="margin-top:14px;padding:0;overflow:auto"><table><thead><tr><th>备注</th><th>协议</th><th>服务器</th><th>端口</th><th>操作</th></tr></thead><tbody id="nodesTable"></tbody></table></div></section><section id="subscriptions" class="view"><div class="title"><h1>订阅管理</h1></div><div class="card"><h3>已添加订阅</h3><div id="subscriptionList" class="muted"></div><div class="row"><button class="primary" onclick="updateSubscriptions()">手动更新全部</button><label>自动更新间隔（小时）</label><input id="updateHours" type="number" min="1" max="168" value="6"><button class="primary" onclick="saveSchedule()">保存间隔</button></div><label>HTTPS 订阅地址</label><input id="subURL" style="width:75%" placeholder="https://..."><div class="row"><button class="primary" onclick="importSubscription()">立即更新并导入</button><span class="muted">更新成功后会自动生成并校验 sing-box 配置</span></div></div></section><section id="routing" class="view"><div class="title"><h1>分流与 DNS</h1><button class="primary" onclick="saveRouting()">保存并重启</button></div><div class="card"><label>代理模式</label><select id="routeMode"><option value="bypass_cn">绕过国内：国内直连，其余代理</option><option value="gfw">GFW：规则匹配代理，其余直连</option><option value="global">全局代理</option></select><label>DNS 说明</label><p class="muted">当前使用 sing-box DNS 和远程 GeoIP/Geosite 规则集。透明网关部署时请将客户端 DNS 指向本机。</p><label>透明网关</label><div class="row"><input id="lanIf" value="eth0" placeholder="LAN 接口"><input id="wanIf" value="eth0" placeholder="WAN 接口"><button class="primary" onclick="gatewayEnable()">启用网关</button><button class="primary" onclick="gateway('status')">查看状态</button><button class="danger" onclick="gateway('disable')">关闭网关规则</button><span class="muted">启用前请确认 LAN/WAN 接口，避免影响现有网络。</span></div><pre id="gatewayOut"></pre></div></section><section id="service" class="view"><div class="title"><h1>服务与组件</h1></div><div class="grid"><div class="card"><h3>ArmWall Web</h3><span class="status">运行中</span><p class="muted">systemd · :8080</p></div><div class="card"><h3>sing-box</h3><p id="coreVersion">检查中</p><button class="primary" onclick="updateCore('sing-box','version')">检查版本</button><button class="primary" onclick="updateCore('sing-box','latest')">更新</button></div><div class="card"><h3>代理服务</h3><button class="primary" onclick="service('start')">启动</button><button class="danger" onclick="service('stop')">停止</button><p id="serviceOut" class="muted"></p></div></div></section><section id="logs" class="view"><div class="title"><h1>运行日志</h1><div><select id="logLevel"><option>trace</option><option>debug</option><option selected>info</option><option>warn</option><option>error</option></select><button class="primary" onclick="saveLogLevel()">应用级别</button><button class="primary" onclick="refreshLogs()">刷新</button><button class="primary" onclick="exportLogs()">导出</button><button class="danger" onclick="clearLogs()">清屏</button></div></div><pre id="logOut">点击服务状态按钮查看 sing-box 状态。</pre></section><div id="out" hidden></div></main></div><script>
+const $=id=>document.getElementById(id);let token=localStorage.armwallToken||'';function api(path,opt={}){opt.headers=Object.assign({},opt.headers,{'Authorization':'Bearer '+token});return fetch(path,opt)}function show(msg){$('out').textContent=typeof msg==='string'?msg:JSON.stringify(msg,null,2)}document.querySelectorAll('aside button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));document.querySelectorAll('aside button').forEach(x=>x.classList.remove('active'));$(b.dataset.tab).classList.add('active');b.classList.add('active')});async function state(){let r=await api('/api/state');if(r.status===401){token=prompt('请输入 ArmWall 管理 Token')||'';localStorage.armwallToken=token;r=await api('/api/state')}let s=await r.json();$('nodeCount').textContent=(s.nodes||[]).length;$('modeText').textContent={bypass_cn:'绕过国内',gfw:'GFW 模式',global:'全局代理'}[s.mode]||s.mode;$('routeMode').value=s.mode;renderNodes(s.nodes||[]);renderSelectors(s);$('badge').textContent='已连接';service('status')}function renderNodes(ns){let b=document.getElementById("nodesTable");b.textContent="";ns.forEach(function(n){let r=b.insertRow();[n.Name||n.name||"未命名",n.Type||n.type,n.Server||n.server,n.Port||n.port].forEach(function(v){r.insertCell().textContent=v});let c=r.insertCell(),x=document.createElement("button");x.className="danger";x.textContent="删除";x.onclick=function(){deleteNode(n.ID||n.id)};c.appendChild(x)})}function esc(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function service(a){let r=await api('/api/service/'+a,{method:'POST'});let t=await r.text();$('svc').textContent=t.trim()||'已提交';$('serviceOut').textContent=t;$('logOut').textContent=t}async function addNode(){let d={Name:$('nName').value,Type:$('nType').value,Server:$('nServer').value,Port:+$('nPort').value,Username:$('nUser').value,UUID:$('nSecret').value,ServerName:$('nSNI').value,Host:$('nHost').value,Path:$('nPath').value,ALPN:$('nALPN').value,Flow:$('nFlow').value,Method:$('nMethod').value,Insecure:$('nInsecure').checked,TLS:true};let r=await api('/api/node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});show(await r.text());state()}async function importLinks(){let r=await api("/api/node/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Links:$("shareLinks").value})});show(await r.text());state()}async function savePort(){let r=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ProxyPort:+$("proxyPort").value})});show(await r.text());state()}async function importSubscription(){let r=await api('/api/subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({URL:$('subURL').value})});show(await r.text());state()}async function saveRouting(){let r=await api('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Mode:$('routeMode').value})});show(await r.text());state()}async function deleteNode(id){let r=await api('/api/node/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ID:id})});show(await r.text());state()}async function gatewayEnable(){let r=await api("/api/gateway/enable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({LAN:document.getElementById("lanIf").value,WAN:document.getElementById("wanIf").value})});document.getElementById("gatewayOut").textContent=await r.text()}async function gateway(a){let r=await api("/api/gateway/"+a,{method:a==="status"?"GET":"POST"});document.getElementById("gatewayOut").textContent=await r.text()}async function refreshLogs(){let r=await api("/api/logs");document.getElementById("logOut").textContent=await r.text()}function renderSelectors(s){let n=document.getElementById("activeNode");n.innerHTML="";(s.nodes||[]).forEach(function(x){let o=document.createElement("option");o.value=x.id;o.textContent=(x.name||"未命名")+" ["+x.type+"]";o.selected=x.id===s.selected_node;n.appendChild(o)});document.getElementById("subscriptionList").textContent=(s.subscription_urls||[]).join("\n")||"暂无订阅";document.getElementById("updateHours").value=s.update_hours||6;document.getElementById("logLevel").value=s.log_level||"info"}async function selectNode(){let r=await api("/api/node/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ID:document.getElementById("activeNode").value})});alert(r.ok?"节点切换成功":await r.text());state()}async function netTest(t,b){let old=b.textContent;b.textContent="测试中";let r=await api("/api/network/test?target="+t);if(r.ok){let d=await r.json();b.textContent=old+" "+d.ms+"ms"}else{b.textContent=old+" 失败"}}async function updateSubscriptions(){let r=await api("/api/subscription/update",{method:"POST"});alert(r.ok?"订阅更新成功":await r.text());state()}async function saveSchedule(){let r=await api("/api/subscription/schedule",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Hours:+document.getElementById("updateHours").value})});alert(r.ok?"更新间隔已保存":await r.text());state()}async function saveLogLevel(){let r=await api("/api/log/level",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Level:document.getElementById("logLevel").value})});alert(r.ok?"日志级别已应用":await r.text())}function exportLogs(){window.open("/api/logs?download=1","_blank")}function clearLogs(){document.getElementById("logOut").textContent=""}async function updateCore(c,a){let r=await api('/api/core/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Core:c,Action:a})});$('coreVersion').textContent=await r.text()}state();</script></body></html>`
