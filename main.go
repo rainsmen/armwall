@@ -1,14 +1,19 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,8 +29,40 @@ type Store struct {
 	Mode             string   `json:"mode"`
 }
 
+func parseSubscription(raw string) []Node {
+	if b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw)); err == nil {
+		raw = string(b)
+	}
+	var out []Node
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		u, err := url.Parse(line)
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		n := Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: u.Fragment, Type: u.Scheme, Server: u.Hostname(), TLS: true}
+		if p, err := strconv.Atoi(u.Port()); err == nil {
+			n.Port = p
+		}
+		if n.Port == 0 {
+			n.Port = 443
+		}
+		if u.User != nil {
+			n.Password, _ = u.User.Password()
+			n.UUID = u.User.Username()
+			if n.Type == "trojan" {
+				n.Password = u.User.Username()
+				n.UUID = ""
+			}
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 var mu sync.Mutex
 var dataPath = "/var/lib/armwall/store.json"
+var configPath = "/etc/armwall/sing-box.json"
 
 func load() Store {
 	b, err := os.ReadFile(dataPath)
@@ -62,10 +99,10 @@ func config(s Store) map[string]any {
 }
 func writeConfig(s Store) error {
 	b, _ := json.MarshalIndent(config(s), "", "  ")
-	if err := os.MkdirAll("/etc/armwall", 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(configPath), 0750); err != nil {
 		return err
 	}
-	return os.WriteFile("/etc/armwall/sing-box.json", b, 0640)
+	return os.WriteFile(configPath, b, 0640)
 }
 func run(w http.ResponseWriter, name string, args ...string) {
 	cmd := exec.Command(name, args...)
@@ -105,6 +142,65 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = writeConfig(s)
 		json.NewEncoder(w).Encode(n)
+	case "/api/node/delete":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ ID string }
+		json.NewDecoder(r.Body).Decode(&v)
+		for i := range s.Nodes {
+			if s.Nodes[i].ID == v.ID {
+				s.Nodes = append(s.Nodes[:i], s.Nodes[i+1:]...)
+				break
+			}
+		}
+		if err := save(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/subscription":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ URL string }
+		if json.NewDecoder(r.Body).Decode(&v) != nil || !strings.HasPrefix(v.URL, "https://") {
+			http.Error(w, "invalid url", 400)
+			return
+		}
+		resp, err := http.Get(v.URL)
+		if err != nil {
+			http.Error(w, err.Error(), 502)
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if resp.StatusCode >= 300 {
+			http.Error(w, "subscription http error", 502)
+			return
+		}
+		nodes := parseSubscription(string(body))
+		if len(nodes) == 0 {
+			http.Error(w, "no supported nodes", 422)
+			return
+		}
+		s.Nodes = append(s.Nodes, nodes...)
+		s.SubscriptionURLs = append(s.SubscriptionURLs, v.URL)
+		if err := save(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
 	case "/api/mode":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -113,8 +209,14 @@ func api(w http.ResponseWriter, r *http.Request) {
 		var v struct{ Mode string }
 		json.NewDecoder(r.Body).Decode(&v)
 		s.Mode = v.Mode
-		save(s)
-		writeConfig(s)
+		if err := save(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		json.NewEncoder(w).Encode(s)
 	case "/api/service/start":
 		writeConfig(s)
@@ -135,7 +237,19 @@ func page(w http.ResponseWriter, r *http.Request) {
 	template.Must(template.New("p").Parse(indexHTML)).Execute(w, nil)
 }
 func main() {
-	http.HandleFunc("/api/", api)
+	if v := os.Getenv("ARMWALL_DATA"); v != "" {
+		dataPath = v
+	}
+	if v := os.Getenv("ARMWALL_CONFIG"); v != "" {
+		configPath = v
+	}
+	http.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		if token := os.Getenv("ARMWALL_TOKEN"); token != "" && r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		api(w, r)
+	})
 	http.HandleFunc("/", page)
 	addr := os.Getenv("ARMWALL_LISTEN")
 	if addr == "" {
