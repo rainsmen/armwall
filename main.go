@@ -143,7 +143,23 @@ func writeConfig(s Store) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0750); err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, b, 0640)
+	candidate := configPath + ".candidate"
+	if err := os.WriteFile(candidate, b, 0640); err != nil {
+		return err
+	}
+	checker, lookErr := exec.LookPath("sing-box")
+	if lookErr == nil {
+		out, err := exec.Command(checker, "check", "-c", candidate).CombinedOutput()
+		if err != nil {
+			_ = os.Remove(candidate)
+			return fmt.Errorf("invalid sing-box config: %s", strings.TrimSpace(string(out)))
+		}
+	}
+	if err := os.Rename(candidate, configPath); err != nil {
+		_ = os.Remove(candidate)
+		return err
+	}
+	return nil
 }
 func run(w http.ResponseWriter, name string, args ...string) {
 	cmd := exec.Command(name, args...)
@@ -184,11 +200,14 @@ func api(w http.ResponseWriter, r *http.Request) {
 			n.ID = fmt.Sprintf("node-%d", time.Now().UnixNano())
 		}
 		s.Nodes = append(s.Nodes, n)
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		if err := save(s); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		_ = writeConfig(s)
 		if err := restartProxy(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -309,6 +328,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		var v struct{ Mode string }
 		json.NewDecoder(r.Body).Decode(&v)
+		if v.Mode != "bypass_cn" && v.Mode != "gfw" && v.Mode != "global" {
+			http.Error(w, "invalid mode", 400)
+			return
+		}
 		s.Mode = v.Mode
 		if err := save(s); err != nil {
 			http.Error(w, err.Error(), 500)
