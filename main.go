@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -179,7 +180,16 @@ func restartProxy() error {
 	if err != nil {
 		return fmt.Errorf("sing-box restart failed: %s", strings.TrimSpace(string(out)))
 	}
-	return nil
+	address := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	for i := 0; i < 30; i++ {
+		conn, dialErr := net.DialTimeout("tcp", address, 150*time.Millisecond)
+		if dialErr == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("sing-box restarted but proxy port %d is not ready", proxyPort)
 }
 func api(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
