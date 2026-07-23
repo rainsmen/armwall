@@ -4,6 +4,8 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/sing-box run -c /etc/armwall/sing-box.json
+StandardOutput=append:/var/log/armwall/sing-box.log
+StandardError=append:/var/log/armwall/sing-box.log
 Restart=on-failure
 RestartSec=3
 User=root
