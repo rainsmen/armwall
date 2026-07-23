@@ -155,6 +155,13 @@ func run(w http.ResponseWriter, name string, args ...string) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write(out)
 }
+func restartProxy() error {
+	out, err := exec.Command("systemctl", "restart", "armwall-sing-box.service").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sing-box restart failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
 func api(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	mu.Lock()
@@ -182,6 +189,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = writeConfig(s)
+		if err := restartProxy(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		json.NewEncoder(w).Encode(n)
 	case "/api/node/delete":
 		if r.Method != "POST" {
@@ -201,6 +212,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := restartProxy(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -256,6 +271,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		if err := restartProxy(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
 	case "/api/subscription/clear":
 		if r.Method != "POST" {
@@ -278,6 +297,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		if err := restartProxy(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"cleared": true})
 	case "/api/mode":
 		if r.Method != "POST" {
@@ -292,6 +315,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := restartProxy(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
