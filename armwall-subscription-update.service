@@ -4,4 +4,7 @@ After=network-online.target armwall.service
 
 [Service]
 Type=oneshot
+Environment=ARMWALL_PROXY_PORT=11080
+Environment=ARMWALL_TPROXY=1
+Environment=ARMWALL_TPROXY_PORT=11081
 ExecStart=/usr/local/bin/armwall --update-subscriptions
