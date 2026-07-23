@@ -52,6 +52,9 @@ func parseSubscription(raw string) []Node {
 		if err != nil || u.Hostname() == "" {
 			continue
 		}
+		if u.Scheme != "vless" && u.Scheme != "trojan" && u.Scheme != "shadowsocks" && u.Scheme != "hysteria2" && u.Scheme != "anytls" {
+			continue
+		}
 		n := Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: u.Fragment, Type: u.Scheme, Server: u.Hostname(), TLS: true}
 		if p, err := strconv.Atoi(u.Port()); err == nil {
 			n.Port = p
