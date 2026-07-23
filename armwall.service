@@ -1,0 +1,11 @@
+[Unit]
+Description=ArmWall web management service
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/local/bin/armwall
+Environment=ARMWALL_LISTEN=:8080
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
