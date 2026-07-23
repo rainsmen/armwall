@@ -231,8 +231,23 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no supported nodes", 422)
 			return
 		}
-		s.Nodes = append(s.Nodes, nodes...)
-		s.SubscriptionURLs = append(s.SubscriptionURLs, v.URL)
+		kept := s.Nodes[:0]
+		for _, n := range s.Nodes {
+			if !strings.HasPrefix(n.ID, "sub-") {
+				kept = append(kept, n)
+			}
+		}
+		s.Nodes = append(kept, nodes...)
+		found := false
+		for _, existing := range s.SubscriptionURLs {
+			if existing == v.URL {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.SubscriptionURLs = append(s.SubscriptionURLs, v.URL)
+		}
 		if err := save(s); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -242,6 +257,28 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
+	case "/api/subscription/clear":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		kept := s.Nodes[:0]
+		for _, n := range s.Nodes {
+			if !strings.HasPrefix(n.ID, "sub-") {
+				kept = append(kept, n)
+			}
+		}
+		s.Nodes = kept
+		s.SubscriptionURLs = nil
+		if err := save(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"cleared": true})
 	case "/api/mode":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
