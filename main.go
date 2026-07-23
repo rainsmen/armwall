@@ -83,23 +83,31 @@ func fetchSubscription(rawURL string) ([]Node, error) {
 		return nil, fmt.Errorf("subscription must use https")
 	}
 	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Get(rawURL)
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err := client.Get(rawURL)
+		if err == nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			resp.Body.Close()
+			if readErr == nil && resp.StatusCode < 300 {
+				nodes := parseSubscription(string(body))
+				if len(nodes) > 0 {
+					return nodes, nil
+				}
+				lastErr = fmt.Errorf("no supported nodes")
+			} else if readErr != nil {
+				lastErr = readErr
+			} else {
+				lastErr = fmt.Errorf("subscription http status %d", resp.StatusCode)
+			}
+		} else {
+			lastErr = err
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("subscription http status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	nodes := parseSubscription(string(body))
-	if len(nodes) == 0 {
-		return nil, fmt.Errorf("no supported nodes")
-	}
-	return nodes, nil
+	return nil, lastErr
 }
 
 func updateSubscriptions() error {
