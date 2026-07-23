@@ -22,6 +22,8 @@ type Node struct {
 	ID, Name, Type, Server, UUID, Password string
 	Port                                   int
 	TLS                                    bool
+	ServerName                             string
+	Insecure                               bool
 }
 type Store struct {
 	Nodes            []Node   `json:"nodes"`
@@ -36,6 +38,16 @@ func parseSubscription(raw string) []Node {
 	var out []Node
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "vmess://") {
+			if b, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(line, "vmess://")); err == nil {
+				var v struct{ PS, Add, Port, ID, TLS, SNI string }
+				if json.Unmarshal(b, &v) == nil {
+					p, _ := strconv.Atoi(v.Port)
+					out = append(out, Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: v.PS, Type: "vmess", Server: v.Add, Port: p, UUID: v.ID, TLS: v.TLS != "", ServerName: v.SNI})
+					continue
+				}
+			}
+		}
 		u, err := url.Parse(line)
 		if err != nil || u.Hostname() == "" {
 			continue
@@ -50,11 +62,13 @@ func parseSubscription(raw string) []Node {
 		if u.User != nil {
 			n.Password, _ = u.User.Password()
 			n.UUID = u.User.Username()
-			if n.Type == "trojan" {
+			if n.Type == "trojan" || n.Type == "anytls" || n.Type == "hysteria2" {
 				n.Password = u.User.Username()
 				n.UUID = ""
 			}
 		}
+		n.ServerName = u.Query().Get("sni")
+		n.Insecure = u.Query().Get("insecure") == "1"
 		out = append(out, n)
 	}
 	return out
@@ -63,6 +77,7 @@ func parseSubscription(raw string) []Node {
 var mu sync.Mutex
 var dataPath = "/var/lib/armwall/store.json"
 var configPath = "/etc/armwall/sing-box.json"
+var proxyPort = 1080
 
 func load() Store {
 	b, err := os.ReadFile(dataPath)
@@ -91,11 +106,31 @@ func config(s Store) map[string]any {
 			o["password"] = n.Password
 		}
 		if n.TLS {
-			o["tls"] = map[string]any{"enabled": true, "server_name": n.Server}
+			serverName := n.ServerName
+			if serverName == "" {
+				serverName = n.Server
+			}
+			o["tls"] = map[string]any{"enabled": true, "server_name": serverName, "insecure": n.Insecure}
 		}
 		outs = append(outs, o)
 	}
-	return map[string]any{"log": map[string]any{"level": "info"}, "inbounds": []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": 1080}}, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "final": "direct"}}
+	proxy := "direct"
+	if len(s.Nodes) > 0 {
+		proxy = s.Nodes[0].ID
+	}
+	rules := []any{map[string]any{"ip_is_private": true, "outbound": "direct"}, map[string]any{"rule_set": []string{"geosite-ads"}, "outbound": "block"}}
+	ruleSets := []any{map[string]any{"type": "remote", "tag": "geosite-ads", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs", "download_detour": "direct"}}
+	final := proxy
+	switch s.Mode {
+	case "bypass_cn":
+		rules = append(rules, map[string]any{"rule_set": []string{"geosite-cn", "geoip-cn"}, "outbound": "direct"})
+		ruleSets = append(ruleSets, map[string]any{"type": "remote", "tag": "geosite-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", "download_detour": "direct"}, map[string]any{"type": "remote", "tag": "geoip-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs", "download_detour": "direct"})
+	case "gfw":
+		rules = append(rules, map[string]any{"rule_set": []string{"geosite-proxy"}, "outbound": proxy})
+		ruleSets = append(ruleSets, map[string]any{"type": "remote", "tag": "geosite-proxy", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs", "download_detour": "direct"})
+		final = "direct"
+	}
+	return map[string]any{"log": map[string]any{"level": "info"}, "inbounds": []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": proxyPort}}, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}}
 }
 func writeConfig(s Store) error {
 	b, _ := json.MarshalIndent(config(s), "", "  ")
@@ -239,6 +274,11 @@ func page(w http.ResponseWriter, r *http.Request) {
 func main() {
 	if v := os.Getenv("ARMWALL_DATA"); v != "" {
 		dataPath = v
+	}
+	if v := os.Getenv("ARMWALL_PROXY_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+			proxyPort = p
+		}
 	}
 	if v := os.Getenv("ARMWALL_CONFIG"); v != "" {
 		configPath = v
