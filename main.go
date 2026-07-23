@@ -78,6 +78,8 @@ var mu sync.Mutex
 var dataPath = "/var/lib/armwall/store.json"
 var configPath = "/etc/armwall/sing-box.json"
 var proxyPort = 1080
+var tproxyEnabled bool
+var tproxyPort = 11081
 
 func load() Store {
 	b, err := os.ReadFile(dataPath)
@@ -130,7 +132,11 @@ func config(s Store) map[string]any {
 		ruleSets = append(ruleSets, map[string]any{"type": "remote", "tag": "geosite-proxy", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs", "download_detour": "direct"})
 		final = "direct"
 	}
-	return map[string]any{"log": map[string]any{"level": "info"}, "inbounds": []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": proxyPort}}, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}}
+	inbounds := []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": proxyPort}}
+	if tproxyEnabled {
+		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": tproxyPort})
+	}
+	return map[string]any{"log": map[string]any{"level": "info"}, "inbounds": inbounds, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}}
 }
 func writeConfig(s Store) error {
 	b, _ := json.MarshalIndent(config(s), "", "  ")
@@ -278,6 +284,14 @@ func main() {
 	if v := os.Getenv("ARMWALL_PROXY_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
 			proxyPort = p
+		}
+	}
+	if os.Getenv("ARMWALL_TPROXY") == "1" {
+		tproxyEnabled = true
+	}
+	if v := os.Getenv("ARMWALL_TPROXY_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+			tproxyPort = p
 		}
 	}
 	if v := os.Getenv("ARMWALL_CONFIG"); v != "" {
