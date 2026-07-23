@@ -78,6 +78,59 @@ func parseSubscription(raw string) []Node {
 	return out
 }
 
+func fetchSubscription(rawURL string) ([]Node, error) {
+	if !strings.HasPrefix(rawURL, "https://") {
+		return nil, fmt.Errorf("subscription must use https")
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("subscription http status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	nodes := parseSubscription(string(body))
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("no supported nodes")
+	}
+	return nodes, nil
+}
+
+func updateSubscriptions() error {
+	s := load()
+	var nodes []Node
+	for _, rawURL := range s.SubscriptionURLs {
+		fetched, err := fetchSubscription(rawURL)
+		if err != nil {
+			return fmt.Errorf("%s: %w", rawURL, err)
+		}
+		nodes = append(nodes, fetched...)
+	}
+	if len(s.SubscriptionURLs) == 0 {
+		return fmt.Errorf("no subscriptions configured")
+	}
+	kept := s.Nodes[:0]
+	for _, n := range s.Nodes {
+		if !strings.HasPrefix(n.ID, "sub-") {
+			kept = append(kept, n)
+		}
+	}
+	s.Nodes = append(kept, nodes...)
+	if err := writeConfig(s); err != nil {
+		return err
+	}
+	if err := save(s); err != nil {
+		return err
+	}
+	return restartProxy()
+}
+
 var mu sync.Mutex
 var dataPath = "/var/lib/armwall/store.json"
 var configPath = "/etc/armwall/sing-box.json"
@@ -262,20 +315,9 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid url", 400)
 			return
 		}
-		resp, err := http.Get(v.URL)
+		nodes, err := fetchSubscription(v.URL)
 		if err != nil {
 			http.Error(w, err.Error(), 502)
-			return
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		if resp.StatusCode >= 300 {
-			http.Error(w, "subscription http error", 502)
-			return
-		}
-		nodes := parseSubscription(string(body))
-		if len(nodes) == 0 {
-			http.Error(w, "no supported nodes", 422)
 			return
 		}
 		kept := s.Nodes[:0]
@@ -478,6 +520,13 @@ func main() {
 	}
 	if v := os.Getenv("ARMWALL_CONFIG"); v != "" {
 		configPath = v
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--update-subscriptions" {
+		if err := updateSubscriptions(); err != nil {
+			log.Fatal(err)
+		}
+		log.Print("subscriptions updated")
+		return
 	}
 	http.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		if token := os.Getenv("ARMWALL_TOKEN"); token != "" && r.Header.Get("Authorization") != "Bearer "+token {

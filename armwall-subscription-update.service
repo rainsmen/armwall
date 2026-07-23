@@ -1,0 +1,7 @@
+[Unit]
+Description=Update ArmWall proxy subscriptions
+After=network-online.target armwall.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/armwall --update-subscriptions
