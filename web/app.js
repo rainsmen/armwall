@@ -427,6 +427,13 @@ function nodeByID(id) {
   return appState.nodes.find((node) => node.id === id);
 }
 
+function updateNodeFields() {
+  const protocol = $("nodeType").value;
+  document.querySelectorAll("#nodeForm [data-protocols]").forEach((field) => {
+    field.hidden = !field.dataset.protocols.split(/\s+/).includes(protocol);
+  });
+}
+
 function openNodeEditor(node = null) {
   $("nodeEditor").hidden = false;
   $("linkImporter").hidden = true;
@@ -443,14 +450,26 @@ function openNodeEditor(node = null) {
   $("nodeSNI").value = node?.server_name || "";
   $("nodeHost").value = node?.host || "";
   $("nodePath").value = node?.path || "";
+  $("nodeServiceName").value = node?.service_name || "";
   $("nodeTransport").value = node?.transport || "";
   $("nodeALPN").value = node?.alpn || "";
   $("nodeFlow").value = node?.flow || "";
   $("nodeMethod").value = node?.method || "";
+  $("nodeSecurity").value = node?.security || "auto";
+  $("nodeAlterID").value = node?.alter_id || 0;
+  $("nodePlugin").value = node?.plugin || "";
+  $("nodePluginOpts").value = node?.plugin_opts || "";
+  $("nodeRealityPublicKey").value = node?.reality_public_key || "";
+  $("nodeRealityShortID").value = node?.reality_short_id || "";
+  $("nodeObfs").value = node?.obfs || "";
+  $("nodeObfsPassword").value = node?.obfs_password || "";
+  $("nodeUpMbps").value = node?.up_mbps || 0;
+  $("nodeDownMbps").value = node?.down_mbps || 0;
   $("nodeFingerprint").value = node?.fingerprint || "";
   $("nodeTLS").checked = node ? Boolean(node.tls) : true;
   $("nodeInsecure").checked = Boolean(node?.insecure);
   $("nodeEnabled").checked = node ? Boolean(node.enabled) : true;
+  updateNodeFields();
   $("nodeEditor").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -473,10 +492,21 @@ function nodePayload() {
     server_name: $("nodeSNI").value.trim(),
     host: $("nodeHost").value.trim(),
     path: $("nodePath").value,
+    service_name: $("nodeServiceName").value.trim(),
     transport: $("nodeTransport").value.trim(),
     alpn: $("nodeALPN").value.trim(),
     flow: $("nodeFlow").value.trim(),
     method: $("nodeMethod").value.trim(),
+    security: $("nodeSecurity").value.trim(),
+    alter_id: Number($("nodeAlterID").value) || 0,
+    plugin: $("nodePlugin").value.trim(),
+    plugin_opts: $("nodePluginOpts").value.trim(),
+    reality_public_key: $("nodeRealityPublicKey").value.trim(),
+    reality_short_id: $("nodeRealityShortID").value.trim(),
+    obfs: $("nodeObfs").value.trim(),
+    obfs_password: $("nodeObfsPassword").value,
+    up_mbps: Number($("nodeUpMbps").value) || 0,
+    down_mbps: Number($("nodeDownMbps").value) || 0,
     fingerprint: $("nodeFingerprint").value.trim(),
     tls: $("nodeTLS").checked,
     insecure: $("nodeInsecure").checked,
@@ -770,10 +800,21 @@ async function renderRules() {
       "geosite-proxy": "代理域名",
     };
     $("ruleManager").innerHTML = Object.entries(data.rules || {})
-      .map(
-        ([tag, primary]) =>
-          `<div class="rule-row" data-rule="${escapeHTML(tag)}"><div><strong>${escapeHTML(names[tag] || tag)}</strong><div class="node-server">${escapeHTML(primary)}</div></div><input class="rule-backup" value="${escapeHTML((data.backups || {})[tag] || "")}" placeholder="备用规则 URL"><input class="rule-hours" type="number" min="1" max="168" value="${escapeHTML(data.update_hours || 6)}"><button class="small-btn" data-action="save-rule" data-tag="${escapeHTML(tag)}">保存</button><button class="small-btn" data-action="update-rule" data-tag="${escapeHTML(tag)}">立即更新</button></div>`,
-      )
+      .map(([tag, primary]) => {
+        const setting = (data.settings || {})[tag] || {};
+        const lastUpdated =
+          setting.last_updated && !setting.last_updated.startsWith("0001-")
+            ? formatDate(setting.last_updated)
+            : "尚未更新";
+        return `<div class="rule-row" data-rule="${escapeHTML(tag)}">
+          <div class="rule-source"><strong>${escapeHTML(names[tag] || tag)}</strong><div class="node-server">${escapeHTML(primary)}</div></div>
+          <label class="rule-field"><span>备用地址</span><input class="rule-backup" value="${escapeHTML(setting.backup_url || (data.backups || {})[tag] || "")}" placeholder="https://"></label>
+          <label class="rule-field rule-interval"><span>更新间隔</span><span class="inline"><input class="rule-hours" type="number" min="1" max="168" value="${escapeHTML(setting.update_hours || data.update_hours || 6)}"><span>小时</span></span></label>
+          <label class="rule-auto"><input type="checkbox" ${setting.auto_update ? "checked" : ""}>自动更新</label>
+          <div class="rule-updated"><span>上次更新</span><strong>${escapeHTML(lastUpdated)}</strong></div>
+          <div class="row-actions"><button class="small-btn" data-action="save-rule" data-tag="${escapeHTML(tag)}">保存</button><button class="small-btn" data-action="update-rule" data-tag="${escapeHTML(tag)}">立即更新</button></div>
+        </div>`;
+      })
       .join("");
   } catch (error) {
     toast(error.message, true);
@@ -1030,13 +1071,16 @@ async function handleAction(button) {
           tag,
           backup: row.querySelector(".rule-backup").value.trim(),
           hours: Number(row.querySelector(".rule-hours").value),
+          autoUpdate: row.querySelector(".rule-auto input").checked,
         },
       });
       toast("规则设置已保存");
+      await renderRules();
     } else if (action === "update-rule") {
       button.disabled = true;
       await request("/api/rules/update", { method: "POST", body: { tag } });
       toast("规则已更新");
+      await renderRules();
     } else if (action === "select-core") selectCore(core);
     else if (action === "core-version") {
       $("coreVersion").textContent = (
@@ -1105,7 +1149,7 @@ async function handleAction(button) {
       $("logOut").textContent = "";
       toast("日志已清空");
     } else if (action === "export-logs") {
-      const data = await request("/api/logs", {}, true);
+      const data = await request("/api/logs?download=1", {}, true);
       const url = URL.createObjectURL(
         new Blob([data], { type: "text/plain;charset=utf-8" }),
       );
@@ -1153,6 +1197,7 @@ $("selectAllNodes").addEventListener("change", (event) =>
   }),
 );
 $("nodeForm").addEventListener("submit", saveNode);
+$("nodeType").addEventListener("change", updateNodeFields);
 $("subscriptionForm").addEventListener("submit", saveSubscription);
 $("strategyForm").addEventListener("submit", saveStrategy);
 $("strategyMembers").addEventListener("change", () =>

@@ -484,6 +484,9 @@ td .row-actions {
   color: #58677b;
   font-size: 13px;
 }
+#nodeForm [data-protocols][hidden] {
+  display: none;
+}
 .form-grid input,
 .form-grid select {
   width: 100%;
@@ -648,24 +651,61 @@ td .row-actions {
 }
 .rule-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.1fr) minmax(220px, 1fr) 82px auto auto;
-  gap: 9px;
+  grid-template-columns: minmax(190px, 1.2fr) minmax(210px, 1fr) 120px auto minmax(120px, auto) auto;
+  gap: 11px;
   align-items: center;
-  padding: 11px 0;
+  padding: 13px 0;
   border-bottom: 1px solid #e5eaf0;
 }
 .rule-row:last-child {
   border-bottom: 0;
 }
-.rule-row input {
+.rule-row input[type="text"],
+.rule-row input[type="number"] {
   min-width: 0;
   width: 100%;
+}
+.rule-source,
+.rule-field,
+.rule-updated {
+  min-width: 0;
+}
+.rule-field,
+.rule-updated {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #66758a;
+  font-size: 12px;
+}
+.rule-interval .inline {
+  flex-wrap: nowrap;
+}
+.rule-interval input {
+  max-width: 72px;
+}
+.rule-auto {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+  color: #40516a;
+}
+.rule-auto input {
+  width: auto;
+}
+.rule-updated strong {
+  color: #33465f;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 @media (max-width: 900px) {
   .rule-row {
     grid-template-columns: 1fr 1fr;
   }
-  .rule-row > div {
+  .rule-source,
+  .rule-row > .row-actions {
     grid-column: 1/-1;
   }
 }

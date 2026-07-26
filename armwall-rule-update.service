@@ -1,0 +1,11 @@
+[Unit]
+Description=Update ArmWall routing rule sets
+After=network-online.target armwall.service armwall-sing-box.service
+
+[Service]
+Type=oneshot
+Environment=ARMWALL_PROXY_PORT=11080
+Environment=ARMWALL_TPROXY=1
+Environment=ARMWALL_TPROXY_PORT=11081
+EnvironmentFile=-/etc/armwall/armwall.env
+ExecStart=/usr/local/bin/armwall --update-rules

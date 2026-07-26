@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore ArmWall transparent gateway
+After=network-online.target armwall-sing-box.service
+Wants=network-online.target armwall-sing-box.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/armwall-gateway restore
+ExecReload=/usr/local/bin/armwall-gateway reload
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

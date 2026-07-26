@@ -8,7 +8,7 @@ ArmWall 是面向 Armbian/Debian 设备的局域网代理网关。它使用 sing
 - 绕过国内、GFW 规则和全局代理模式，TCP/UDP 可分别选择节点或策略组。
 - Selector、URLTest、Fallback 策略组，显示实际运行成员与最近延迟。
 - Ping、TCP、URLTest 节点测速，以及常用国内外网站连通测试。
-- sing-box DNS、DNS 劫持、FakeIP、GeoSite/GeoIP 规则与广告阻止规则。
+- sing-box DNS、DNS 劫持、FakeIP、GeoSite/GeoIP 规则与广告阻止规则；规则支持逐项备用地址、自动更新间隔与手动更新。
 - 按源 IP/CIDR、MAC、协议和目标端口设置 ACL。MAC ACL 由 nftables 分流到独立 TProxy 入口。
 - sing-box、NaiveProxy 在线更新和手动上传，更新前自动保留旧二进制。
 - SQLite 持久化、配置导入导出、服务器端备份和恢复。
@@ -69,7 +69,7 @@ make release VERSION=0.1.0
 2. 在同一页面填写 LAN/WAN 接口并启用透明网关。
 3. 将客户端 IPv4 网关和 DNS 都设置为 Armbian 的局域网 IP。
 
-透明网关使用 nftables TProxy 和策略路由，启用时保存并打开 `net.ipv4.ip_forward`，关闭时恢复之前的值。当前网关规则仅处理 IPv4；客户端存在原生 IPv6 时，应另行配置 IPv6 路由或在客户端关闭 IPv6，避免绕过代理。
+透明网关使用 nftables TProxy 和策略路由，启用时保存并打开 `net.ipv4.ip_forward`，关闭时恢复之前的值。启用状态与 LAN/WAN 接口会持久化，并由 `armwall-gateway.service` 在设备启动后恢复；活动网关会在 ArmWall 配置更新后自动重载 ACL。当前网关规则仅处理 IPv4；客户端存在原生 IPv6 时，应另行配置 IPv6 路由或在客户端关闭 IPv6，避免绕过代理。
 
 MAC ACL 只能识别与 Armbian 位于同一二层网络中的客户端。跨路由网络请使用源 IP/CIDR ACL。
 
@@ -79,7 +79,9 @@ MAC ACL 只能识别与 Armbian 位于同一二层网络中的客户端。跨路
 systemctl status armwall.service
 systemctl status armwall-sing-box.service
 systemctl status armwall-naive.service
+systemctl status armwall-gateway.service
 systemctl status armwall-subscription-update.timer
+systemctl status armwall-rule-update.timer
 ```
 
 NaiveProxy 节点由独立本地 SOCKS 入口承载，再由 sing-box 统一纳入分流和策略组。未安装 NaiveProxy 核心时仍可保存节点，但该节点在安装核心前不可连接。

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>ArmWall</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=20260726-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260726-5" />
   </head>
   <body>
     <header class="topbar">
@@ -196,30 +196,59 @@
                     max="65535"
                     value="443"
                     required /></label
-                ><label>用户名<input id="nodeUsername" /></label
-                ><label>UUID<input id="nodeUUID" /></label
-                ><label>密码<input id="nodePassword" /></label
-                ><label>TLS SNI<input id="nodeSNI" /></label
-                ><label>HTTP Host<input id="nodeHost" /></label
-                ><label>路径<input id="nodePath" /></label
-                ><label
+                ><label data-protocols="naive"
+                  >用户名<input id="nodeUsername" /></label
+                ><label data-protocols="vless vmess"
+                  >UUID<input id="nodeUUID" /></label
+                ><label data-protocols="trojan shadowsocks ss hysteria2 anytls naive"
+                  >密码<input id="nodePassword" /></label
+                ><label data-protocols="vless vmess trojan hysteria2 anytls"
+                  >TLS SNI<input id="nodeSNI" /></label
+                ><label data-protocols="vless vmess trojan"
+                  >HTTP Host<input id="nodeHost" /></label
+                ><label data-protocols="vless vmess trojan"
+                  >路径<input id="nodePath" /></label
+                ><label data-protocols="vless vmess trojan"
                   >传输方式<input
                     id="nodeTransport"
                     placeholder="ws / http / grpc" /></label
-                ><label
+                ><label data-protocols="vless vmess trojan"
+                  >gRPC 服务名<input id="nodeServiceName" /></label
+                ><label data-protocols="vless vmess trojan hysteria2 anytls"
                   >ALPN<input id="nodeALPN" placeholder="h2,http/1.1" /></label
-                ><label>VLESS Flow<input id="nodeFlow" /></label
-                ><label
-                  >加密方法<input
+                ><label data-protocols="vless"
+                  >VLESS Flow<input id="nodeFlow" /></label
+                ><label data-protocols="shadowsocks ss"
+                  >Shadowsocks 加密<input
                     id="nodeMethod"
                     placeholder="aes-128-gcm" /></label
-                ><label
+                ><label data-protocols="vmess"
+                  >VMess 加密<input id="nodeSecurity" placeholder="auto" /></label
+                ><label data-protocols="vmess"
+                  >VMess AlterID<input id="nodeAlterID" type="number" min="0" /></label
+                ><label data-protocols="shadowsocks ss"
+                  >插件<input id="nodePlugin" placeholder="v2ray-plugin" /></label
+                ><label data-protocols="shadowsocks ss"
+                  >插件参数<input id="nodePluginOpts" /></label
+                ><label data-protocols="vless"
+                  >Reality 公钥<input id="nodeRealityPublicKey" /></label
+                ><label data-protocols="vless"
+                  >Reality Short ID<input id="nodeRealityShortID" /></label
+                ><label data-protocols="hysteria2"
+                  >混淆类型<input id="nodeObfs" placeholder="salamander" /></label
+                ><label data-protocols="hysteria2"
+                  >混淆密码<input id="nodeObfsPassword" /></label
+                ><label data-protocols="hysteria2"
+                  >上行 Mbps<input id="nodeUpMbps" type="number" min="0" /></label
+                ><label data-protocols="hysteria2"
+                  >下行 Mbps<input id="nodeDownMbps" type="number" min="0" /></label
+                ><label data-protocols="vless vmess trojan"
                   >指纹<input
                     id="nodeFingerprint"
                     placeholder="chrome" /></label
-                ><label class="check-label"
+                ><label class="check-label" data-protocols="vless vmess trojan hysteria2 anytls"
                   ><input id="nodeTLS" type="checkbox" checked />启用 TLS</label
-                ><label class="check-label"
+                ><label class="check-label" data-protocols="vless vmess trojan hysteria2 anytls"
                   ><input
                     id="nodeInsecure"
                     type="checkbox"
@@ -726,6 +755,6 @@
       </main>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js?v=20260726-1" defer></script>
+    <script src="/static/app.js?v=20260726-5" defer></script>
   </body>
 </html>

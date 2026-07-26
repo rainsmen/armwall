@@ -37,8 +37,11 @@ install -m 0755 "$SRC_DIR/naive-supervisor.sh" /usr/local/bin/armwall-naive-supe
 install -m 0644 "$SRC_DIR/armwall.service" /etc/systemd/system/armwall.service
 install -m 0644 "$SRC_DIR/armwall-sing-box.service" /etc/systemd/system/armwall-sing-box.service
 install -m 0644 "$SRC_DIR/armwall-naive.service" /etc/systemd/system/armwall-naive.service
+install -m 0644 "$SRC_DIR/armwall-gateway.service" /etc/systemd/system/armwall-gateway.service
 install -m 0644 "$SRC_DIR/armwall-subscription-update.service" /etc/systemd/system/armwall-subscription-update.service
 install -m 0644 "$SRC_DIR/armwall-subscription-update.timer" /etc/systemd/system/armwall-subscription-update.timer
+install -m 0644 "$SRC_DIR/armwall-rule-update.service" /etc/systemd/system/armwall-rule-update.service
+install -m 0644 "$SRC_DIR/armwall-rule-update.timer" /etc/systemd/system/armwall-rule-update.timer
 if [ ! -f /etc/armwall/armwall.env ]; then
   ARMWALL_ADMIN_TOKEN=${ARMWALL_TOKEN:-}
   if [ -z "$ARMWALL_ADMIN_TOKEN" ]; then
@@ -63,9 +66,11 @@ ARMWALL_PROXY_PORT=11080 ARMWALL_TPROXY=1 ARMWALL_TPROXY_PORT=11081 /usr/local/b
 systemctl daemon-reload
 systemctl enable armwall.service
 systemctl enable armwall-subscription-update.timer
+systemctl enable armwall-rule-update.timer
 systemctl enable armwall-naive.service
 systemctl restart armwall.service
 systemctl restart armwall-subscription-update.timer
+systemctl restart armwall-rule-update.timer
 systemctl restart armwall-naive.service
 if command -v sing-box >/dev/null 2>&1; then
   systemctl enable armwall-sing-box.service

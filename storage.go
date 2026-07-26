@@ -94,6 +94,8 @@ func loadDB() (Store, error) {
 			s.RuleUpdateHours, _ = strconv.Atoi(v)
 		case "rule_backups":
 			json.Unmarshal([]byte(v), &s.RuleBackups)
+		case "rule_settings":
+			json.Unmarshal([]byte(v), &s.RuleSettings)
 		case "strategy_groups":
 			json.Unmarshal([]byte(v), &s.StrategyGroups)
 		case "tcp_outbound":
@@ -171,10 +173,11 @@ func saveDB(s Store) error {
 		return err
 	}
 	backups, _ := json.Marshal(s.RuleBackups)
+	ruleSettings, _ := json.Marshal(s.RuleSettings)
 	groups, _ := json.Marshal(s.StrategyGroups)
 	aclRules, _ := json.Marshal(s.ACLRules)
 	dnsSettings, _ := json.Marshal(s.DNS)
-	settings := map[string]string{"mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings)}
+	settings := map[string]string{"mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "rule_settings": string(ruleSettings), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings)}
 	for k, v := range settings {
 		if _, err = tx.Exec("INSERT INTO settings(key,value) VALUES(?,?)", k, v); err != nil {
 			return err

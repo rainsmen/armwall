@@ -87,6 +87,18 @@ func validateImportedStore(s *Store) error {
 	if !map[string]bool{"trace": true, "debug": true, "info": true, "warn": true, "error": true}[s.LogLevel] {
 		return fmt.Errorf("invalid log level")
 	}
+	normalizeRuleSettings(s)
+	for tag, setting := range s.RuleSettings {
+		if _, ok := ruleURLs[tag]; !ok {
+			return fmt.Errorf("unknown rule setting: %s", tag)
+		}
+		if setting.UpdateHours < 1 || setting.UpdateHours > 168 {
+			return fmt.Errorf("invalid update interval for rule %s", tag)
+		}
+		if setting.BackupURL != "" && !httpsURL(setting.BackupURL) {
+			return fmt.Errorf("invalid backup URL for rule %s", tag)
+		}
+	}
 	seenNodes := map[string]bool{}
 	for i := range s.Nodes {
 		node := &s.Nodes[i]

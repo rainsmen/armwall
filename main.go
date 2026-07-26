@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -23,30 +24,39 @@ import (
 var version = "dev"
 
 type Node struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	Type           string `json:"type"`
-	Server         string `json:"server"`
-	UUID           string `json:"uuid"`
-	Password       string `json:"password"`
-	Port           int    `json:"port"`
-	TLS            bool   `json:"tls"`
-	ServerName     string `json:"server_name"`
-	Insecure       bool   `json:"insecure"`
-	Username       string `json:"username"`
-	Method         string `json:"method"`
-	Flow           string `json:"flow"`
-	Transport      string `json:"transport"`
-	Host           string `json:"host"`
-	Path           string `json:"path"`
-	ALPN           string `json:"alpn"`
-	Fingerprint    string `json:"fingerprint"`
-	Plugin         string `json:"plugin"`
-	PluginOpts     string `json:"plugin_opts"`
-	Group          string `json:"group"`
-	SubscriptionID string `json:"subscription_id"`
-	Enabled        bool   `json:"enabled"`
-	SortOrder      int    `json:"sort_order"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Type             string `json:"type"`
+	Server           string `json:"server"`
+	UUID             string `json:"uuid"`
+	Password         string `json:"password"`
+	Port             int    `json:"port"`
+	TLS              bool   `json:"tls"`
+	ServerName       string `json:"server_name"`
+	Insecure         bool   `json:"insecure"`
+	Username         string `json:"username"`
+	Method           string `json:"method"`
+	Security         string `json:"security"`
+	AlterID          int    `json:"alter_id"`
+	Flow             string `json:"flow"`
+	Transport        string `json:"transport"`
+	Host             string `json:"host"`
+	Path             string `json:"path"`
+	ServiceName      string `json:"service_name"`
+	ALPN             string `json:"alpn"`
+	Fingerprint      string `json:"fingerprint"`
+	RealityPublicKey string `json:"reality_public_key"`
+	RealityShortID   string `json:"reality_short_id"`
+	Obfs             string `json:"obfs"`
+	ObfsPassword     string `json:"obfs_password"`
+	UpMbps           int    `json:"up_mbps"`
+	DownMbps         int    `json:"down_mbps"`
+	Plugin           string `json:"plugin"`
+	PluginOpts       string `json:"plugin_opts"`
+	Group            string `json:"group"`
+	SubscriptionID   string `json:"subscription_id"`
+	Enabled          bool   `json:"enabled"`
+	SortOrder        int    `json:"sort_order"`
 }
 
 type StrategyGroup struct {
@@ -99,55 +109,191 @@ type DNSSettings struct {
 	FakeIP        bool   `json:"fake_ip"`
 }
 
+type RuleUpdateSetting struct {
+	BackupURL   string    `json:"backup_url"`
+	AutoUpdate  bool      `json:"auto_update"`
+	UpdateHours int       `json:"update_hours"`
+	LastUpdated time.Time `json:"last_updated"`
+}
+
 type Store struct {
-	Nodes            []Node            `json:"nodes"`
-	SubscriptionURLs []string          `json:"subscription_urls"`
-	Mode             string            `json:"mode"`
-	ProxyPort        int               `json:"proxy_port"`
-	SelectedNode     string            `json:"selected_node"`
-	UpdateHours      int               `json:"update_hours"`
-	LogLevel         string            `json:"log_level"`
-	RuleUpdateHours  int               `json:"rule_update_hours"`
-	RuleBackups      map[string]string `json:"rule_backups"`
-	Subscriptions    []Subscription    `json:"subscriptions"`
-	StrategyGroups   []StrategyGroup   `json:"strategy_groups"`
-	TCPOutbound      string            `json:"tcp_outbound"`
-	UDPOutbound      string            `json:"udp_outbound"`
-	ACLRules         []ACLRule         `json:"acl_rules"`
-	DNS              DNSSettings       `json:"dns"`
+	Nodes            []Node                       `json:"nodes"`
+	SubscriptionURLs []string                     `json:"subscription_urls"`
+	Mode             string                       `json:"mode"`
+	ProxyPort        int                          `json:"proxy_port"`
+	SelectedNode     string                       `json:"selected_node"`
+	UpdateHours      int                          `json:"update_hours"`
+	LogLevel         string                       `json:"log_level"`
+	RuleUpdateHours  int                          `json:"rule_update_hours"`
+	RuleBackups      map[string]string            `json:"rule_backups"`
+	RuleSettings     map[string]RuleUpdateSetting `json:"rule_settings"`
+	Subscriptions    []Subscription               `json:"subscriptions"`
+	StrategyGroups   []StrategyGroup              `json:"strategy_groups"`
+	TCPOutbound      string                       `json:"tcp_outbound"`
+	UDPOutbound      string                       `json:"udp_outbound"`
+	ACLRules         []ACLRule                    `json:"acl_rules"`
+	DNS              DNSSettings                  `json:"dns"`
+}
+
+func decodeBase64(raw string) ([]byte, bool) {
+	raw = strings.TrimSpace(raw)
+	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if decoded, err := encoding.DecodeString(raw); err == nil {
+			return decoded, true
+		}
+	}
+	return nil, false
+}
+
+func anyInt(value any) int {
+	switch typed := value.(type) {
+	case string:
+		parsed, _ := strconv.Atoi(typed)
+		return parsed
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, _ := strconv.Atoi(typed.String())
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func parseVMessLink(line string) (Node, bool) {
+	decoded, ok := decodeBase64(strings.TrimPrefix(line, "vmess://"))
+	if !ok {
+		return Node{}, false
+	}
+	var value struct {
+		PS, Add, ID, TLS, SNI, Net, Host, Path, Scy, FP, ALPN string
+		Port, Aid                                             any
+	}
+	if json.Unmarshal(decoded, &value) != nil {
+		return Node{}, false
+	}
+	node := Node{
+		ID:          fmt.Sprintf("sub-%d", time.Now().UnixNano()),
+		Name:        value.PS,
+		Type:        "vmess",
+		Server:      value.Add,
+		Port:        anyInt(value.Port),
+		UUID:        value.ID,
+		Security:    value.Scy,
+		AlterID:     anyInt(value.Aid),
+		TLS:         value.TLS != "" && !strings.EqualFold(value.TLS, "none"),
+		ServerName:  value.SNI,
+		Transport:   value.Net,
+		Host:        value.Host,
+		Path:        value.Path,
+		ServiceName: value.Path,
+		ALPN:        value.ALPN,
+		Fingerprint: value.FP,
+		Enabled:     true,
+	}
+	if node.Security == "" {
+		node.Security = "auto"
+	}
+	if node.Name == "" {
+		node.Name = node.Server
+	}
+	return node, node.Server != "" && node.Port > 0 && node.UUID != ""
+}
+
+func parseShadowsocksLink(line string) (Node, bool) {
+	raw := strings.TrimPrefix(line, "ss://")
+	raw = strings.TrimPrefix(raw, "shadowsocks://")
+	fragment := ""
+	if index := strings.Index(raw, "#"); index >= 0 {
+		fragment, _ = url.QueryUnescape(raw[index+1:])
+		raw = raw[:index]
+	}
+	if !strings.Contains(raw, "@") {
+		encoded := raw
+		query := ""
+		if index := strings.Index(encoded, "?"); index >= 0 {
+			query = encoded[index:]
+			encoded = encoded[:index]
+		}
+		if decoded, ok := decodeBase64(encoded); ok {
+			raw = string(decoded) + query
+		}
+	}
+	parsed, err := url.Parse("ss://" + raw)
+	if err != nil || parsed.Hostname() == "" || parsed.User == nil {
+		return Node{}, false
+	}
+	method := parsed.User.Username()
+	password, hasPassword := parsed.User.Password()
+	if !hasPassword {
+		if decoded, ok := decodeBase64(method); ok {
+			credentials := string(decoded)
+			if index := strings.Index(credentials, ":"); index > 0 {
+				method, password = credentials[:index], credentials[index+1:]
+				hasPassword = true
+			}
+		}
+	}
+	port, _ := strconv.Atoi(parsed.Port())
+	if !hasPassword || method == "" || password == "" || port == 0 {
+		return Node{}, false
+	}
+	node := Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: fragment, Type: "shadowsocks", Server: parsed.Hostname(), Port: port, Method: method, Password: password, Enabled: true}
+	plugin := parsed.Query().Get("plugin")
+	if plugin != "" {
+		parts := strings.Split(plugin, ";")
+		node.Plugin = parts[0]
+		if len(parts) > 1 {
+			node.PluginOpts = strings.Join(parts[1:], ";")
+		}
+	}
+	if node.Name == "" {
+		node.Name = node.Server
+	}
+	return node, true
 }
 
 func parseSubscription(raw string) []Node {
-	if b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw)); err == nil {
-		raw = string(b)
+	if decoded, ok := decodeBase64(raw); ok && strings.Contains(string(decoded), "://") {
+		raw = string(decoded)
 	}
 	var out []Node
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "vmess://") {
-			if b, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(line, "vmess://")); err == nil {
-				var v struct{ PS, Add, Port, ID, TLS, SNI string }
-				if json.Unmarshal(b, &v) == nil {
-					p, _ := strconv.Atoi(v.Port)
-					out = append(out, Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: v.PS, Type: "vmess", Server: v.Add, Port: p, UUID: v.ID, TLS: v.TLS != "", ServerName: v.SNI, Enabled: true})
-					continue
-				}
+			if node, ok := parseVMessLink(line); ok {
+				out = append(out, node)
+				continue
+			}
+		}
+		if strings.HasPrefix(line, "ss://") || strings.HasPrefix(line, "shadowsocks://") {
+			if node, ok := parseShadowsocksLink(line); ok {
+				out = append(out, node)
+				continue
 			}
 		}
 		u, err := url.Parse(line)
 		if err != nil || u.Hostname() == "" {
 			continue
 		}
-		if u.Scheme != "vless" && u.Scheme != "trojan" && u.Scheme != "shadowsocks" && u.Scheme != "ss" && u.Scheme != "hysteria2" && u.Scheme != "anytls" && u.Scheme != "naive" && u.Scheme != "naive+https" && u.Scheme != "naive+quic" {
+		if u.Scheme != "vless" && u.Scheme != "trojan" && u.Scheme != "hysteria2" && u.Scheme != "hy2" && u.Scheme != "anytls" && u.Scheme != "naive" && u.Scheme != "naive+https" && u.Scheme != "naive+quic" {
 			continue
 		}
 		nodeType := u.Scheme
+		if nodeType == "hy2" {
+			nodeType = "hysteria2"
+		}
 		naiveTransport := ""
 		if strings.HasPrefix(nodeType, "naive+") {
 			naiveTransport = strings.TrimPrefix(nodeType, "naive+")
 			nodeType = "naive"
 		}
-		n := Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: u.Fragment, Type: nodeType, Server: u.Hostname(), TLS: true, Enabled: true, Transport: naiveTransport}
+		tlsEnabled := nodeType == "trojan" || nodeType == "hysteria2" || nodeType == "anytls" || nodeType == "naive"
+		security := strings.ToLower(u.Query().Get("security"))
+		if security == "tls" || security == "reality" || u.Query().Get("tls") == "1" {
+			tlsEnabled = true
+		}
+		n := Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: u.Fragment, Type: nodeType, Server: u.Hostname(), TLS: tlsEnabled, Enabled: true, Transport: naiveTransport}
 		if p, err := strconv.Atoi(u.Port()); err == nil {
 			n.Port = p
 		}
@@ -169,15 +315,28 @@ func parseSubscription(raw string) []Node {
 		}
 		n.Host = u.Query().Get("host")
 		n.Path = u.Query().Get("path")
+		n.ServiceName = u.Query().Get("serviceName")
+		if n.ServiceName == "" {
+			n.ServiceName = u.Query().Get("service_name")
+		}
 		n.Flow = u.Query().Get("flow")
 		n.ALPN = u.Query().Get("alpn")
 		n.Fingerprint = u.Query().Get("fp")
+		n.RealityPublicKey = u.Query().Get("pbk")
+		n.RealityShortID = u.Query().Get("sid")
+		n.Obfs = u.Query().Get("obfs")
+		n.ObfsPassword = u.Query().Get("obfs-password")
+		if n.ObfsPassword == "" {
+			n.ObfsPassword = u.Query().Get("obfs_password")
+		}
+		n.UpMbps, _ = strconv.Atoi(u.Query().Get("upmbps"))
+		n.DownMbps, _ = strconv.Atoi(u.Query().Get("downmbps"))
 		if n.Type == "naive" {
 			n.Username = n.UUID
 			n.UUID = ""
 		}
-		if n.Type == "ss" {
-			n.Type = "shadowsocks"
+		if n.Name == "" {
+			n.Name = n.Server
 		}
 		out = append(out, n)
 	}
@@ -185,29 +344,18 @@ func parseSubscription(raw string) []Node {
 }
 
 func fetchSubscription(rawURL string) ([]Node, error) {
-	if !strings.HasPrefix(rawURL, "https://") {
+	if !httpsURL(rawURL) {
 		return nil, fmt.Errorf("subscription must use https")
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err := client.Get(rawURL)
-		if err == nil {
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-			resp.Body.Close()
-			if readErr == nil && resp.StatusCode < 300 {
-				nodes := parseSubscription(string(body))
-				if len(nodes) > 0 {
-					return nodes, nil
-				}
-				lastErr = fmt.Errorf("no supported nodes")
-			} else if readErr != nil {
-				lastErr = readErr
-			} else {
-				lastErr = fmt.Errorf("subscription http status %d", resp.StatusCode)
-			}
-		} else {
+		body, err := downloadResource(rawURL, 4<<20, 20*time.Second)
+		if err != nil {
 			lastErr = err
+		} else if nodes := parseSubscription(string(body)); len(nodes) > 0 {
+			return nodes, nil
+		} else {
+			lastErr = fmt.Errorf("no supported nodes")
 		}
 		if attempt < 2 {
 			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
@@ -216,8 +364,56 @@ func fetchSubscription(rawURL string) ([]Node, error) {
 	return nil, lastErr
 }
 
+var fetchSubscriptionFn = fetchSubscription
+
 func updateSubscriptions() error {
 	return updateSubscriptionsWithForce(false)
+}
+
+func subscriptionNodeKey(node Node) string {
+	node.ID = ""
+	node.Name = ""
+	node.Group = ""
+	node.SubscriptionID = ""
+	node.Enabled = false
+	node.SortOrder = 0
+	payload, _ := json.Marshal(node)
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func reconcileSubscriptionNodes(existing, fetched []Node, sub Subscription) []Node {
+	previous := map[string][]Node{}
+	usedIDs := map[string]bool{}
+	for _, node := range existing {
+		usedIDs[node.ID] = true
+		if node.SubscriptionID == sub.ID {
+			key := subscriptionNodeKey(node)
+			previous[key] = append(previous[key], node)
+		}
+	}
+	occurrences := map[string]int{}
+	for i := range fetched {
+		key := subscriptionNodeKey(fetched[i])
+		fetched[i].SubscriptionID = sub.ID
+		fetched[i].Group = sub.Name
+		if matches := previous[key]; len(matches) > 0 {
+			fetched[i].ID = matches[0].ID
+			fetched[i].Enabled = matches[0].Enabled
+			previous[key] = matches[1:]
+			continue
+		}
+		fetched[i].Enabled = true
+		baseID := fmt.Sprintf("sub-%x", sha256.Sum256([]byte(sub.ID+":"+key)))[:24]
+		candidate := baseID
+		for usedIDs[candidate] {
+			occurrences[baseID]++
+			candidate = fmt.Sprintf("%s-%d", baseID, occurrences[baseID]+1)
+		}
+		fetched[i].ID = candidate
+		usedIDs[candidate] = true
+	}
+	return fetched
 }
 
 func subscriptionDue(sub Subscription, now time.Time) bool {
@@ -230,10 +426,12 @@ func subscriptionDue(sub Subscription, now time.Time) bool {
 
 func updateSubscriptionsWithForce(force bool) error {
 	s := load()
+	wasRunning := proxyRunningFn()
 	if len(s.Subscriptions) == 0 {
 		s = migrateLegacy(s)
 	}
 	fetchedBySub := map[string][]Node{}
+	errors := make([]string, 0)
 	now := time.Now()
 	for i := range s.Subscriptions {
 		sub := &s.Subscriptions[i]
@@ -243,15 +441,12 @@ func updateSubscriptionsWithForce(force bool) error {
 		if !force && !subscriptionDue(*sub, now) {
 			continue
 		}
-		fetched, err := fetchSubscription(sub.URL)
+		fetched, err := fetchSubscriptionFn(sub.URL)
 		if err != nil {
-			return fmt.Errorf("%s: %w", sub.URL, err)
+			errors = append(errors, fmt.Sprintf("%s: %v", sub.Name, err))
+			continue
 		}
-		for j := range fetched {
-			fetched[j].SubscriptionID = sub.ID
-			fetched[j].Group = sub.Name
-			fetched[j].Enabled = true
-		}
+		fetched = reconcileSubscriptionNodes(s.Nodes, fetched, *sub)
 		fetchedBySub[sub.ID] = fetched
 		sub.LastUpdated = now
 	}
@@ -259,6 +454,9 @@ func updateSubscriptionsWithForce(force bool) error {
 		return fmt.Errorf("no subscriptions configured")
 	}
 	if len(fetchedBySub) == 0 {
+		if len(errors) > 0 {
+			return fmt.Errorf("%s", strings.Join(errors, "; "))
+		}
 		return nil
 	}
 	kept := make([]Node, 0, len(s.Nodes))
@@ -281,7 +479,15 @@ func updateSubscriptionsWithForce(force bool) error {
 	if err := save(s); err != nil {
 		return err
 	}
-	return restartProxy()
+	if wasRunning {
+		if err := restartProxyFn(); err != nil {
+			return err
+		}
+	}
+	if len(errors) > 0 {
+		return fmt.Errorf("%s", strings.Join(errors, "; "))
+	}
+	return nil
 }
 
 var mu sync.Mutex
@@ -290,6 +496,8 @@ var configPath = "/etc/armwall/sing-box.json"
 var macACLPath = "/etc/armwall/mac-acl.tsv"
 var naiveConfigDir = "/etc/armwall/naive"
 var logDir = "/var/log/armwall"
+var gatewayPath = "/usr/local/bin/armwall-gateway"
+var gatewayStatePath = "/var/lib/armwall/gateway.state"
 var proxyPort = 1080
 var tproxyEnabled bool
 var tproxyPort = 11081
@@ -308,10 +516,67 @@ func ruleSet(tag string) map[string]any {
 	}
 	return map[string]any{"type": "remote", "tag": tag, "format": "binary", "url": ruleURLs[tag], "download_detour": "direct"}
 }
+
+func httpsURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && u.Scheme == "https" && u.Hostname() != ""
+}
+
+func outboundHTTPClients(timeout time.Duration) []*http.Client {
+	clients := make([]*http.Client, 0, 2)
+	address := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	if conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond); err == nil {
+		_ = conn.Close()
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = http.ProxyURL(&url.URL{Scheme: "socks5", Host: address})
+		clients = append(clients, &http.Client{Transport: transport, Timeout: timeout})
+	}
+	direct := http.DefaultTransport.(*http.Transport).Clone()
+	direct.Proxy = nil
+	return append(clients, &http.Client{Transport: direct, Timeout: timeout})
+}
+
+func downloadResource(raw string, limit int64, timeout time.Duration) ([]byte, error) {
+	if !httpsURL(raw) {
+		return nil, fmt.Errorf("download URL must use https")
+	}
+	var lastErr error
+	for _, client := range outboundHTTPClients(timeout) {
+		resp, err := client.Get(raw)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("http status %d", resp.StatusCode)
+			continue
+		}
+		if int64(len(body)) > limit {
+			lastErr = fmt.Errorf("download exceeds %d bytes", limit)
+			continue
+		}
+		return body, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("download failed")
+	}
+	return nil, lastErr
+}
+
 func updateRule(tag, backup string) error {
 	primary, ok := ruleURLs[tag]
 	if !ok {
 		return fmt.Errorf("unknown rule")
+	}
+	backup = strings.TrimSpace(backup)
+	if backup != "" && !httpsURL(backup) {
+		return fmt.Errorf("backup rule URL must use https")
 	}
 	urls := []string{primary}
 	if backup != "" {
@@ -319,32 +584,121 @@ func updateRule(tag, backup string) error {
 	}
 	var last error
 	for _, raw := range urls {
-		resp, err := (&http.Client{Timeout: 30 * time.Second}).Get(raw)
-		if err != nil {
-			last = err
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-		resp.Body.Close()
-		if err != nil || resp.StatusCode >= 300 || len(body) < 16 {
-			last = fmt.Errorf("download failed")
+		body, err := downloadResource(raw, 32<<20, 30*time.Second)
+		if err != nil || len(body) < 16 {
+			if err == nil {
+				err = fmt.Errorf("downloaded rule is empty")
+			}
+			last = fmt.Errorf("%s: %w", raw, err)
 			continue
 		}
 		dir := "/var/lib/armwall/rules"
 		if err = os.MkdirAll(dir, 0750); err != nil {
 			return err
 		}
-		return os.WriteFile(filepath.Join(dir, tag+".srs"), body, 0640)
+		return writeAtomicFile(filepath.Join(dir, tag+".srs"), body, 0640)
 	}
 	return last
+}
+
+var updateRuleFn = updateRule
+
+func normalizeRuleSettings(s *Store) {
+	if s.RuleSettings == nil {
+		s.RuleSettings = map[string]RuleUpdateSetting{}
+	}
+	if s.RuleBackups == nil {
+		s.RuleBackups = map[string]string{}
+	}
+	legacyHours := s.RuleUpdateHours
+	if legacyHours < 1 || legacyHours > 168 {
+		legacyHours = 6
+	}
+	for tag := range ruleURLs {
+		setting := s.RuleSettings[tag]
+		if setting.BackupURL == "" {
+			setting.BackupURL = strings.TrimSpace(s.RuleBackups[tag])
+		}
+		if setting.UpdateHours < 1 || setting.UpdateHours > 168 {
+			setting.UpdateHours = legacyHours
+		}
+		s.RuleSettings[tag] = setting
+		s.RuleBackups[tag] = setting.BackupURL
+	}
+	s.RuleUpdateHours = legacyHours
+}
+
+func ruleUpdateDue(setting RuleUpdateSetting, now time.Time) bool {
+	if !setting.AutoUpdate {
+		return false
+	}
+	hours := setting.UpdateHours
+	if hours < 1 || hours > 168 {
+		hours = 6
+	}
+	return setting.LastUpdated.IsZero() || now.Sub(setting.LastUpdated) >= time.Duration(hours)*time.Hour
+}
+
+func updateConfiguredRules(s *Store, force bool, onlyTag string, now time.Time) ([]string, error) {
+	normalizeRuleSettings(s)
+	if onlyTag != "" {
+		if _, ok := ruleURLs[onlyTag]; !ok {
+			return nil, fmt.Errorf("unknown rule")
+		}
+	}
+	updated := make([]string, 0, len(ruleURLs))
+	errors := make([]string, 0)
+	for tag := range ruleURLs {
+		if onlyTag != "" && tag != onlyTag {
+			continue
+		}
+		setting := s.RuleSettings[tag]
+		if !force && !ruleUpdateDue(setting, now) {
+			continue
+		}
+		if err := updateRuleFn(tag, setting.BackupURL); err != nil {
+			errors = append(errors, tag+": "+err.Error())
+			continue
+		}
+		setting.LastUpdated = now
+		s.RuleSettings[tag] = setting
+		updated = append(updated, tag)
+	}
+	if len(errors) > 0 {
+		return updated, fmt.Errorf("%s", strings.Join(errors, "; "))
+	}
+	return updated, nil
+}
+
+func applyScheduledRuleUpdates() (int, error) {
+	s := load()
+	wasRunning := proxyRunningFn()
+	updated, updateErr := updateConfiguredRules(&s, false, "", time.Now())
+	if len(updated) == 0 {
+		return 0, updateErr
+	}
+	if err := writeConfig(s); err != nil {
+		return 0, err
+	}
+	if err := save(s); err != nil {
+		return 0, err
+	}
+	if wasRunning {
+		if err := restartProxy(); err != nil {
+			return 0, err
+		}
+	}
+	return len(updated), updateErr
 }
 
 func load() Store {
 	s, err := loadDB()
 	if err == nil {
+		normalizeStore(&s)
 		return s
 	}
 	legacy := migrateLegacy(loadJSON())
+	normalizeStore(&legacy)
 	_ = saveDB(legacy)
 	return legacy
 }
@@ -356,6 +710,7 @@ func save(s Store) error {
 }
 
 func normalizeStore(s *Store) {
+	normalizeRuleSettings(s)
 	s.SubscriptionURLs = s.SubscriptionURLs[:0]
 	for _, sub := range s.Subscriptions {
 		s.SubscriptionURLs = append(s.SubscriptionURLs, sub.URL)
@@ -417,6 +772,7 @@ func normalizeStore(s *Store) {
 
 func persistStore(next Store, reload bool) error {
 	previous := load()
+	wasRunning := proxyRunningFn()
 	previousProxyPort := proxyPort
 	normalizeStore(&next)
 	if !reload {
@@ -434,15 +790,46 @@ func persistStore(next Store, reload bool) error {
 		_ = writeConfig(previous)
 		return err
 	}
-	if err := restartProxyFn(); err != nil {
-		proxyPort = previousProxyPort
-		_ = save(previous)
-		_ = writeConfig(previous)
-		_ = restartProxyFn()
-		return err
+	if wasRunning {
+		if err := restartProxyFn(); err != nil {
+			proxyPort = previousProxyPort
+			_ = save(previous)
+			_ = writeConfig(previous)
+			_ = restartProxyFn()
+			return err
+		}
+		if err := reloadGatewayFn(); err != nil {
+			proxyPort = previousProxyPort
+			_ = save(previous)
+			_ = writeConfig(previous)
+			_ = restartProxyFn()
+			_ = reloadGatewayFn()
+			return err
+		}
 	}
 	return nil
 }
+
+func reloadGatewayIfActive() error {
+	if _, err := os.Stat(gatewayStatePath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	out, err := exec.Command(gatewayPath, "reload").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("transparent gateway reload failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+var reloadGatewayFn = reloadGatewayIfActive
+
+func proxyRunning() bool {
+	return exec.Command("systemctl", "is-active", "--quiet", "armwall-sing-box.service").Run() == nil
+}
+
+var proxyRunningFn = proxyRunning
 
 func validateNode(n *Node) error {
 	n.Name = strings.TrimSpace(n.Name)
@@ -468,6 +855,12 @@ func validateNode(n *Node) error {
 		}
 		if n.Transport != "https" && n.Transport != "quic" {
 			return fmt.Errorf("NaiveProxy transport must be https or quic")
+		}
+	}
+	if n.RealityPublicKey != "" {
+		n.TLS = true
+		if n.Fingerprint == "" {
+			n.Fingerprint = "chrome"
 		}
 	}
 	return nil
@@ -865,15 +1258,49 @@ func config(s Store) map[string]any {
 		if n.Username != "" {
 			o["username"] = n.Username
 		}
-		if n.Method != "" {
+		if n.Type == "vmess" {
+			security := n.Security
+			if security == "" {
+				security = "auto"
+			}
+			o["security"] = security
+			if n.AlterID > 0 {
+				o["alter_id"] = n.AlterID
+			}
+		} else if n.Method != "" {
 			o["method"] = n.Method
+		}
+		if n.Type == "shadowsocks" && n.Plugin != "" {
+			o["plugin"] = n.Plugin
+			if n.PluginOpts != "" {
+				o["plugin_opts"] = n.PluginOpts
+			}
+		}
+		if n.Type == "hysteria2" {
+			if n.Obfs != "" {
+				o["obfs"] = map[string]any{"type": n.Obfs, "password": n.ObfsPassword}
+			}
+			if n.UpMbps > 0 {
+				o["up_mbps"] = n.UpMbps
+			}
+			if n.DownMbps > 0 {
+				o["down_mbps"] = n.DownMbps
+			}
 		}
 		if n.Flow != "" {
 			o["flow"] = n.Flow
 		}
 		if n.Transport != "" {
 			tr := map[string]any{"type": n.Transport}
-			if n.Path != "" {
+			if n.Transport == "grpc" {
+				serviceName := n.ServiceName
+				if serviceName == "" {
+					serviceName = strings.TrimPrefix(n.Path, "/")
+				}
+				if serviceName != "" {
+					tr["service_name"] = serviceName
+				}
+			} else if n.Path != "" {
 				tr["path"] = n.Path
 			}
 			if n.Host != "" {
@@ -892,6 +1319,16 @@ func config(s Store) map[string]any {
 			}
 			if n.Fingerprint != "" {
 				tls["utls"] = map[string]any{"enabled": true, "fingerprint": n.Fingerprint}
+			}
+			if n.RealityPublicKey != "" {
+				if n.Fingerprint == "" {
+					tls["utls"] = map[string]any{"enabled": true, "fingerprint": "chrome"}
+				}
+				reality := map[string]any{"enabled": true, "public_key": n.RealityPublicKey}
+				if n.RealityShortID != "" {
+					reality["short_id"] = n.RealityShortID
+				}
+				tls["reality"] = reality
 			}
 			o["tls"] = tls
 		}
@@ -1115,6 +1552,18 @@ func run(w http.ResponseWriter, name string, args ...string) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write(out)
+}
+
+func runCoreUpdate(w http.ResponseWriter, args ...string) {
+	cmd := exec.Command(updateCorePath, args...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("ARMWALL_PROXY_PORT=%d", proxyPort))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		http.Error(w, string(out), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(out)
 }
 func restartProxy() error {
 	if _, err := exec.LookPath("naive"); err == nil {
@@ -1424,7 +1873,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid url", 400)
 			return
 		}
-		nodes, err := fetchSubscription(v.URL)
+		nodes, err := fetchSubscriptionFn(v.URL)
 		if err != nil {
 			http.Error(w, err.Error(), 502)
 			return
@@ -1452,11 +1901,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			s.Subscriptions = append(s.Subscriptions, Subscription{ID: fmt.Sprintf("subsrc-%d", time.Now().UnixNano()), Name: name, URL: v.URL, UpdateHours: hours, Enabled: true})
 			sub = &s.Subscriptions[len(s.Subscriptions)-1]
 		}
-		for i := range nodes {
-			nodes[i].SubscriptionID = sub.ID
-			nodes[i].Group = sub.Name
-			nodes[i].Enabled = true
-		}
+		nodes = reconcileSubscriptionNodes(s.Nodes, nodes, *sub)
 		sub.LastUpdated = time.Now()
 		kept := make([]Node, 0, len(s.Nodes))
 		for _, n := range s.Nodes {
@@ -1517,7 +1962,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "subscription not found", 404)
 			return
 		}
-		nodes, err := fetchSubscription(sub.URL)
+		nodes, err := fetchSubscriptionFn(sub.URL)
 		if err != nil {
 			http.Error(w, err.Error(), 502)
 			return
@@ -1526,11 +1971,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "subscription contains no supported nodes", 422)
 			return
 		}
-		for i := range nodes {
-			nodes[i].SubscriptionID = sub.ID
-			nodes[i].Group = sub.Name
-			nodes[i].Enabled = true
-		}
+		nodes = reconcileSubscriptionNodes(s.Nodes, nodes, *sub)
 		kept := make([]Node, 0, len(s.Nodes))
 		for _, n := range s.Nodes {
 			if n.SubscriptionID != sub.ID {
@@ -1998,12 +2439,17 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.ProxyPort = v.ProxyPort
-		proxyPort = v.ProxyPort
-		if err := writeConfig(s); err != nil {
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		if err := save(s); err != nil {
+		json.NewEncoder(w).Encode(s)
+	case "/api/service/start":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := writeConfig(s); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -2011,31 +2457,65 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		json.NewEncoder(w).Encode(s)
-	case "/api/service/start":
-		if err := writeConfig(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		run(w, "systemctl", "restart", "armwall-sing-box.service")
-	case "/api/service/stop":
-		run(w, "systemctl", "stop", "armwall-sing-box.service")
-	case "/api/service/status":
-		run(w, "systemctl", "is-active", "armwall-sing-box.service")
-	case "/api/logs":
-		if r.URL.Query().Get("download") == "1" {
-			w.Header().Set("Content-Disposition", "attachment; filename=armwall.log")
-		}
-		b, err := os.ReadFile(filepath.Join(logDir, "sing-box.log"))
-		if err != nil && !os.IsNotExist(err) {
+		if err := reloadGatewayIfActive(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if len(b) > 256<<10 {
-			b = b[len(b)-(256<<10):]
+		_, _ = w.Write([]byte("active\n"))
+	case "/api/service/stop":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
 		}
-		w.Write(b)
+		gatewaySuspended := false
+		if _, statErr := os.Stat(gatewayStatePath); statErr == nil {
+			if gatewayOut, gatewayErr := exec.Command(gatewayPath, "suspend").CombinedOutput(); gatewayErr != nil {
+				http.Error(w, string(gatewayOut), 500)
+				return
+			}
+			gatewaySuspended = true
+		}
+		out, err := exec.Command("systemctl", "stop", "armwall-sing-box.service", "armwall-naive.service").CombinedOutput()
+		if err != nil {
+			if gatewaySuspended {
+				_, _ = exec.Command(gatewayPath, "restore").CombinedOutput()
+			}
+			http.Error(w, strings.TrimSpace(string(out)), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("inactive\n"))
+	case "/api/service/status":
+		out, _ := exec.Command("systemctl", "is-active", "armwall-sing-box.service").CombinedOutput()
+		status := strings.TrimSpace(string(out))
+		if status == "" {
+			status = "unknown"
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(status + "\n"))
+	case "/api/logs":
+		path := filepath.Join(logDir, "sing-box.log")
+		file, err := os.Open(path)
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer file.Close()
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if r.URL.Query().Get("download") == "1" {
+			w.Header().Set("Content-Disposition", "attachment; filename=armwall.log")
+			_, _ = io.Copy(w, file)
+			return
+		}
+		if info, statErr := file.Stat(); statErr == nil && info.Size() > 256<<10 {
+			_, _ = file.Seek(-(256 << 10), io.SeekEnd)
+		}
+		_, _ = io.Copy(w, file)
 	case "/api/log/clear":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -2058,18 +2538,13 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.LogLevel = v.Level
-		if err := writeConfig(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		save(s)
-		if err := restartProxy(); err != nil {
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		json.NewEncoder(w).Encode(s)
 	case "/api/rules":
-		json.NewEncoder(w).Encode(map[string]any{"rules": ruleURLs, "backups": s.RuleBackups, "update_hours": s.RuleUpdateHours})
+		json.NewEncoder(w).Encode(map[string]any{"rules": ruleURLs, "settings": s.RuleSettings, "backups": s.RuleBackups, "update_hours": s.RuleUpdateHours})
 	case "/api/rules/update":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -2077,21 +2552,29 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		var v struct{ Tag string }
 		json.NewDecoder(r.Body).Decode(&v)
-		backup := ""
-		if s.RuleBackups != nil {
-			backup = s.RuleBackups[v.Tag]
-		}
-		if err := updateRule(v.Tag, backup); err != nil {
+		updated, err := updateConfiguredRules(&s, true, v.Tag, time.Now())
+		if err != nil {
 			http.Error(w, err.Error(), 502)
+			return
+		}
+		if len(updated) != 1 {
+			http.Error(w, "rule was not updated", 500)
 			return
 		}
 		if err := writeConfig(s); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		if err := restartProxy(); err != nil {
+		if err := save(s); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
+		}
+		wasRunning := proxyRunningFn()
+		if wasRunning {
+			if err := restartProxy(); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
 		}
 		json.NewEncoder(w).Encode(map[string]any{"updated": v.Tag})
 	case "/api/rules/settings":
@@ -2102,17 +2585,24 @@ func api(w http.ResponseWriter, r *http.Request) {
 		var v struct {
 			Tag, Backup string
 			Hours       int
+			AutoUpdate  bool
 		}
 		json.NewDecoder(r.Body).Decode(&v)
 		if _, ok := ruleURLs[v.Tag]; !ok || v.Hours < 1 || v.Hours > 168 {
 			http.Error(w, "invalid rule settings", 400)
 			return
 		}
-		if s.RuleBackups == nil {
-			s.RuleBackups = map[string]string{}
+		v.Backup = strings.TrimSpace(v.Backup)
+		if v.Backup != "" && !httpsURL(v.Backup) {
+			http.Error(w, "backup rule URL must use https", 400)
+			return
 		}
+		setting := s.RuleSettings[v.Tag]
+		setting.BackupURL = v.Backup
+		setting.UpdateHours = v.Hours
+		setting.AutoUpdate = v.AutoUpdate
+		s.RuleSettings[v.Tag] = setting
 		s.RuleBackups[v.Tag] = v.Backup
-		s.RuleUpdateHours = v.Hours
 		if err := save(s); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -2137,7 +2627,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 		resp.Body.Close()
 		json.NewEncoder(w).Encode(map[string]any{"target": name, "status": resp.StatusCode, "ms": time.Since(start).Milliseconds()})
 	case "/api/gateway/status":
-		run(w, "/usr/local/bin/armwall-gateway", "status")
+		run(w, gatewayPath, "status")
 	case "/api/gateway/enable":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -2148,11 +2638,16 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid interface", 400)
 			return
 		}
-		cmd := exec.Command("/usr/local/bin/armwall-gateway", "enable")
+		cmd := exec.Command(gatewayPath, "enable")
 		cmd.Env = append(os.Environ(), "ARMWALL_LAN_IF="+v.LAN, "ARMWALL_WAN_IF="+v.WAN)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			http.Error(w, string(out), 500)
+			return
+		}
+		if serviceOut, serviceErr := exec.Command("systemctl", "enable", "--now", "armwall-gateway.service").CombinedOutput(); serviceErr != nil {
+			_, _ = exec.Command(gatewayPath, "disable").CombinedOutput()
+			http.Error(w, string(serviceOut), 500)
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain")
@@ -2162,7 +2657,17 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method", 405)
 			return
 		}
-		run(w, "/usr/local/bin/armwall-gateway", "disable")
+		out, err := exec.Command(gatewayPath, "disable").CombinedOutput()
+		if err != nil {
+			http.Error(w, string(out), 500)
+			return
+		}
+		if serviceOut, serviceErr := exec.Command("systemctl", "disable", "--now", "armwall-gateway.service").CombinedOutput(); serviceErr != nil {
+			http.Error(w, string(serviceOut), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write(out)
 	case "/api/node/test":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -2228,16 +2733,15 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no supported links", 422)
 			return
 		}
-		if err := writeConfig(Store{Nodes: append(s.Nodes, nodes...), Mode: s.Mode, ProxyPort: s.ProxyPort}); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
+		for i := range nodes {
+			nodes[i].SubscriptionID = ""
+			if err := validateNode(&nodes[i]); err != nil {
+				http.Error(w, fmt.Sprintf("invalid imported node: %v", err), 422)
+				return
+			}
 		}
 		s.Nodes = append(s.Nodes, nodes...)
-		if err := save(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := restartProxy(); err != nil {
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -2257,7 +2761,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		args := []string{v.Core, v.Action}
-		run(w, updateCorePath, args...)
+		runCoreUpdate(w, args...)
 	case "/api/core/upload":
 		handleCoreUpload(w, r)
 	case "/api/config/export":
@@ -2480,6 +2984,14 @@ func main() {
 			log.Fatal(err)
 		}
 		log.Print("subscriptions updated")
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--update-rules" {
+		updated, err := applyScheduledRuleUpdates()
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("rules updated: %d", updated)
 		return
 	}
 	http.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

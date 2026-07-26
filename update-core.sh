@@ -7,8 +7,19 @@ BIN_DIR=${ARMWALL_BIN_DIR:-/usr/local/bin}
 BACKUP_DIR=${ARMWALL_BACKUP_DIR:-/var/lib/armwall/backups}
 CONFIG=${ARMWALL_CONFIG:-/etc/armwall/sing-box.json}
 LAST_BACKUP=
+PROXY_PORT=${ARMWALL_PROXY_PORT:-}
 
 die(){ echo "armwall-update-core: $*" >&2; exit 1; }
+fetch_file(){
+  url=$1; destination=$2
+  if [ -n "$PROXY_PORT" ]; then
+    if curl -fsSL --connect-timeout 5 --proxy "socks5h://127.0.0.1:$PROXY_PORT" "$url" -o "$destination" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$destination"
+  fi
+  curl -fsSL --connect-timeout 10 "$url" -o "$destination"
+}
 arch(){
   case "$(uname -m)" in
     x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; armv7*) echo armv7;; armv6*) echo armv6;; *) die "unsupported architecture: $(uname -m)";;
@@ -36,6 +47,7 @@ install_binary(){
 }
 restart_sing_box(){
   [ -f "$CONFIG" ] || return 0
+  systemctl is-active --quiet armwall-sing-box.service || return 0
   if ! systemctl restart armwall-sing-box.service; then
     if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP" ]; then
       install -m 0755 "$LAST_BACKUP" "$BIN_DIR/sing-box"
@@ -46,11 +58,12 @@ restart_sing_box(){
 }
 latest_sing_box(){
   a=$(arch); [ "$a" != armv6 ] || die "official sing-box releases do not provide armv6 builds; use manual"
-  version=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' | head -1)
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  fetch_file https://api.github.com/repos/SagerNet/sing-box/releases/latest "$tmp/release.json"
+  version=$(sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' "$tmp/release.json" | head -1)
   [ -n "$version" ] || die "cannot determine latest sing-box version"
   url="https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-$a-glibc.tar.gz"
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-  curl -fL "$url" -o "$tmp/core.tgz"
+  fetch_file "$url" "$tmp/core.tgz"
   tar -tzf "$tmp/core.tgz" >/dev/null || die "invalid archive"
   tar -xzf "$tmp/core.tgz" -C "$tmp"
   install_binary "$(find "$tmp" -type f -name sing-box | head -1)" sing-box
@@ -64,11 +77,12 @@ latest_naive(){
     armv7) a=arm;;
     armv6) die "automatic NaiveProxy updates are unavailable for ARMv6; use manual upload";;
   esac
-  tag=$(curl -fsSL https://api.github.com/repos/klzgrad/naiveproxy/releases/latest | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -1)
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  fetch_file https://api.github.com/repos/klzgrad/naiveproxy/releases/latest "$tmp/release.json"
+  tag=$(sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' "$tmp/release.json" | head -1)
   [ -n "$tag" ] || die "cannot determine latest NaiveProxy version"
   url="https://github.com/klzgrad/naiveproxy/releases/download/$tag/naiveproxy-$tag-linux-$a.tar.xz"
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-  curl -fL "$url" -o "$tmp/core.tar.xz"
+  fetch_file "$url" "$tmp/core.tar.xz"
   tar -tJf "$tmp/core.tar.xz" >/dev/null || die "invalid archive"
   tar -xJf "$tmp/core.tar.xz" -C "$tmp"
   binary=$(find "$tmp" -type f -name naive | head -1)
@@ -76,12 +90,16 @@ latest_naive(){
   install_binary "$binary" naive
   naive --version 2>&1 | head -1
 }
+restart_naive(){
+  systemctl is-active --quiet armwall-naive.service || return 0
+  systemctl restart armwall-naive.service
+}
 case "$CORE:$ACTION" in
   sing-box:version) sing-box version;;
   sing-box:latest) latest_sing_box;;
   sing-box:manual) [ -n "$SOURCE" ] || die "manual requires a file path"; install_binary "$SOURCE" sing-box; restart_sing_box; sing-box version;;
   naive:version) naive --version 2>&1 | head -1;;
-  naive:latest) latest_naive; systemctl restart armwall-naive.service 2>/dev/null || true;;
-  naive:manual) [ -n "$SOURCE" ] || die "manual requires a file path"; install_binary "$SOURCE" naive; systemctl restart armwall-naive.service 2>/dev/null || true; naive --version 2>&1 | head -1;;
+  naive:latest) latest_naive; restart_naive;;
+  naive:manual) [ -n "$SOURCE" ] || die "manual requires a file path"; install_binary "$SOURCE" naive; restart_naive; naive --version 2>&1 | head -1;;
   *) echo "usage: $0 {sing-box|naive} {version|latest|manual} [file]"; exit 2;;
 esac
