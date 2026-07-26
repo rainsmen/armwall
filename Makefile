@@ -8,7 +8,7 @@ build:
 test:
 	$(GO) test ./...
 	node --check web/app.js
-	sh -n gateway.sh install.sh update-core.sh naive-supervisor.sh
+	sh -n gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh
 
 release:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall-linux-armv6 .

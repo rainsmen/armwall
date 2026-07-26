@@ -35,19 +35,27 @@ make release VERSION=0.1.0
 
 ## 安装
 
-在目标 Armbian 设备上以 root 运行：
+在目标 Armbian/Debian 设备上执行一键安装命令：
 
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh | sudo sh
 ```
 
-安装器会根据 `uname -m` 选择当前目录中的构建文件，也可明确指定：
+脚本会下载完整安装包，根据 `uname -m` 自动选择 ARMv6、ARMv7、ARM64 或 AMD64 架构的 ArmWall 程序，并安装、启用所需服务。安装完成后打开 `http://设备IP:8080`，首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
+
+### 离线安装
+
+无法联网下载项目时，将完整发布包传到设备并在解压目录中以 root 运行：
 
 ```bash
-./install.sh ./armwall-linux-armv7
+sudo ./install.sh
 ```
 
-安装完成后打开 `http://设备IP:8080`。首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
+安装器会自动选择当前目录中的架构构建文件，也可明确指定：
+
+```bash
+sudo ./install.sh ./armwall-linux-armv7
+```
 
 主要文件：
 
