@@ -5,6 +5,8 @@ ACTION=${2:-}
 SOURCE=${3:-}
 BIN_DIR=${ARMWALL_BIN_DIR:-/usr/local/bin}
 BACKUP_DIR=${ARMWALL_BACKUP_DIR:-/var/lib/armwall/backups}
+CONFIG=${ARMWALL_CONFIG:-/etc/armwall/sing-box.json}
+LAST_BACKUP=
 
 die(){ echo "armwall-update-core: $*" >&2; exit 1; }
 arch(){
@@ -18,10 +20,29 @@ install_binary(){
   file "$src" | grep -q ELF || die "uploaded file is not an ELF executable"
   mkdir -p "$BIN_DIR" "$BACKUP_DIR"
   stamp=$(date +%Y%m%d%H%M%S)
-  [ ! -x "$BIN_DIR/$name" ] || cp -p "$BIN_DIR/$name" "$BACKUP_DIR/$name.$stamp"
+  if [ -x "$BIN_DIR/$name" ]; then
+    LAST_BACKUP="$BACKUP_DIR/$name.$stamp"
+    cp -p "$BIN_DIR/$name" "$LAST_BACKUP"
+  fi
   install -m 0755 "$src" "$BIN_DIR/$name.new"
-  "$BIN_DIR/$name.new" version >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "binary self-check failed"; }
+  case "$name" in
+    sing-box)
+      "$BIN_DIR/$name.new" version >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "binary self-check failed"; }
+      [ ! -f "$CONFIG" ] || "$BIN_DIR/$name.new" check -c "$CONFIG" >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "existing configuration is incompatible with the uploaded binary"; }
+      ;;
+    naive) "$BIN_DIR/$name.new" --version >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "binary self-check failed"; };;
+  esac
   mv "$BIN_DIR/$name.new" "$BIN_DIR/$name"
+}
+restart_sing_box(){
+  [ -f "$CONFIG" ] || return 0
+  if ! systemctl restart armwall-sing-box.service; then
+    if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP" ]; then
+      install -m 0755 "$LAST_BACKUP" "$BIN_DIR/sing-box"
+      systemctl restart armwall-sing-box.service 2>/dev/null || true
+    fi
+    die "sing-box restart failed; the previous binary was restored"
+  fi
 }
 latest_sing_box(){
   a=$(arch); [ "$a" != armv6 ] || die "official sing-box releases do not provide armv6 builds; use manual"
@@ -33,14 +54,34 @@ latest_sing_box(){
   tar -tzf "$tmp/core.tgz" >/dev/null || die "invalid archive"
   tar -xzf "$tmp/core.tgz" -C "$tmp"
   install_binary "$(find "$tmp" -type f -name sing-box | head -1)" sing-box
-  systemctl restart armwall-sing-box.service 2>/dev/null || true
+  restart_sing_box
   sing-box version
+}
+latest_naive(){
+  case "$(arch)" in
+    amd64) a=x64;;
+    arm64) a=arm64;;
+    armv7) a=arm;;
+    armv6) die "automatic NaiveProxy updates are unavailable for ARMv6; use manual upload";;
+  esac
+  tag=$(curl -fsSL https://api.github.com/repos/klzgrad/naiveproxy/releases/latest | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$tag" ] || die "cannot determine latest NaiveProxy version"
+  url="https://github.com/klzgrad/naiveproxy/releases/download/$tag/naiveproxy-$tag-linux-$a.tar.xz"
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  curl -fL "$url" -o "$tmp/core.tar.xz"
+  tar -tJf "$tmp/core.tar.xz" >/dev/null || die "invalid archive"
+  tar -xJf "$tmp/core.tar.xz" -C "$tmp"
+  binary=$(find "$tmp" -type f -name naive | head -1)
+  [ -n "$binary" ] || die "NaiveProxy binary is missing from the archive"
+  install_binary "$binary" naive
+  naive --version 2>&1 | head -1
 }
 case "$CORE:$ACTION" in
   sing-box:version) sing-box version;;
   sing-box:latest) latest_sing_box;;
-  sing-box:manual) [ -n "$SOURCE" ] || die "manual requires a file path"; install_binary "$SOURCE" sing-box; systemctl restart armwall-sing-box.service; sing-box version;;
+  sing-box:manual) [ -n "$SOURCE" ] || die "manual requires a file path"; install_binary "$SOURCE" sing-box; restart_sing_box; sing-box version;;
   naive:version) naive --version 2>&1 | head -1;;
-  naive:manual) [ -n "$SOURCE" ] || die "manual requires a file path"; install_binary "$SOURCE" naive; naive --version 2>&1 | head -1;;
+  naive:latest) latest_naive; systemctl restart armwall-naive.service 2>/dev/null || true;;
+  naive:manual) [ -n "$SOURCE" ] || die "manual requires a file path"; install_binary "$SOURCE" naive; systemctl restart armwall-naive.service 2>/dev/null || true; naive --version 2>&1 | head -1;;
   *) echo "usage: $0 {sing-box|naive} {version|latest|manual} [file]"; exit 2;;
 esac

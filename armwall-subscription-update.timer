@@ -1,9 +1,9 @@
 [Unit]
-Description=Update ArmWall subscriptions every six hours
+Description=Check ArmWall subscriptions every hour
 
 [Timer]
 OnBootSec=10min
-OnUnitActiveSec=6h
+OnUnitActiveSec=1h
 Persistent=true
 
 [Install]

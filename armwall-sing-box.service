@@ -1,7 +1,7 @@
 [Unit]
 Description=ArmWall sing-box proxy
-After=network-online.target
-Wants=network-online.target
+After=network-online.target armwall-naive.service
+Wants=network-online.target armwall-naive.service
 [Service]
 ExecStart=/usr/local/bin/sing-box run -c /etc/armwall/sing-box.json
 StandardOutput=append:/var/log/armwall/sing-box.log

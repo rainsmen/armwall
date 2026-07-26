@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>ArmWall</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/styles.css?v=20260726-1" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">ArmWall <span>Armbian proxy gateway</span></div>
+      <div class="top-status">
+        <span id="connectionDot"></span><span id="connectionText">未连接</span>
+      </div>
+    </header>
+    <div class="shell">
+      <aside class="sidebar">
+        <button class="nav-item active" data-view="dashboard">概览</button>
+        <button class="nav-item" data-view="nodes">节点管理</button>
+        <button class="nav-item" data-view="subscriptions">订阅管理</button>
+        <button class="nav-item" data-view="routing">分流与 DNS</button>
+        <button class="nav-item" data-view="service">服务与组件</button>
+        <button class="nav-item" data-view="system">系统管理</button>
+        <button class="nav-item" data-view="logs">运行日志</button>
+      </aside>
+      <main class="content">
+        <section id="dashboard" class="view active">
+          <div class="page-head">
+            <div>
+              <h1>概览</h1>
+              <p class="subhead">代理网关运行状态</p>
+            </div>
+            <button class="btn primary" data-action="restart-service">
+              启动 / 重启
+            </button>
+          </div>
+          <div class="metric-grid">
+            <article class="metric-card">
+              <div class="eyebrow">代理服务</div>
+              <strong id="serviceMetric">检查中</strong
+              ><span id="proxyEndpoint">mixed SOCKS5 / HTTP</span>
+            </article>
+            <article class="metric-card">
+              <div class="eyebrow">节点数量</div>
+              <strong id="nodeMetric">-</strong
+              ><span>当前配置中的出站节点</span>
+            </article>
+            <article class="metric-card">
+              <div class="eyebrow">运行模式</div>
+              <strong id="modeMetric">-</strong
+              ><span>可在分流与 DNS 中调整</span>
+            </article>
+          </div>
+          <article class="panel active-panel">
+            <div class="panel-head">
+              <div>
+                <h2>当前运行节点</h2>
+                <p class="muted">选择后立即重载 sing-box 出站配置</p>
+              </div>
+              <div class="inline">
+                <select id="activeNode"></select
+                ><button class="btn primary" data-action="select-node">
+                  切换节点
+                </button>
+              </div>
+            </div>
+            <div class="section-head">
+              <h2>网络测试</h2>
+              <span class="muted">通过当前代理测量访问延迟</span>
+            </div>
+            <div class="site-grid" id="siteGrid"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>快速连接</h2>
+                <p class="muted">局域网客户端可使用此 mixed 端口</p>
+              </div>
+              <div class="inline">
+                <label class="sr-only" for="proxyPort">代理端口</label
+                ><input
+                  id="proxyPort"
+                  type="number"
+                  min="1"
+                  max="65535"
+                /><button class="btn primary" data-action="save-port">
+                  应用端口
+                </button>
+              </div>
+            </div>
+            <p class="hint">
+              透明网关端口：11081。启用网关后，客户端网关和 DNS 可指向本机。
+            </p>
+          </article>
+        </section>
+
+        <section id="nodes" class="view">
+          <div class="page-head">
+            <div>
+              <h1>节点管理</h1>
+              <p class="subhead">管理手动节点、订阅节点和运行状态</p>
+            </div>
+            <div class="toolbar">
+              <button class="btn secondary" data-action="import-links">
+                导入分享链接</button
+              ><button class="btn primary" data-action="new-node">
+                添加节点
+              </button>
+            </div>
+          </div>
+          <article class="panel filter-panel">
+            <div class="inline grow">
+              <input
+                id="nodeSearch"
+                placeholder="搜索名称、服务器或协议"
+              /><select id="nodeGroupFilter">
+                <option value="">全部分组</option></select
+              ><select id="nodeStatusFilter">
+                <option value="">全部状态</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">已停用</option>
+              </select>
+            </div>
+            <div class="toolbar">
+              <button class="btn secondary" data-action="batch-enable">
+                启用选中</button
+              ><button class="btn secondary" data-action="batch-disable">
+                停用选中</button
+              ><button class="btn danger" data-action="batch-delete">
+                删除选中
+              </button>
+            </div>
+          </article>
+          <article class="panel table-panel">
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="check-col">
+                      <input
+                        id="selectAllNodes"
+                        type="checkbox"
+                        aria-label="全选节点"
+                      />
+                    </th>
+                    <th>节点</th>
+                    <th>协议</th>
+                    <th>分组 / 来源</th>
+                    <th>服务器</th>
+                    <th>状态</th>
+                    <th>延迟</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="nodesTable"></tbody>
+              </table>
+            </div>
+            <div id="nodeEmpty" class="empty" hidden>没有匹配的节点</div>
+          </article>
+          <article id="nodeEditor" class="panel editor" hidden>
+            <div class="panel-head">
+              <div>
+                <h2 id="nodeEditorTitle">添加节点</h2>
+                <p class="muted">字段会按 sing-box 出站格式保存</p>
+              </div>
+              <button class="icon-btn" data-action="close-node" title="关闭">
+                ×
+              </button>
+            </div>
+            <form id="nodeForm">
+              <input id="nodeId" type="hidden" />
+              <div class="form-grid">
+                <label>备注名称<input id="nodeName" required /></label
+                ><label
+                  >协议<select id="nodeType">
+                    <option value="vless">VLESS</option>
+                    <option value="vmess">VMess</option>
+                    <option value="trojan">Trojan</option>
+                    <option value="shadowsocks">Shadowsocks</option>
+                    <option value="ss">Shadowsocks (ss)</option>
+                    <option value="hysteria2">Hysteria2</option>
+                    <option value="anytls">AnyTLS</option>
+                    <option value="naive">NaiveProxy</option>
+                  </select></label
+                ><label
+                  >分组<input
+                    id="nodeGroup"
+                    placeholder="例如：手动节点" /></label
+                ><label>服务器地址<input id="nodeServer" required /></label
+                ><label
+                  >服务器端口<input
+                    id="nodePort"
+                    type="number"
+                    min="1"
+                    max="65535"
+                    value="443"
+                    required /></label
+                ><label>用户名<input id="nodeUsername" /></label
+                ><label>UUID<input id="nodeUUID" /></label
+                ><label>密码<input id="nodePassword" /></label
+                ><label>TLS SNI<input id="nodeSNI" /></label
+                ><label>HTTP Host<input id="nodeHost" /></label
+                ><label>路径<input id="nodePath" /></label
+                ><label
+                  >传输方式<input
+                    id="nodeTransport"
+                    placeholder="ws / http / grpc" /></label
+                ><label
+                  >ALPN<input id="nodeALPN" placeholder="h2,http/1.1" /></label
+                ><label>VLESS Flow<input id="nodeFlow" /></label
+                ><label
+                  >加密方法<input
+                    id="nodeMethod"
+                    placeholder="aes-128-gcm" /></label
+                ><label
+                  >指纹<input
+                    id="nodeFingerprint"
+                    placeholder="chrome" /></label
+                ><label class="check-label"
+                  ><input id="nodeTLS" type="checkbox" checked />启用 TLS</label
+                ><label class="check-label"
+                  ><input
+                    id="nodeInsecure"
+                    type="checkbox"
+                  />跳过证书验证</label
+                ><label class="check-label"
+                  ><input
+                    id="nodeEnabled"
+                    type="checkbox"
+                    checked
+                  />启用此节点</label
+                >
+              </div>
+              <div class="form-actions">
+                <button
+                  class="btn secondary"
+                  type="button"
+                  data-action="close-node"
+                >
+                  取消</button
+                ><button class="btn primary" type="submit">保存节点</button>
+              </div>
+            </form>
+          </article>
+          <article id="linkImporter" class="panel editor" hidden>
+            <div class="panel-head">
+              <div>
+                <h2>导入分享链接</h2>
+                <p class="muted">
+                  每行一个，支持
+                  vless、vmess、trojan、ss、hysteria2、anytls、naive
+                </p>
+              </div>
+              <button class="icon-btn" data-action="close-import" title="关闭">
+                ×
+              </button>
+            </div>
+            <textarea
+              id="shareLinks"
+              rows="6"
+              placeholder="vless://...&#10;naive+https://..."
+            ></textarea>
+            <div class="form-actions">
+              <button class="btn secondary" data-action="close-import">
+                取消</button
+              ><button class="btn primary" data-action="submit-import">
+                导入节点
+              </button>
+            </div>
+          </article>
+        </section>
+
+        <section id="subscriptions" class="view">
+          <div class="page-head">
+            <div>
+              <h1>订阅管理</h1>
+              <p class="subhead">独立更新、启停和维护订阅来源</p>
+            </div>
+            <div class="toolbar">
+              <button
+                class="btn secondary"
+                data-action="update-all-subscriptions"
+              >
+                更新全部</button
+              ><button class="btn primary" data-action="new-subscription">
+                添加订阅
+              </button>
+            </div>
+          </div>
+          <article class="panel table-panel">
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>订阅</th>
+                    <th>地址</th>
+                    <th>自动更新</th>
+                    <th>间隔</th>
+                    <th>最近更新</th>
+                    <th>节点数</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="subscriptionsTable"></tbody>
+              </table>
+            </div>
+            <div id="subscriptionEmpty" class="empty" hidden>
+              还没有添加订阅
+            </div>
+          </article>
+          <article id="subscriptionEditor" class="panel editor" hidden>
+            <div class="panel-head">
+              <div>
+                <h2 id="subscriptionEditorTitle">添加订阅</h2>
+                <p class="muted">订阅地址必须使用 HTTPS</p>
+              </div>
+              <button
+                class="icon-btn"
+                data-action="close-subscription"
+                title="关闭"
+              >
+                ×
+              </button>
+            </div>
+            <form id="subscriptionForm">
+              <input id="subscriptionId" type="hidden" />
+              <div class="form-grid">
+                <label
+                  >名称<input
+                    id="subscriptionName"
+                    required
+                    placeholder="例如：主订阅" /></label
+                ><label
+                  >自动更新间隔（小时）<input
+                    id="subscriptionHours"
+                    type="number"
+                    min="1"
+                    max="168"
+                    value="6"
+                    required /></label
+                ><label class="span-2"
+                  >订阅地址<input
+                    id="subscriptionURL"
+                    type="url"
+                    required
+                    placeholder="https://example.com/subscription" /></label
+                ><label class="check-label"
+                  ><input
+                    id="subscriptionEnabled"
+                    type="checkbox"
+                    checked
+                  />启用自动更新</label
+                >
+              </div>
+              <div class="form-actions">
+                <button
+                  class="btn secondary"
+                  type="button"
+                  data-action="close-subscription"
+                >
+                  取消</button
+                ><button class="btn primary" type="submit">保存订阅</button>
+              </div>
+            </form>
+          </article>
+        </section>
+
+        <section id="routing" class="view">
+          <div class="page-head">
+            <div>
+              <h1>分流与 DNS</h1>
+              <p class="subhead">选择代理策略并维护远程规则集</p>
+            </div>
+            <button class="btn primary" data-action="save-routing">
+              保存并重启
+            </button>
+          </div>
+          <article class="panel">
+            <div class="form-grid compact">
+              <label
+                >代理模式<select id="routeMode">
+                  <option value="bypass_cn">绕过国内</option>
+                  <option value="gfw">GFW 模式</option>
+                  <option value="global">全局代理</option>
+                </select></label
+              ><label
+                >DNS 模式<select id="dnsMode">
+                  <option value="disabled">关闭内置 DNS</option>
+                  <option value="remote">分流 DNS（推荐）</option>
+                  <option value="fakeip">FakeIP</option>
+                </select></label
+              >
+            </div>
+            <div class="form-grid compact outbound-grid">
+              <label>TCP 默认出站<select id="tcpOutbound"></select></label
+              ><label
+                >UDP 默认出站<select id="udpOutbound">
+                  <option value="same">跟随 TCP</option>
+                </select></label
+              >
+            </div>
+            <div id="dnsSettings" class="form-grid dns-grid">
+              <label
+                >DNS 监听地址<input
+                  id="dnsListen"
+                  placeholder="Armbian LAN IP" /></label
+              ><label
+                >DNS 监听端口<input
+                  id="dnsPort"
+                  type="number"
+                  min="1"
+                  max="65535"
+                  value="53"
+              /></label>
+              <label
+                >远程 DNS<input
+                  id="dnsRemote"
+                  value="https://1.1.1.1/dns-query" /></label
+              ><label
+                >远程 DNS SNI<input
+                  id="dnsSNI"
+                  value="cloudflare-dns.com" /></label
+              ><label
+                >国内 DNS<input id="dnsDirect" value="udp://223.5.5.5" /></label
+              ><label
+                >域名策略<select id="dnsStrategy">
+                  <option value="prefer_ipv4">优先 IPv4</option>
+                  <option value="prefer_ipv6">优先 IPv6</option>
+                  <option value="ipv4_only">仅 IPv4</option>
+                  <option value="ipv6_only">仅 IPv6</option>
+                </select></label
+              ><label class="check-label"
+                ><input id="dnsHijack" type="checkbox" checked />劫持客户端 DNS
+                请求</label
+              >
+            </div>
+            <div class="section-head">
+              <div>
+                <h2>策略组</h2>
+                <span class="muted"
+                  >Selector 手动切换，URLTest 自动选择最低延迟</span
+                >
+              </div>
+              <button class="btn secondary" data-action="new-strategy">
+                新建策略组
+              </button>
+            </div>
+            <div id="strategyManager"></div>
+            <div id="strategyEditor" class="strategy-editor" hidden>
+              <div class="panel-head">
+                <h2 id="strategyEditorTitle">新建策略组</h2>
+                <button
+                  class="icon-btn"
+                  data-action="close-strategy"
+                  title="关闭"
+                >
+                  ×
+                </button>
+              </div>
+              <form id="strategyForm">
+                <input id="strategyId" type="hidden" />
+                <div class="form-grid compact">
+                  <label>名称<input id="strategyName" required /></label
+                  ><label
+                    >类型<select id="strategyType">
+                      <option value="selector">Selector 手动</option>
+                      <option value="urltest">URLTest 自动</option>
+                      <option value="fallback">Fallback 健康优先</option>
+                    </select></label
+                  ><label
+                    >测速 URL<input
+                      id="strategyURL"
+                      type="url"
+                      value="https://www.gstatic.com/generate_204" /></label
+                  ><label
+                    >检查间隔（秒）<input
+                      id="strategyInterval"
+                      type="number"
+                      min="10"
+                      max="86400"
+                      value="180" /></label
+                  ><label
+                    >容差（毫秒）<input
+                      id="strategyTolerance"
+                      type="number"
+                      min="0"
+                      max="10000"
+                      value="50" /></label
+                  ><label
+                    >默认节点<select id="strategySelected"></select
+                  ></label>
+                </div>
+                <label>成员节点</label>
+                <div id="strategyMembers" class="strategy-members"></div>
+                <div class="form-actions">
+                  <button
+                    class="btn secondary"
+                    type="button"
+                    data-action="close-strategy"
+                  >
+                    取消</button
+                  ><button class="btn primary" type="submit">保存策略组</button>
+                </div>
+              </form>
+            </div>
+            <div class="section-head">
+              <div>
+                <h2>访问控制 ACL</h2>
+                <span class="muted"
+                  >按源 IP/CIDR、MAC、协议和目标端口选择出站</span
+                >
+              </div>
+              <button class="btn secondary" data-action="new-acl">
+                添加 ACL
+              </button>
+            </div>
+            <div id="aclManager"></div>
+            <div id="aclEditor" class="strategy-editor" hidden>
+              <div class="panel-head">
+                <h2 id="aclEditorTitle">添加 ACL</h2>
+                <button class="icon-btn" data-action="close-acl" title="关闭">
+                  ×
+                </button>
+              </div>
+              <form id="aclForm">
+                <input id="aclId" type="hidden" />
+                <div class="form-grid">
+                  <label>名称<input id="aclName" required /></label
+                  ><label
+                    >网络<select id="aclNetwork">
+                      <option value="">TCP + UDP</option>
+                      <option value="tcp">仅 TCP</option>
+                      <option value="udp">仅 UDP</option>
+                    </select></label
+                  ><label>出站<select id="aclOutbound"></select></label
+                  ><label
+                    >目标端口<input
+                      id="aclPorts"
+                      placeholder="80,443,1000:2000" /></label
+                  ><label class="span-2"
+                    >源 IP / CIDR<textarea
+                      id="aclCIDRs"
+                      rows="3"
+                      placeholder="192.168.10.20&#10;192.168.10.0/24"
+                    ></textarea></label
+                  ><label class="span-2"
+                    >源 MAC<textarea
+                      id="aclMACs"
+                      rows="3"
+                      placeholder="00:11:22:33:44:55"
+                    ></textarea></label
+                  ><label class="check-label"
+                    ><input
+                      id="aclEnabled"
+                      type="checkbox"
+                      checked
+                    />启用此规则</label
+                  >
+                </div>
+                <div class="form-actions">
+                  <button
+                    class="btn secondary"
+                    type="button"
+                    data-action="close-acl"
+                  >
+                    取消</button
+                  ><button class="btn primary" type="submit">保存 ACL</button>
+                </div>
+              </form>
+            </div>
+            <p class="hint">
+              当前 sing-box 使用 GeoIP/Geosite
+              规则集；透明网关模式下请将局域网客户端 DNS 指向本机。
+            </p>
+            <div class="section-head">
+              <h2>规则集更新</h2>
+              <span class="muted">主地址失败时自动尝试备用地址</span>
+            </div>
+            <div id="ruleManager"></div>
+            <div class="section-head gateway-head"><h2>透明网关</h2></div>
+            <div class="inline wrap">
+              <input id="lanIf" value="eth0" placeholder="LAN 接口" /><input
+                id="wanIf"
+                value="eth0"
+                placeholder="WAN 接口"
+              /><button class="btn primary" data-action="gateway-enable">
+                启用网关</button
+              ><button class="btn secondary" data-action="gateway-status">
+                查看状态</button
+              ><button class="btn danger" data-action="gateway-disable">
+                关闭网关
+              </button>
+            </div>
+            <pre id="gatewayOut" class="output"></pre>
+          </article>
+        </section>
+
+        <section id="service" class="view">
+          <div class="page-head">
+            <div>
+              <h1>服务与组件</h1>
+              <p class="subhead">查看核心状态和代理进程</p>
+            </div>
+          </div>
+          <div class="metric-grid">
+            <article class="metric-card">
+              <div class="eyebrow">ArmWall Web</div>
+              <strong class="ok">运行中</strong><span>systemd · :8080</span>
+            </article>
+            <article class="metric-card">
+              <div class="eyebrow">核心组件</div>
+              <div class="segmented" id="coreSelector">
+                <button
+                  class="active"
+                  data-action="select-core"
+                  data-core="sing-box"
+                >
+                  sing-box
+                </button>
+                <button data-action="select-core" data-core="naive">
+                  NaiveProxy
+                </button>
+              </div>
+              <strong id="coreVersion">检查中</strong>
+              <div class="inline">
+                <button class="btn secondary" data-action="core-version">
+                  检查版本</button
+                ><button class="btn primary" data-action="core-latest">
+                  在线更新</button
+                ><button class="btn secondary" data-action="core-upload">
+                  上传文件
+                </button>
+                <input id="coreUploadFile" type="file" hidden />
+              </div>
+            </article>
+            <article class="metric-card">
+              <div class="eyebrow">代理服务</div>
+              <div class="inline">
+                <button class="btn primary" data-action="start-service">
+                  启动</button
+                ><button class="btn danger" data-action="stop-service">
+                  停止
+                </button>
+              </div>
+              <span id="serviceOutput">-</span>
+            </article>
+          </div>
+        </section>
+
+        <section id="system" class="view">
+          <div class="page-head">
+            <div>
+              <h1>系统管理</h1>
+              <p class="subhead">配置迁移与恢复</p>
+            </div>
+          </div>
+          <article class="panel active-panel">
+            <div class="panel-head">
+              <div><h2>配置文件</h2></div>
+              <div class="toolbar">
+                <button class="btn secondary" data-action="export-config">
+                  导出配置</button
+                ><button class="btn primary" data-action="import-config">
+                  导入配置
+                </button>
+                <input
+                  id="configImportFile"
+                  type="file"
+                  accept="application/json,.json"
+                  hidden
+                />
+              </div>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <div><h2>配置备份</h2></div>
+              <button class="btn primary" data-action="create-backup">
+                新建备份
+              </button>
+            </div>
+            <div class="table-scroll backup-table-wrap">
+              <table class="backup-table">
+                <thead>
+                  <tr>
+                    <th>备份文件</th>
+                    <th>创建时间</th>
+                    <th>大小</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="backupTable"></tbody>
+              </table>
+            </div>
+            <div id="backupEmpty" class="empty" hidden>暂无配置备份</div>
+          </article>
+        </section>
+
+        <section id="logs" class="view">
+          <div class="page-head">
+            <div>
+              <h1>运行日志</h1>
+              <p class="subhead">查看 sing-box 运行输出</p>
+            </div>
+            <div class="toolbar">
+              <select id="logLevel">
+                <option>trace</option>
+                <option>debug</option>
+                <option selected>info</option>
+                <option>warn</option>
+                <option>error</option></select
+              ><button class="btn secondary" data-action="save-log-level">
+                应用级别</button
+              ><button class="btn secondary" data-action="refresh-logs">
+                刷新</button
+              ><button class="btn secondary" data-action="export-logs">
+                导出</button
+              ><button class="btn danger" data-action="clear-logs">清空</button>
+            </div>
+          </div>
+          <article class="panel log-panel">
+            <pre id="logOut">点击刷新查看日志。</pre>
+          </article>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js?v=20260726-1" defer></script>
+  </body>
+</html>

@@ -1,12 +1,76 @@
 #!/bin/sh
 set -eu
-install -d -m 0750 /etc/armwall /var/lib/armwall
-install -m 0755 armwall /usr/local/bin/armwall
-install -m 0644 armwall.service /etc/systemd/system/armwall.service
-install -m 0644 armwall-sing-box.service /etc/systemd/system/armwall-sing-box.service
-install -m 0644 armwall-subscription-update.service /etc/systemd/system/armwall-subscription-update.service
-install -m 0644 armwall-subscription-update.timer /etc/systemd/system/armwall-subscription-update.timer
+[ "$(id -u)" -eq 0 ] || { echo "install.sh must run as root" >&2; exit 1; }
+SRC_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+missing=
+for command in curl file tar xz nft ip ping sysctl; do
+  command -v "$command" >/dev/null 2>&1 || missing="$missing $command"
+done
+if [ -n "$missing" ]; then
+  command -v apt-get >/dev/null 2>&1 || { echo "missing commands:$missing" >&2; exit 1; }
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl file xz-utils nftables iproute2 iputils-ping procps
+fi
+case "$(uname -m)" in
+  armv6*) ARMWALL_ARCH=armv6;;
+  armv7*|armhf) ARMWALL_ARCH=armv7;;
+  aarch64|arm64) ARMWALL_ARCH=arm64;;
+  x86_64|amd64) ARMWALL_ARCH=amd64;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1;;
+esac
+ARMWALL_BINARY=${1:-}
+if [ -z "$ARMWALL_BINARY" ]; then
+  if [ -f "$SRC_DIR/armwall" ]; then
+    ARMWALL_BINARY="$SRC_DIR/armwall"
+  else
+    ARMWALL_BINARY="$SRC_DIR/armwall-linux-$ARMWALL_ARCH"
+  fi
+fi
+[ -f "$ARMWALL_BINARY" ] || { echo "ArmWall binary not found: $ARMWALL_BINARY" >&2; exit 1; }
+
+install -d -m 0750 /etc/armwall /var/lib/armwall /var/lib/armwall/backups/config /var/lib/armwall/uploads /var/lib/armwall/rules /var/log/armwall
+install -m 0755 "$ARMWALL_BINARY" /usr/local/bin/armwall
+/usr/local/bin/armwall --version
+install -m 0755 "$SRC_DIR/gateway.sh" /usr/local/bin/armwall-gateway
+install -m 0755 "$SRC_DIR/update-core.sh" /usr/local/bin/armwall-update-core
+install -m 0755 "$SRC_DIR/naive-supervisor.sh" /usr/local/bin/armwall-naive-supervisor
+install -m 0644 "$SRC_DIR/armwall.service" /etc/systemd/system/armwall.service
+install -m 0644 "$SRC_DIR/armwall-sing-box.service" /etc/systemd/system/armwall-sing-box.service
+install -m 0644 "$SRC_DIR/armwall-naive.service" /etc/systemd/system/armwall-naive.service
+install -m 0644 "$SRC_DIR/armwall-subscription-update.service" /etc/systemd/system/armwall-subscription-update.service
+install -m 0644 "$SRC_DIR/armwall-subscription-update.timer" /etc/systemd/system/armwall-subscription-update.timer
+if [ ! -f /etc/armwall/armwall.env ]; then
+  ARMWALL_ADMIN_TOKEN=${ARMWALL_TOKEN:-}
+  if [ -z "$ARMWALL_ADMIN_TOKEN" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+      ARMWALL_ADMIN_TOKEN=$(openssl rand -hex 16)
+    else
+      ARMWALL_ADMIN_TOKEN=$(tr -d '-' < /proc/sys/kernel/random/uuid)
+    fi
+  fi
+  umask 077
+  printf 'ARMWALL_TOKEN=%s\nARMWALL_MAC_ACL_FILE=/etc/armwall/mac-acl.tsv\n' "$ARMWALL_ADMIN_TOKEN" > /etc/armwall/armwall.env
+fi
+
+if ! command -v sing-box >/dev/null 2>&1; then
+  if [ "$ARMWALL_ARCH" = armv6 ]; then
+    echo "sing-box has no official ARMv6 release; upload a compatible binary in the Web UI" >&2
+  else
+    /usr/local/bin/armwall-update-core sing-box latest || echo "sing-box installation failed; retry from the Web UI" >&2
+  fi
+fi
+ARMWALL_PROXY_PORT=11080 ARMWALL_TPROXY=1 ARMWALL_TPROXY_PORT=11081 /usr/local/bin/armwall --write-config
 systemctl daemon-reload
-systemctl enable --now armwall.service
-systemctl enable --now armwall-subscription-update.timer
+systemctl enable armwall.service
+systemctl enable armwall-subscription-update.timer
+systemctl enable armwall-naive.service
+systemctl restart armwall.service
+systemctl restart armwall-subscription-update.timer
+systemctl restart armwall-naive.service
+if command -v sing-box >/dev/null 2>&1; then
+  systemctl enable armwall-sing-box.service
+  systemctl restart armwall-sing-box.service
+fi
+ARMWALL_ADMIN_TOKEN=$(sed -n 's/^ARMWALL_TOKEN=//p' /etc/armwall/armwall.env | head -1)
 echo "ArmWall installed at http://<server-ip>:8080"
+echo "Management token: $ARMWALL_ADMIN_TOKEN"

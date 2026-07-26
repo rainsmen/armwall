@@ -1,11 +1,12 @@
 package main
 
 import (
+	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -19,28 +20,85 @@ import (
 	"time"
 )
 
+var version = "dev"
+
 type Node struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Server      string `json:"server"`
-	UUID        string `json:"uuid"`
-	Password    string `json:"password"`
-	Port        int    `json:"port"`
-	TLS         bool   `json:"tls"`
-	ServerName  string `json:"server_name"`
-	Insecure    bool   `json:"insecure"`
-	Username    string `json:"username"`
-	Method      string `json:"method"`
-	Flow        string `json:"flow"`
-	Transport   string `json:"transport"`
-	Host        string `json:"host"`
-	Path        string `json:"path"`
-	ALPN        string `json:"alpn"`
-	Fingerprint string `json:"fingerprint"`
-	Plugin      string `json:"plugin"`
-	PluginOpts  string `json:"plugin_opts"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Type           string `json:"type"`
+	Server         string `json:"server"`
+	UUID           string `json:"uuid"`
+	Password       string `json:"password"`
+	Port           int    `json:"port"`
+	TLS            bool   `json:"tls"`
+	ServerName     string `json:"server_name"`
+	Insecure       bool   `json:"insecure"`
+	Username       string `json:"username"`
+	Method         string `json:"method"`
+	Flow           string `json:"flow"`
+	Transport      string `json:"transport"`
+	Host           string `json:"host"`
+	Path           string `json:"path"`
+	ALPN           string `json:"alpn"`
+	Fingerprint    string `json:"fingerprint"`
+	Plugin         string `json:"plugin"`
+	PluginOpts     string `json:"plugin_opts"`
+	Group          string `json:"group"`
+	SubscriptionID string `json:"subscription_id"`
+	Enabled        bool   `json:"enabled"`
+	SortOrder      int    `json:"sort_order"`
 }
+
+type StrategyGroup struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	NodeIDs     []string `json:"node_ids"`
+	Selected    string   `json:"selected"`
+	TestURL     string   `json:"test_url"`
+	IntervalSec int      `json:"interval_sec"`
+	ToleranceMS int      `json:"tolerance_ms"`
+}
+
+type ACLRule struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Enabled     bool     `json:"enabled"`
+	SourceCIDRs []string `json:"source_cidrs"`
+	SourceMACs  []string `json:"source_macs"`
+	Network     string   `json:"network"`
+	PortRanges  []string `json:"port_ranges"`
+	Outbound    string   `json:"outbound"`
+}
+
+type macACLBinding struct {
+	ACLID      string
+	Tag        string
+	Port       int
+	MACs       []string
+	Network    string
+	PortRanges []string
+	Outbound   string
+}
+
+type naiveBinding struct {
+	Node   Node
+	Port   int
+	Config string
+}
+
+type DNSSettings struct {
+	Enabled       bool   `json:"enabled"`
+	ListenAddress string `json:"listen_address"`
+	ListenPort    int    `json:"listen_port"`
+	RemoteServer  string `json:"remote_server"`
+	RemoteSNI     string `json:"remote_sni"`
+	DirectServer  string `json:"direct_server"`
+	Strategy      string `json:"strategy"`
+	Hijack        bool   `json:"hijack"`
+	FakeIP        bool   `json:"fake_ip"`
+}
+
 type Store struct {
 	Nodes            []Node            `json:"nodes"`
 	SubscriptionURLs []string          `json:"subscription_urls"`
@@ -51,6 +109,12 @@ type Store struct {
 	LogLevel         string            `json:"log_level"`
 	RuleUpdateHours  int               `json:"rule_update_hours"`
 	RuleBackups      map[string]string `json:"rule_backups"`
+	Subscriptions    []Subscription    `json:"subscriptions"`
+	StrategyGroups   []StrategyGroup   `json:"strategy_groups"`
+	TCPOutbound      string            `json:"tcp_outbound"`
+	UDPOutbound      string            `json:"udp_outbound"`
+	ACLRules         []ACLRule         `json:"acl_rules"`
+	DNS              DNSSettings       `json:"dns"`
 }
 
 func parseSubscription(raw string) []Node {
@@ -65,7 +129,7 @@ func parseSubscription(raw string) []Node {
 				var v struct{ PS, Add, Port, ID, TLS, SNI string }
 				if json.Unmarshal(b, &v) == nil {
 					p, _ := strconv.Atoi(v.Port)
-					out = append(out, Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: v.PS, Type: "vmess", Server: v.Add, Port: p, UUID: v.ID, TLS: v.TLS != "", ServerName: v.SNI})
+					out = append(out, Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: v.PS, Type: "vmess", Server: v.Add, Port: p, UUID: v.ID, TLS: v.TLS != "", ServerName: v.SNI, Enabled: true})
 					continue
 				}
 			}
@@ -74,10 +138,16 @@ func parseSubscription(raw string) []Node {
 		if err != nil || u.Hostname() == "" {
 			continue
 		}
-		if u.Scheme != "vless" && u.Scheme != "trojan" && u.Scheme != "shadowsocks" && u.Scheme != "ss" && u.Scheme != "hysteria2" && u.Scheme != "anytls" && u.Scheme != "naive" {
+		if u.Scheme != "vless" && u.Scheme != "trojan" && u.Scheme != "shadowsocks" && u.Scheme != "ss" && u.Scheme != "hysteria2" && u.Scheme != "anytls" && u.Scheme != "naive" && u.Scheme != "naive+https" && u.Scheme != "naive+quic" {
 			continue
 		}
-		n := Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: u.Fragment, Type: u.Scheme, Server: u.Hostname(), TLS: true}
+		nodeType := u.Scheme
+		naiveTransport := ""
+		if strings.HasPrefix(nodeType, "naive+") {
+			naiveTransport = strings.TrimPrefix(nodeType, "naive+")
+			nodeType = "naive"
+		}
+		n := Node{ID: fmt.Sprintf("sub-%d", time.Now().UnixNano()), Name: u.Fragment, Type: nodeType, Server: u.Hostname(), TLS: true, Enabled: true, Transport: naiveTransport}
 		if p, err := strconv.Atoi(u.Port()); err == nil {
 			n.Port = p
 		}
@@ -94,7 +164,9 @@ func parseSubscription(raw string) []Node {
 		}
 		n.ServerName = u.Query().Get("sni")
 		n.Insecure = u.Query().Get("insecure") == "1"
-		n.Transport = u.Query().Get("type")
+		if transport := u.Query().Get("type"); transport != "" {
+			n.Transport = transport
+		}
 		n.Host = u.Query().Get("host")
 		n.Path = u.Query().Get("path")
 		n.Flow = u.Query().Get("flow")
@@ -145,25 +217,64 @@ func fetchSubscription(rawURL string) ([]Node, error) {
 }
 
 func updateSubscriptions() error {
-	s := load()
-	var nodes []Node
-	for _, rawURL := range s.SubscriptionURLs {
-		fetched, err := fetchSubscription(rawURL)
-		if err != nil {
-			return fmt.Errorf("%s: %w", rawURL, err)
-		}
-		nodes = append(nodes, fetched...)
+	return updateSubscriptionsWithForce(false)
+}
+
+func subscriptionDue(sub Subscription, now time.Time) bool {
+	hours := sub.UpdateHours
+	if hours < 1 {
+		hours = 6
 	}
-	if len(s.SubscriptionURLs) == 0 {
+	return sub.LastUpdated.IsZero() || now.Sub(sub.LastUpdated) >= time.Duration(hours)*time.Hour
+}
+
+func updateSubscriptionsWithForce(force bool) error {
+	s := load()
+	if len(s.Subscriptions) == 0 {
+		s = migrateLegacy(s)
+	}
+	fetchedBySub := map[string][]Node{}
+	now := time.Now()
+	for i := range s.Subscriptions {
+		sub := &s.Subscriptions[i]
+		if !sub.Enabled {
+			continue
+		}
+		if !force && !subscriptionDue(*sub, now) {
+			continue
+		}
+		fetched, err := fetchSubscription(sub.URL)
+		if err != nil {
+			return fmt.Errorf("%s: %w", sub.URL, err)
+		}
+		for j := range fetched {
+			fetched[j].SubscriptionID = sub.ID
+			fetched[j].Group = sub.Name
+			fetched[j].Enabled = true
+		}
+		fetchedBySub[sub.ID] = fetched
+		sub.LastUpdated = now
+	}
+	if len(s.Subscriptions) == 0 {
 		return fmt.Errorf("no subscriptions configured")
 	}
-	kept := s.Nodes[:0]
+	if len(fetchedBySub) == 0 {
+		return nil
+	}
+	kept := make([]Node, 0, len(s.Nodes))
 	for _, n := range s.Nodes {
-		if !strings.HasPrefix(n.ID, "sub-") {
+		if _, ok := fetchedBySub[n.SubscriptionID]; !ok {
 			kept = append(kept, n)
 		}
 	}
-	s.Nodes = append(kept, nodes...)
+	for _, sub := range s.Subscriptions {
+		kept = append(kept, fetchedBySub[sub.ID]...)
+	}
+	s.Nodes = kept
+	s.SubscriptionURLs = nil
+	for _, sub := range s.Subscriptions {
+		s.SubscriptionURLs = append(s.SubscriptionURLs, sub.URL)
+	}
 	if err := writeConfig(s); err != nil {
 		return err
 	}
@@ -176,9 +287,13 @@ func updateSubscriptions() error {
 var mu sync.Mutex
 var dataPath = "/var/lib/armwall/store.json"
 var configPath = "/etc/armwall/sing-box.json"
+var macACLPath = "/etc/armwall/mac-acl.tsv"
+var naiveConfigDir = "/etc/armwall/naive"
+var logDir = "/var/log/armwall"
 var proxyPort = 1080
 var tproxyEnabled bool
 var tproxyPort = 11081
+var naiveProxyPort = 12000
 var ruleURLs = map[string]string{
 	"geosite-ads":   "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
 	"geosite-cn":    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
@@ -225,24 +340,521 @@ func updateRule(tag, backup string) error {
 }
 
 func load() Store {
-	b, err := os.ReadFile(dataPath)
-	if err != nil {
-		return Store{Mode: "bypass_cn"}
+	s, err := loadDB()
+	if err == nil {
+		return s
 	}
-	var s Store
-	_ = json.Unmarshal(b, &s)
-	return s
+	legacy := migrateLegacy(loadJSON())
+	_ = saveDB(legacy)
+	return legacy
 }
 func save(s Store) error {
-	if err := os.MkdirAll(filepath.Dir(dataPath), 0750); err != nil {
+	if err := saveDB(s); err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(s, "", "  ")
-	return os.WriteFile(dataPath, b, 0600)
+	return saveJSON(s)
 }
+
+func normalizeStore(s *Store) {
+	s.SubscriptionURLs = s.SubscriptionURLs[:0]
+	for _, sub := range s.Subscriptions {
+		s.SubscriptionURLs = append(s.SubscriptionURLs, sub.URL)
+	}
+	selectedOK := false
+	existingNodes := make(map[string]bool, len(s.Nodes))
+	for i := range s.Nodes {
+		s.Nodes[i].SortOrder = i
+		existingNodes[s.Nodes[i].ID] = true
+		if s.Nodes[i].ID == s.SelectedNode && s.Nodes[i].Enabled {
+			selectedOK = true
+		}
+	}
+	existingOutbounds := map[string]bool{"direct": true}
+	for id := range existingNodes {
+		existingOutbounds[id] = true
+	}
+	for i := range s.StrategyGroups {
+		group := &s.StrategyGroups[i]
+		kept := group.NodeIDs[:0]
+		seen := map[string]bool{}
+		for _, id := range group.NodeIDs {
+			if existingNodes[id] && !seen[id] {
+				kept = append(kept, id)
+				seen[id] = true
+			}
+		}
+		group.NodeIDs = kept
+		if !seen[group.Selected] {
+			group.Selected = ""
+			if len(group.NodeIDs) > 0 {
+				group.Selected = group.NodeIDs[0]
+			}
+		}
+		existingOutbounds[group.ID] = true
+	}
+	if !existingOutbounds[s.TCPOutbound] {
+		s.TCPOutbound = ""
+	}
+	if s.UDPOutbound != "same" && !existingOutbounds[s.UDPOutbound] {
+		s.UDPOutbound = ""
+	}
+	for i := range s.ACLRules {
+		if !existingOutbounds[s.ACLRules[i].Outbound] && s.ACLRules[i].Outbound != "block" {
+			s.ACLRules[i].Enabled = false
+		}
+	}
+	if selectedOK {
+		return
+	}
+	s.SelectedNode = ""
+	for _, node := range s.Nodes {
+		if node.Enabled {
+			s.SelectedNode = node.ID
+			break
+		}
+	}
+}
+
+func persistStore(next Store, reload bool) error {
+	previous := load()
+	previousProxyPort := proxyPort
+	normalizeStore(&next)
+	if !reload {
+		return save(next)
+	}
+	if next.ProxyPort > 0 {
+		proxyPort = next.ProxyPort
+	}
+	if err := writeConfig(next); err != nil {
+		proxyPort = previousProxyPort
+		return err
+	}
+	if err := save(next); err != nil {
+		proxyPort = previousProxyPort
+		_ = writeConfig(previous)
+		return err
+	}
+	if err := restartProxyFn(); err != nil {
+		proxyPort = previousProxyPort
+		_ = save(previous)
+		_ = writeConfig(previous)
+		_ = restartProxyFn()
+		return err
+	}
+	return nil
+}
+
+func validateNode(n *Node) error {
+	n.Name = strings.TrimSpace(n.Name)
+	n.Type = strings.ToLower(strings.TrimSpace(n.Type))
+	n.Server = strings.TrimSpace(n.Server)
+	n.Group = strings.TrimSpace(n.Group)
+	if n.Type == "ss" {
+		n.Type = "shadowsocks"
+	}
+	allowed := map[string]bool{"vless": true, "vmess": true, "trojan": true, "shadowsocks": true, "hysteria2": true, "anytls": true, "naive": true}
+	if !allowed[n.Type] {
+		return fmt.Errorf("unsupported node type")
+	}
+	if n.Name == "" || n.Server == "" || n.Port < 1 || n.Port > 65535 {
+		return fmt.Errorf("name, server and valid port are required")
+	}
+	if n.Group == "" {
+		n.Group = "手动节点"
+	}
+	if n.Type == "naive" {
+		if n.Transport == "" {
+			n.Transport = "https"
+		}
+		if n.Transport != "https" && n.Transport != "quic" {
+			return fmt.Errorf("NaiveProxy transport must be https or quic")
+		}
+	}
+	return nil
+}
+
+func validateStrategyGroup(group *StrategyGroup, s Store) error {
+	group.Name = strings.TrimSpace(group.Name)
+	group.Type = strings.ToLower(strings.TrimSpace(group.Type))
+	if group.Name == "" || (group.Type != "selector" && group.Type != "urltest" && group.Type != "fallback") {
+		return fmt.Errorf("strategy name and valid type are required")
+	}
+	existing := make(map[string]bool, len(s.Nodes))
+	for _, node := range s.Nodes {
+		existing[node.ID] = true
+		if node.ID == group.ID {
+			return fmt.Errorf("strategy id conflicts with node")
+		}
+	}
+	seen := map[string]bool{}
+	members := group.NodeIDs[:0]
+	for _, id := range group.NodeIDs {
+		if existing[id] && !seen[id] {
+			members = append(members, id)
+			seen[id] = true
+		}
+	}
+	group.NodeIDs = members
+	if len(group.NodeIDs) == 0 {
+		return fmt.Errorf("strategy requires at least one node")
+	}
+	if group.Type != "selector" && len(group.NodeIDs) < 2 {
+		return fmt.Errorf("automatic strategy requires at least two nodes")
+	}
+	if !seen[group.Selected] {
+		group.Selected = group.NodeIDs[0]
+	}
+	if group.TestURL == "" {
+		group.TestURL = "https://www.gstatic.com/generate_204"
+	}
+	if !strings.HasPrefix(group.TestURL, "https://") {
+		return fmt.Errorf("test url must use https")
+	}
+	if group.IntervalSec == 0 {
+		group.IntervalSec = 180
+	}
+	if group.IntervalSec < 10 || group.IntervalSec > 86400 || group.ToleranceMS < 0 || group.ToleranceMS > 10000 {
+		return fmt.Errorf("invalid strategy interval or tolerance")
+	}
+	for _, existingGroup := range s.StrategyGroups {
+		if existingGroup.ID != group.ID && existingGroup.Name == group.Name {
+			return fmt.Errorf("strategy name already exists")
+		}
+	}
+	return nil
+}
+
+func validOutboundTags(s Store) map[string]bool {
+	valid := map[string]bool{"direct": true, "block": true}
+	for _, node := range s.Nodes {
+		valid[node.ID] = true
+	}
+	for _, group := range s.StrategyGroups {
+		valid[group.ID] = true
+	}
+	return valid
+}
+
+func validatePortRange(value string) bool {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) < 1 || len(parts) > 2 {
+		return false
+	}
+	first, err := strconv.Atoi(parts[0])
+	if err != nil || first < 1 || first > 65535 {
+		return false
+	}
+	if len(parts) == 1 {
+		return true
+	}
+	last, err := strconv.Atoi(parts[1])
+	return err == nil && last >= first && last <= 65535
+}
+
+func validateACLRule(rule *ACLRule, s Store) error {
+	rule.Name = strings.TrimSpace(rule.Name)
+	rule.Network = strings.ToLower(strings.TrimSpace(rule.Network))
+	if rule.Name == "" || (rule.Network != "" && rule.Network != "tcp" && rule.Network != "udp") {
+		return fmt.Errorf("ACL name and valid network are required")
+	}
+	if !validOutboundTags(s)[rule.Outbound] {
+		return fmt.Errorf("ACL outbound does not exist")
+	}
+	cidrs := make([]string, 0, len(rule.SourceCIDRs))
+	seenCIDR := map[string]bool{}
+	for _, raw := range rule.SourceCIDRs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if ip := net.ParseIP(raw); ip != nil {
+			if ip.To4() != nil {
+				raw += "/32"
+			} else {
+				raw += "/128"
+			}
+		}
+		if _, _, err := net.ParseCIDR(raw); err != nil {
+			return fmt.Errorf("invalid source CIDR: %s", raw)
+		}
+		if !seenCIDR[raw] {
+			cidrs = append(cidrs, raw)
+			seenCIDR[raw] = true
+		}
+	}
+	rule.SourceCIDRs = cidrs
+	macs := make([]string, 0, len(rule.SourceMACs))
+	seenMAC := map[string]bool{}
+	for _, raw := range rule.SourceMACs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		mac, err := net.ParseMAC(raw)
+		if err != nil {
+			return fmt.Errorf("invalid source MAC: %s", raw)
+		}
+		normalized := strings.ToLower(mac.String())
+		if !seenMAC[normalized] {
+			macs = append(macs, normalized)
+			seenMAC[normalized] = true
+		}
+	}
+	rule.SourceMACs = macs
+	if len(rule.SourceCIDRs) == 0 && len(rule.SourceMACs) == 0 {
+		return fmt.Errorf("ACL requires a source IP/CIDR or MAC")
+	}
+	ports := make([]string, 0, len(rule.PortRanges))
+	for _, raw := range rule.PortRanges {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if !validatePortRange(raw) {
+			return fmt.Errorf("invalid destination port range: %s", raw)
+		}
+		ports = append(ports, raw)
+	}
+	rule.PortRanges = ports
+	return nil
+}
+
+func validateDNSSettings(settings *DNSSettings) error {
+	if !settings.Enabled {
+		return nil
+	}
+	settings.ListenAddress = strings.TrimSpace(settings.ListenAddress)
+	if settings.ListenAddress == "" {
+		address, err := detectDNSListenAddress()
+		if err != nil {
+			return err
+		}
+		settings.ListenAddress = address
+	}
+	if net.ParseIP(settings.ListenAddress) == nil {
+		return fmt.Errorf("DNS listen address must be an IP address")
+	}
+	if settings.ListenPort == 0 {
+		settings.ListenPort = 53
+	}
+	if settings.ListenPort < 1 || settings.ListenPort > 65535 {
+		return fmt.Errorf("invalid DNS listen port")
+	}
+	if settings.RemoteServer == "" {
+		settings.RemoteServer = "https://1.1.1.1/dns-query"
+	}
+	if settings.DirectServer == "" {
+		settings.DirectServer = "udp://223.5.5.5"
+	}
+	if settings.Strategy == "" {
+		settings.Strategy = "prefer_ipv4"
+	}
+	validStrategy := map[string]bool{"prefer_ipv4": true, "prefer_ipv6": true, "ipv4_only": true, "ipv6_only": true}
+	if !validStrategy[settings.Strategy] {
+		return fmt.Errorf("invalid DNS strategy")
+	}
+	for _, raw := range []string{settings.RemoteServer, settings.DirectServer} {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "tls" && u.Scheme != "udp" && u.Scheme != "tcp") {
+			return fmt.Errorf("invalid DNS server: %s", raw)
+		}
+	}
+	if settings.FakeIP {
+		settings.Hijack = true
+	}
+	return nil
+}
+
+func detectDNSListenAddress() (string, error) {
+	conn, err := net.Dial("udp", "1.1.1.1:53")
+	if err != nil {
+		return "", fmt.Errorf("cannot detect DNS listen address; enter the Armbian LAN IP")
+	}
+	defer conn.Close()
+	address, _, err := net.SplitHostPort(conn.LocalAddr().String())
+	if err != nil || net.ParseIP(address) == nil {
+		return "", fmt.Errorf("cannot detect DNS listen address; enter the Armbian LAN IP")
+	}
+	return address, nil
+}
+
+func dnsServerConfig(tag, raw, serverName, detour string) map[string]any {
+	u, _ := url.Parse(raw)
+	port, _ := strconv.Atoi(u.Port())
+	server := map[string]any{"type": u.Scheme, "tag": tag, "server": u.Hostname()}
+	switch u.Scheme {
+	case "https":
+		if port == 0 {
+			port = 443
+		}
+		path := u.EscapedPath()
+		if path == "" {
+			path = "/dns-query"
+		}
+		server["path"] = path
+		if serverName == "" {
+			serverName = u.Hostname()
+		}
+		server["tls"] = map[string]any{"enabled": true, "server_name": serverName}
+	case "tls":
+		if port == 0 {
+			port = 853
+		}
+		if serverName == "" {
+			serverName = u.Hostname()
+		}
+		server["tls"] = map[string]any{"enabled": true, "server_name": serverName}
+	default:
+		if port == 0 {
+			port = 53
+		}
+	}
+	server["server_port"] = port
+	if detour != "" {
+		server["detour"] = detour
+	}
+	return server
+}
+
+func macACLBindings(s Store) []macACLBinding {
+	bindings := make([]macACLBinding, 0)
+	for _, acl := range s.ACLRules {
+		if !acl.Enabled || len(acl.SourceMACs) == 0 {
+			continue
+		}
+		index := len(bindings) + 1
+		bindings = append(bindings, macACLBinding{
+			ACLID:      acl.ID,
+			Tag:        fmt.Sprintf("acl-mac-%d", index),
+			Port:       tproxyPort + index,
+			MACs:       append([]string(nil), acl.SourceMACs...),
+			Network:    acl.Network,
+			PortRanges: append([]string(nil), acl.PortRanges...),
+			Outbound:   acl.Outbound,
+		})
+	}
+	return bindings
+}
+
+func naiveBindings(s Store) []naiveBinding {
+	bindings := make([]naiveBinding, 0)
+	for _, node := range s.Nodes {
+		if !node.Enabled || node.Type != "naive" {
+			continue
+		}
+		port := naiveProxyPort + len(bindings)
+		transport := node.Transport
+		if transport != "quic" {
+			transport = "https"
+		}
+		proxy := &url.URL{Scheme: transport, Host: net.JoinHostPort(node.Server, strconv.Itoa(node.Port))}
+		if node.Username != "" || node.Password != "" {
+			proxy.User = url.UserPassword(node.Username, node.Password)
+		}
+		configData, _ := json.MarshalIndent(map[string]string{
+			"listen": fmt.Sprintf("socks://127.0.0.1:%d", port),
+			"proxy":  proxy.String(),
+		}, "", "  ")
+		bindings = append(bindings, naiveBinding{Node: node, Port: port, Config: string(configData)})
+	}
+	return bindings
+}
+
+func writeNaiveConfigs(s Store) error {
+	parent := filepath.Dir(naiveConfigDir)
+	if err := os.MkdirAll(parent, 0750); err != nil {
+		return err
+	}
+	candidate, err := os.MkdirTemp(parent, ".naive-candidate-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(candidate)
+	for i, binding := range naiveBindings(s) {
+		path := filepath.Join(candidate, fmt.Sprintf("%04d.json", i+1))
+		if err := os.WriteFile(path, []byte(binding.Config+"\n"), 0600); err != nil {
+			return err
+		}
+	}
+	previous := naiveConfigDir + ".previous"
+	_ = os.RemoveAll(previous)
+	if err := os.Rename(naiveConfigDir, previous); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(candidate, naiveConfigDir); err != nil {
+		_ = os.Rename(previous, naiveConfigDir)
+		return err
+	}
+	_ = os.RemoveAll(previous)
+	return nil
+}
+
+func macACLData(s Store) ([]byte, error) {
+	var data strings.Builder
+	for _, binding := range macACLBindings(s) {
+		if binding.Port > 65535 {
+			return nil, fmt.Errorf("too many MAC ACL rules for TProxy port %d", tproxyPort)
+		}
+		network := binding.Network
+		if network == "" {
+			network = "any"
+		}
+		ports := strings.Join(binding.PortRanges, ",")
+		if ports == "" {
+			ports = "any"
+		}
+		for _, mac := range binding.MACs {
+			fmt.Fprintf(&data, "%d\t%s\t%s\t%s\n", binding.Port, mac, network, ports)
+		}
+	}
+	return []byte(data.String()), nil
+}
+
+func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
 func config(s Store) map[string]any {
 	outs := []any{map[string]any{"type": "direct", "tag": "direct"}, map[string]any{"type": "block", "tag": "block"}}
+	naivePorts := map[string]int{}
+	for _, binding := range naiveBindings(s) {
+		naivePorts[binding.Node.ID] = binding.Port
+	}
+	nodeTags := map[string]bool{}
 	for _, n := range s.Nodes {
+		if !n.Enabled {
+			continue
+		}
+		nodeTags[n.ID] = true
+		if n.Type == "naive" {
+			outs = append(outs, map[string]any{"type": "socks", "tag": n.ID, "server": "127.0.0.1", "server_port": naivePorts[n.ID]})
+			continue
+		}
 		o := map[string]any{"type": n.Type, "tag": n.ID, "server": n.Server, "server_port": n.Port}
 		if n.UUID != "" {
 			o["uuid"] = n.UUID
@@ -285,50 +897,188 @@ func config(s Store) map[string]any {
 		}
 		outs = append(outs, o)
 	}
+	strategyTags := map[string]bool{}
+	for _, group := range s.StrategyGroups {
+		if group.ID == "" || group.Name == "" {
+			continue
+		}
+		members := make([]string, 0, len(group.NodeIDs))
+		for _, id := range group.NodeIDs {
+			if nodeTags[id] {
+				members = append(members, id)
+			}
+		}
+		if len(members) == 0 {
+			continue
+		}
+		groupType := group.Type
+		if groupType == "fallback" {
+			// sing-box implements health-based failover through URLTest.
+			groupType = "urltest"
+		}
+		if groupType != "selector" && groupType != "urltest" {
+			continue
+		}
+		o := map[string]any{"type": groupType, "tag": group.ID, "outbounds": members}
+		if groupType == "selector" {
+			selected := group.Selected
+			if !nodeTags[selected] {
+				selected = members[0]
+			}
+			o["default"] = selected
+		} else {
+			testURL := group.TestURL
+			if testURL == "" {
+				testURL = "https://www.gstatic.com/generate_204"
+			}
+			interval := group.IntervalSec
+			if interval < 10 {
+				interval = 180
+			}
+			o["url"] = testURL
+			o["interval"] = fmt.Sprintf("%ds", interval)
+			o["tolerance"] = group.ToleranceMS
+		}
+		outs = append(outs, o)
+		strategyTags[group.ID] = true
+	}
 	proxy := "direct"
-	if len(s.Nodes) > 0 {
-		proxy = s.Nodes[0].ID
+	for _, n := range s.Nodes {
+		if n.Enabled {
+			proxy = n.ID
+			break
+		}
 	}
 	if s.SelectedNode != "" {
 		for _, n := range s.Nodes {
-			if n.ID == s.SelectedNode {
+			if n.ID == s.SelectedNode && n.Enabled {
 				proxy = n.ID
 				break
 			}
 		}
 	}
-	rules := []any{map[string]any{"ip_is_private": true, "outbound": "direct"}, map[string]any{"rule_set": []string{"geosite-ads"}, "outbound": "block"}}
+	validOutbound := map[string]bool{"direct": true}
+	for tag := range nodeTags {
+		validOutbound[tag] = true
+	}
+	for tag := range strategyTags {
+		validOutbound[tag] = true
+	}
+	chooseOutbound := func(value, fallback string) string {
+		if value == "" || value == "same" || !validOutbound[value] {
+			return fallback
+		}
+		return value
+	}
+	tcpOutbound := chooseOutbound(s.TCPOutbound, proxy)
+	udpOutbound := chooseOutbound(s.UDPOutbound, tcpOutbound)
+	rules := []any{}
+	if s.DNS.Enabled {
+		rules = append(rules, map[string]any{"inbound": []string{"dns-in"}, "action": "hijack-dns"})
+	}
+	if s.DNS.Enabled && s.DNS.Hijack {
+		rules = append(rules, map[string]any{"protocol": "dns", "action": "hijack-dns"})
+	}
+	for _, acl := range s.ACLRules {
+		if !acl.Enabled {
+			continue
+		}
+		if len(acl.SourceCIDRs) > 0 {
+			rule := map[string]any{"outbound": acl.Outbound}
+			rule["source_ip_cidr"] = acl.SourceCIDRs
+			if acl.Network != "" {
+				rule["network"] = []string{acl.Network}
+			}
+			if len(acl.PortRanges) > 0 {
+				rule["port_range"] = acl.PortRanges
+			}
+			rules = append(rules, rule)
+		}
+	}
+	macBindings := macACLBindings(s)
+	for _, binding := range macBindings {
+		rules = append(rules, map[string]any{"inbound": []string{binding.Tag}, "outbound": binding.Outbound})
+	}
+	rules = append(rules, map[string]any{"ip_is_private": true, "outbound": "direct"}, map[string]any{"rule_set": []string{"geosite-ads"}, "outbound": "block"})
 	ruleSets := []any{ruleSet("geosite-ads")}
 	final := proxy
 	switch s.Mode {
 	case "bypass_cn":
 		rules = append(rules, map[string]any{"rule_set": []string{"geosite-cn", "geoip-cn"}, "outbound": "direct"})
+		if udpOutbound != tcpOutbound {
+			rules = append(rules, map[string]any{"network": "udp", "outbound": udpOutbound})
+		}
 		ruleSets = append(ruleSets, ruleSet("geosite-cn"), ruleSet("geoip-cn"))
 	case "gfw":
-		rules = append(rules, map[string]any{"rule_set": []string{"geosite-proxy"}, "outbound": proxy})
+		if udpOutbound != tcpOutbound {
+			rules = append(rules, map[string]any{"rule_set": []string{"geosite-proxy"}, "network": "udp", "outbound": udpOutbound}, map[string]any{"rule_set": []string{"geosite-proxy"}, "network": "tcp", "outbound": tcpOutbound})
+		} else {
+			rules = append(rules, map[string]any{"rule_set": []string{"geosite-proxy"}, "outbound": tcpOutbound})
+		}
 		ruleSets = append(ruleSets, ruleSet("geosite-proxy"))
 		final = "direct"
+	default:
+		if udpOutbound != tcpOutbound {
+			rules = append(rules, map[string]any{"network": "udp", "outbound": udpOutbound})
+		}
+	}
+	if s.Mode != "gfw" {
+		final = tcpOutbound
 	}
 	listenPort := proxyPort
 	if s.ProxyPort > 0 {
 		listenPort = s.ProxyPort
 	}
 	inbounds := []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": listenPort}}
+	if s.DNS.Enabled {
+		inbounds = append(inbounds, map[string]any{"type": "direct", "tag": "dns-in", "listen": s.DNS.ListenAddress, "listen_port": s.DNS.ListenPort})
+	}
 	if tproxyEnabled {
 		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": tproxyPort})
+	}
+	for _, binding := range macBindings {
+		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": binding.Tag, "listen": "0.0.0.0", "listen_port": binding.Port})
 	}
 	level := s.LogLevel
 	if level == "" {
 		level = "info"
 	}
-	return map[string]any{"log": map[string]any{"level": level, "output": "/var/log/armwall/sing-box.log", "timestamp": true}, "inbounds": inbounds, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}, "experimental": map[string]any{"clash_api": map[string]any{"external_controller": "127.0.0.1:9090"}}}
+	result := map[string]any{"log": map[string]any{"level": level, "output": filepath.Join(logDir, "sing-box.log"), "timestamp": true}, "inbounds": inbounds, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}, "experimental": map[string]any{"clash_api": map[string]any{"external_controller": "127.0.0.1:9090"}}}
+	if s.DNS.Enabled {
+		remoteDetour := tcpOutbound
+		if remoteDetour == "direct" {
+			remoteDetour = ""
+		}
+		dnsServers := []any{dnsServerConfig("remote-dns", s.DNS.RemoteServer, s.DNS.RemoteSNI, remoteDetour), dnsServerConfig("direct-dns", s.DNS.DirectServer, "", "")}
+		dns := map[string]any{"servers": dnsServers, "rules": []any{map[string]any{"rule_set": []string{"geosite-cn"}, "action": "route", "server": "direct-dns"}}, "final": "remote-dns", "strategy": s.DNS.Strategy, "independent_cache": true}
+		if s.DNS.FakeIP {
+			dnsServers = append(dnsServers, map[string]any{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"})
+			dns["servers"] = dnsServers
+			dns["rules"] = append(dns["rules"].([]any), map[string]any{"query_type": []string{"A", "AAAA"}, "action": "route", "server": "fakeip"})
+			dns["reverse_mapping"] = true
+		}
+		result["dns"] = dns
+		route := result["route"].(map[string]any)
+		route["default_domain_resolver"] = "direct-dns"
+		if s.Mode != "bypass_cn" {
+			route["rule_set"] = append(route["rule_set"].([]any), ruleSet("geosite-cn"))
+		}
+	}
+	return result
 }
 func writeConfig(s Store) error {
+	if err := validateDNSSettings(&s.DNS); err != nil {
+		return err
+	}
+	macData, err := macACLData(s)
+	if err != nil {
+		return err
+	}
 	b, _ := json.MarshalIndent(config(s), "", "  ")
 	if err := os.MkdirAll(filepath.Dir(configPath), 0750); err != nil {
 		return err
 	}
-	if err := os.MkdirAll("/var/log/armwall", 0750); err != nil {
+	if err := os.MkdirAll(logDir, 0750); err != nil {
 		return err
 	}
 	candidate := configPath + ".candidate"
@@ -343,9 +1093,16 @@ func writeConfig(s Store) error {
 			return fmt.Errorf("invalid sing-box config: %s", strings.TrimSpace(string(out)))
 		}
 	}
+	if err := writeNaiveConfigs(s); err != nil {
+		_ = os.Remove(candidate)
+		return fmt.Errorf("write NaiveProxy configs: %w", err)
+	}
 	if err := os.Rename(candidate, configPath); err != nil {
 		_ = os.Remove(candidate)
 		return err
+	}
+	if err := writeAtomicFile(macACLPath, macData, 0640); err != nil {
+		return fmt.Errorf("write MAC ACL bindings: %w", err)
 	}
 	return nil
 }
@@ -360,6 +1117,12 @@ func run(w http.ResponseWriter, name string, args ...string) {
 	w.Write(out)
 }
 func restartProxy() error {
+	if _, err := exec.LookPath("naive"); err == nil {
+		out, restartErr := exec.Command("systemctl", "restart", "armwall-naive.service").CombinedOutput()
+		if restartErr != nil {
+			return fmt.Errorf("NaiveProxy restart failed: %s", strings.TrimSpace(string(out)))
+		}
+	}
 	out, err := exec.Command("systemctl", "restart", "armwall-sing-box.service").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("sing-box restart failed: %s", strings.TrimSpace(string(out)))
@@ -375,6 +1138,9 @@ func restartProxy() error {
 	}
 	return fmt.Errorf("sing-box restarted but proxy port %d is not ready", proxyPort)
 }
+
+var restartProxyFn = restartProxy
+
 func api(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	mu.Lock()
@@ -393,19 +1159,17 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid json", 400)
 			return
 		}
+		if err := validateNode(&n); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
 		if n.ID == "" {
 			n.ID = fmt.Sprintf("node-%d", time.Now().UnixNano())
 		}
+		n.Enabled = true
+		n.SortOrder = len(s.Nodes)
 		s.Nodes = append(s.Nodes, n)
-		if err := writeConfig(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := save(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := restartProxy(); err != nil {
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -420,21 +1184,205 @@ func api(w http.ResponseWriter, r *http.Request) {
 		if v.ID == "" {
 			v.ID = r.URL.Query().Get("id")
 		}
+		found := false
 		for i := range s.Nodes {
 			if s.Nodes[i].ID == v.ID {
 				s.Nodes = append(s.Nodes[:i], s.Nodes[i+1:]...)
+				found = true
 				break
 			}
 		}
-		if err := save(s); err != nil {
+		if !found {
+			http.Error(w, "node not found", 404)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		if err := writeConfig(s); err != nil {
+		json.NewEncoder(w).Encode(s)
+	case "/api/node/update":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var n Node
+		if json.NewDecoder(r.Body).Decode(&n) != nil || n.ID == "" {
+			http.Error(w, "invalid node", 400)
+			return
+		}
+		index := -1
+		for i := range s.Nodes {
+			if s.Nodes[i].ID == n.ID {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			http.Error(w, "node not found", 404)
+			return
+		}
+		n.SubscriptionID = s.Nodes[index].SubscriptionID
+		if strings.TrimSpace(n.Group) == "" {
+			n.Group = s.Nodes[index].Group
+		}
+		n.SortOrder = s.Nodes[index].SortOrder
+		if err := validateNode(&n); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		s.Nodes[index] = n
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		if err := restartProxy(); err != nil {
+		json.NewEncoder(w).Encode(n)
+	case "/api/node/copy":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ ID string }
+		json.NewDecoder(r.Body).Decode(&v)
+		for _, n := range s.Nodes {
+			if n.ID == v.ID {
+				n.ID = fmt.Sprintf("node-%d", time.Now().UnixNano())
+				n.Name += " - 副本"
+				n.SubscriptionID = ""
+				n.Group = "手动节点"
+				n.Enabled = true
+				n.SortOrder = len(s.Nodes)
+				s.Nodes = append(s.Nodes, n)
+				if err := persistStore(s, true); err != nil {
+					http.Error(w, err.Error(), 500)
+					return
+				}
+				json.NewEncoder(w).Encode(n)
+				return
+			}
+		}
+		http.Error(w, "node not found", 404)
+	case "/api/node/toggle":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct {
+			ID      string
+			Enabled bool
+		}
+		json.NewDecoder(r.Body).Decode(&v)
+		found := false
+		for i := range s.Nodes {
+			if s.Nodes[i].ID == v.ID {
+				s.Nodes[i].Enabled = v.Enabled
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "node not found", 404)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/node/batch-toggle":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct {
+			IDs     []string
+			Enabled bool
+		}
+		if json.NewDecoder(r.Body).Decode(&v) != nil || len(v.IDs) == 0 {
+			http.Error(w, "node ids are required", 400)
+			return
+		}
+		ids := make(map[string]bool, len(v.IDs))
+		for _, id := range v.IDs {
+			ids[id] = true
+		}
+		updated := 0
+		for i := range s.Nodes {
+			if ids[s.Nodes[i].ID] {
+				s.Nodes[i].Enabled = v.Enabled
+				updated++
+			}
+		}
+		if updated == 0 {
+			http.Error(w, "nodes not found", 404)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"updated": updated, "enabled": v.Enabled})
+	case "/api/node/batch-delete":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ IDs []string }
+		if json.NewDecoder(r.Body).Decode(&v) != nil || len(v.IDs) == 0 {
+			http.Error(w, "node ids are required", 400)
+			return
+		}
+		ids := map[string]bool{}
+		for _, id := range v.IDs {
+			ids[id] = true
+		}
+		before := len(s.Nodes)
+		kept := s.Nodes[:0]
+		for _, n := range s.Nodes {
+			if !ids[n.ID] {
+				kept = append(kept, n)
+			}
+		}
+		s.Nodes = kept
+		if len(s.Nodes) == before {
+			http.Error(w, "nodes not found", 404)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/node/reorder":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ IDs []string }
+		if json.NewDecoder(r.Body).Decode(&v) != nil || len(v.IDs) == 0 {
+			http.Error(w, "node ids are required", 400)
+			return
+		}
+		byID := map[string]Node{}
+		for _, n := range s.Nodes {
+			byID[n.ID] = n
+		}
+		ordered := make([]Node, 0, len(s.Nodes))
+		for _, id := range v.IDs {
+			if n, ok := byID[id]; ok {
+				n.SortOrder = len(ordered)
+				ordered = append(ordered, n)
+				delete(byID, id)
+			}
+		}
+		for _, n := range s.Nodes {
+			if rest, ok := byID[n.ID]; ok {
+				rest.SortOrder = len(ordered)
+				ordered = append(ordered, rest)
+			}
+		}
+		s.Nodes = ordered
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -448,7 +1396,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&v)
 		found := false
 		for _, n := range s.Nodes {
-			if n.ID == v.ID {
+			if n.ID == v.ID && n.Enabled {
 				found = true
 				break
 			}
@@ -458,15 +1406,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.SelectedNode = v.ID
-		if err := writeConfig(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := save(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := restartProxy(); err != nil {
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -476,7 +1416,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method", 405)
 			return
 		}
-		var v struct{ URL string }
+		var v struct {
+			URL, Name   string
+			UpdateHours int
+		}
 		if json.NewDecoder(r.Body).Decode(&v) != nil || !strings.HasPrefix(v.URL, "https://") {
 			http.Error(w, "invalid url", 400)
 			return
@@ -486,32 +1429,43 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 502)
 			return
 		}
-		kept := s.Nodes[:0]
+		if len(nodes) == 0 {
+			http.Error(w, "subscription contains no supported nodes", 422)
+			return
+		}
+		var sub *Subscription
+		for i := range s.Subscriptions {
+			if s.Subscriptions[i].URL == v.URL {
+				sub = &s.Subscriptions[i]
+				break
+			}
+		}
+		if sub == nil {
+			name := strings.TrimSpace(v.Name)
+			if name == "" {
+				name = fmt.Sprintf("订阅 %d", len(s.Subscriptions)+1)
+			}
+			hours := v.UpdateHours
+			if hours < 1 || hours > 168 {
+				hours = 6
+			}
+			s.Subscriptions = append(s.Subscriptions, Subscription{ID: fmt.Sprintf("subsrc-%d", time.Now().UnixNano()), Name: name, URL: v.URL, UpdateHours: hours, Enabled: true})
+			sub = &s.Subscriptions[len(s.Subscriptions)-1]
+		}
+		for i := range nodes {
+			nodes[i].SubscriptionID = sub.ID
+			nodes[i].Group = sub.Name
+			nodes[i].Enabled = true
+		}
+		sub.LastUpdated = time.Now()
+		kept := make([]Node, 0, len(s.Nodes))
 		for _, n := range s.Nodes {
-			if !strings.HasPrefix(n.ID, "sub-") {
+			if n.SubscriptionID != sub.ID {
 				kept = append(kept, n)
 			}
 		}
 		s.Nodes = append(kept, nodes...)
-		found := false
-		for _, existing := range s.SubscriptionURLs {
-			if existing == v.URL {
-				found = true
-				break
-			}
-		}
-		if !found {
-			s.SubscriptionURLs = append(s.SubscriptionURLs, v.URL)
-		}
-		if err := save(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := writeConfig(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := restartProxy(); err != nil {
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -523,21 +1477,14 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		kept := s.Nodes[:0]
 		for _, n := range s.Nodes {
-			if !strings.HasPrefix(n.ID, "sub-") {
+			if n.SubscriptionID == "" && !strings.HasPrefix(n.ID, "sub-") {
 				kept = append(kept, n)
 			}
 		}
 		s.Nodes = kept
 		s.SubscriptionURLs = nil
-		if err := save(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := writeConfig(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := restartProxy(); err != nil {
+		s.Subscriptions = nil
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -547,11 +1494,161 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method", 405)
 			return
 		}
-		if err := updateSubscriptions(); err != nil {
+		if err := updateSubscriptionsWithForce(true); err != nil {
 			http.Error(w, err.Error(), 502)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"updated": true})
+	case "/api/subscription/update-one":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ ID string }
+		json.NewDecoder(r.Body).Decode(&v)
+		var sub *Subscription
+		for i := range s.Subscriptions {
+			if s.Subscriptions[i].ID == v.ID {
+				sub = &s.Subscriptions[i]
+				break
+			}
+		}
+		if sub == nil {
+			http.Error(w, "subscription not found", 404)
+			return
+		}
+		nodes, err := fetchSubscription(sub.URL)
+		if err != nil {
+			http.Error(w, err.Error(), 502)
+			return
+		}
+		if len(nodes) == 0 {
+			http.Error(w, "subscription contains no supported nodes", 422)
+			return
+		}
+		for i := range nodes {
+			nodes[i].SubscriptionID = sub.ID
+			nodes[i].Group = sub.Name
+			nodes[i].Enabled = true
+		}
+		kept := make([]Node, 0, len(s.Nodes))
+		for _, n := range s.Nodes {
+			if n.SubscriptionID != sub.ID {
+				kept = append(kept, n)
+			}
+		}
+		s.Nodes = append(kept, nodes...)
+		sub.LastUpdated = time.Now()
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"updated": sub.ID, "nodes": len(nodes)})
+	case "/api/subscription/edit":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v Subscription
+		if json.NewDecoder(r.Body).Decode(&v) != nil || v.ID == "" || !strings.HasPrefix(v.URL, "https://") {
+			http.Error(w, "invalid subscription", 400)
+			return
+		}
+		v.Name = strings.TrimSpace(v.Name)
+		if v.Name == "" || v.UpdateHours < 1 || v.UpdateHours > 168 {
+			http.Error(w, "name and update interval 1-168 are required", 400)
+			return
+		}
+		for _, sub := range s.Subscriptions {
+			if sub.ID != v.ID && sub.URL == v.URL {
+				http.Error(w, "subscription url already exists", 409)
+				return
+			}
+		}
+		found := false
+		for i := range s.Subscriptions {
+			if s.Subscriptions[i].ID == v.ID {
+				oldName := s.Subscriptions[i].Name
+				if v.LastUpdated.IsZero() {
+					v.LastUpdated = s.Subscriptions[i].LastUpdated
+				}
+				s.Subscriptions[i] = v
+				for j := range s.Nodes {
+					if s.Nodes[j].SubscriptionID == v.ID && s.Nodes[j].Group == oldName {
+						s.Nodes[j].Group = v.Name
+					}
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "subscription not found", 404)
+			return
+		}
+		if err := persistStore(s, false); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(v)
+	case "/api/subscription/delete":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ ID string }
+		json.NewDecoder(r.Body).Decode(&v)
+		before := len(s.Subscriptions)
+		subs := s.Subscriptions[:0]
+		for _, sub := range s.Subscriptions {
+			if sub.ID != v.ID {
+				subs = append(subs, sub)
+			}
+		}
+		s.Subscriptions = subs
+		if len(s.Subscriptions) == before {
+			http.Error(w, "subscription not found", 404)
+			return
+		}
+		nodes := s.Nodes[:0]
+		for _, n := range s.Nodes {
+			if n.SubscriptionID != v.ID {
+				nodes = append(nodes, n)
+			}
+		}
+		s.Nodes = nodes
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/subscription/toggle":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct {
+			ID      string
+			Enabled bool
+		}
+		json.NewDecoder(r.Body).Decode(&v)
+		found := false
+		for i := range s.Subscriptions {
+			if s.Subscriptions[i].ID == v.ID {
+				s.Subscriptions[i].Enabled = v.Enabled
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "subscription not found", 404)
+			return
+		}
+		if err := persistStore(s, false); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
 	case "/api/subscription/schedule":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -580,6 +1677,299 @@ func api(w http.ResponseWriter, r *http.Request) {
 		exec.Command("systemctl", "daemon-reload").Run()
 		exec.Command("systemctl", "restart", "armwall-subscription-update.timer").Run()
 		json.NewEncoder(w).Encode(s)
+	case "/api/acl":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var rule ACLRule
+		if json.NewDecoder(r.Body).Decode(&rule) != nil {
+			http.Error(w, "invalid ACL rule", 400)
+			return
+		}
+		creating := rule.ID == ""
+		if creating {
+			rule.ID = fmt.Sprintf("acl-%d", time.Now().UnixNano())
+		}
+		if err := validateACLRule(&rule, s); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if creating {
+			s.ACLRules = append(s.ACLRules, rule)
+		} else {
+			index := -1
+			for i := range s.ACLRules {
+				if s.ACLRules[i].ID == rule.ID {
+					index = i
+					break
+				}
+			}
+			if index < 0 {
+				http.Error(w, "ACL rule not found", 404)
+				return
+			}
+			s.ACLRules[index] = rule
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(rule)
+	case "/api/acl/toggle":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct {
+			ID      string
+			Enabled bool
+		}
+		if json.NewDecoder(r.Body).Decode(&v) != nil || v.ID == "" {
+			http.Error(w, "ACL rule id is required", 400)
+			return
+		}
+		found := false
+		for i := range s.ACLRules {
+			if s.ACLRules[i].ID == v.ID {
+				s.ACLRules[i].Enabled = v.Enabled
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "ACL rule not found", 404)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/acl/delete":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ ID string }
+		if json.NewDecoder(r.Body).Decode(&v) != nil || v.ID == "" {
+			http.Error(w, "ACL rule id is required", 400)
+			return
+		}
+		before := len(s.ACLRules)
+		kept := s.ACLRules[:0]
+		for _, rule := range s.ACLRules {
+			if rule.ID != v.ID {
+				kept = append(kept, rule)
+			}
+		}
+		s.ACLRules = kept
+		if len(s.ACLRules) == before {
+			http.Error(w, "ACL rule not found", 404)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/dns":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var settings DNSSettings
+		if json.NewDecoder(r.Body).Decode(&settings) != nil {
+			http.Error(w, "invalid DNS settings", 400)
+			return
+		}
+		if err := validateDNSSettings(&settings); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		s.DNS = settings
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s.DNS)
+	case "/api/strategy":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var group StrategyGroup
+		if json.NewDecoder(r.Body).Decode(&group) != nil {
+			http.Error(w, "invalid strategy", 400)
+			return
+		}
+		creating := group.ID == ""
+		if creating {
+			group.ID = fmt.Sprintf("strategy-%d", time.Now().UnixNano())
+		}
+		if group.ID == "direct" || group.ID == "block" {
+			http.Error(w, "reserved strategy id", 400)
+			return
+		}
+		if err := validateStrategyGroup(&group, s); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if creating {
+			s.StrategyGroups = append(s.StrategyGroups, group)
+		} else {
+			index := -1
+			for i := range s.StrategyGroups {
+				if s.StrategyGroups[i].ID == group.ID {
+					index = i
+					break
+				}
+			}
+			if index < 0 {
+				http.Error(w, "strategy not found", 404)
+				return
+			}
+			s.StrategyGroups[index] = group
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(group)
+	case "/api/strategy/delete":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct{ ID string }
+		if json.NewDecoder(r.Body).Decode(&v) != nil || v.ID == "" {
+			http.Error(w, "strategy id is required", 400)
+			return
+		}
+		before := len(s.StrategyGroups)
+		kept := s.StrategyGroups[:0]
+		for _, group := range s.StrategyGroups {
+			if group.ID != v.ID {
+				kept = append(kept, group)
+			}
+		}
+		s.StrategyGroups = kept
+		if len(s.StrategyGroups) == before {
+			http.Error(w, "strategy not found", 404)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/strategy/status":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"groups": strategyRuntimeStatuses(s)})
+	case "/api/strategy/test":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct{ ID string }
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.ID == "" {
+			http.Error(w, "strategy id is required", http.StatusBadRequest)
+			return
+		}
+		var group *StrategyGroup
+		for i := range s.StrategyGroups {
+			if s.StrategyGroups[i].ID == request.ID {
+				group = &s.StrategyGroups[i]
+				break
+			}
+		}
+		if group == nil {
+			http.Error(w, "strategy not found", http.StatusNotFound)
+			return
+		}
+		delay, err := clashDelay(group.ID, group.TestURL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": group.ID, "ms": delay})
+	case "/api/strategy/select":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct{ ID, NodeID string }
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.ID == "" || request.NodeID == "" {
+			http.Error(w, "strategy and node ids are required", http.StatusBadRequest)
+			return
+		}
+		found := false
+		for i := range s.StrategyGroups {
+			group := &s.StrategyGroups[i]
+			if group.ID != request.ID || group.Type != "selector" {
+				continue
+			}
+			for _, member := range group.NodeIDs {
+				if member == request.NodeID {
+					group.Selected = request.NodeID
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			http.Error(w, "selector or member not found", http.StatusNotFound)
+			return
+		}
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+	case "/api/routing":
+		if r.Method != "POST" {
+			http.Error(w, "method", 405)
+			return
+		}
+		var v struct {
+			Mode        string
+			TCPOutbound string
+			UDPOutbound string
+			DNS         *DNSSettings
+		}
+		if json.NewDecoder(r.Body).Decode(&v) != nil || (v.Mode != "bypass_cn" && v.Mode != "gfw" && v.Mode != "global") {
+			http.Error(w, "invalid routing settings", 400)
+			return
+		}
+		valid := map[string]bool{"": true, "same": true, "direct": true}
+		for _, node := range s.Nodes {
+			valid[node.ID] = true
+		}
+		for _, group := range s.StrategyGroups {
+			valid[group.ID] = true
+		}
+		if !valid[v.TCPOutbound] || !valid[v.UDPOutbound] {
+			http.Error(w, "unknown routing outbound", 400)
+			return
+		}
+		if v.DNS != nil {
+			if err := validateDNSSettings(v.DNS); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			s.DNS = *v.DNS
+		}
+		s.Mode = v.Mode
+		s.TCPOutbound = v.TCPOutbound
+		s.UDPOutbound = v.UDPOutbound
+		if err := persistStore(s, true); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
 	case "/api/mode":
 		if r.Method != "POST" {
 			http.Error(w, "method", 405)
@@ -592,15 +1982,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.Mode = v.Mode
-		if err := save(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := writeConfig(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := restartProxy(); err != nil {
+		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -631,7 +2013,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(s)
 	case "/api/service/start":
-		writeConfig(s)
+		if err := writeConfig(s); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		run(w, "systemctl", "restart", "armwall-sing-box.service")
 	case "/api/service/stop":
 		run(w, "systemctl", "stop", "armwall-sing-box.service")
@@ -641,7 +2026,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("download") == "1" {
 			w.Header().Set("Content-Disposition", "attachment; filename=armwall.log")
 		}
-		b, err := os.ReadFile("/var/log/armwall/sing-box.log")
+		b, err := os.ReadFile(filepath.Join(logDir, "sing-box.log"))
 		if err != nil && !os.IsNotExist(err) {
 			http.Error(w, err.Error(), 500)
 			return
@@ -656,7 +2041,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method", 405)
 			return
 		}
-		if err := os.WriteFile("/var/log/armwall/sing-box.log", nil, 0640); err != nil {
+		if err := os.WriteFile(filepath.Join(logDir, "sing-box.log"), nil, 0640); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -819,15 +2204,12 @@ func api(w http.ResponseWriter, r *http.Request) {
 			conn.Close()
 			json.NewEncoder(w).Encode(map[string]any{"method": "tcp", "ms": time.Since(start).Milliseconds()})
 		case "urltest":
-			endpoint := "http://127.0.0.1:9090/proxies/" + url.PathEscape(tag) + "/delay?url=" + url.QueryEscape("https://www.google.com/generate_204") + "&timeout=10000"
-			resp, err := http.Get(endpoint)
+			delay, err := clashDelay(tag, "https://www.google.com/generate_204")
 			if err != nil {
 				http.Error(w, err.Error(), 502)
 				return
 			}
-			defer resp.Body.Close()
-			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
+			json.NewEncoder(w).Encode(map[string]any{"method": "urltest", "ms": delay, "delay": delay})
 		default:
 			http.Error(w, "invalid method", 400)
 		}
@@ -865,24 +2247,150 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method", 405)
 			return
 		}
-		var v struct{ Core, Action, File string }
+		var v struct{ Core, Action string }
 		if json.NewDecoder(r.Body).Decode(&v) != nil || (v.Core != "sing-box" && v.Core != "naive") {
 			http.Error(w, "invalid core", 400)
 			return
 		}
-		if v.Action != "version" && v.Action != "latest" && v.Action != "manual" {
+		if v.Action != "version" && v.Action != "latest" {
 			http.Error(w, "invalid action", 400)
 			return
 		}
 		args := []string{v.Core, v.Action}
-		if v.Action == "manual" {
-			if !filepath.IsAbs(v.File) || strings.Contains(v.File, "..") {
-				http.Error(w, "invalid file", 400)
-				return
-			}
-			args = append(args, v.File)
+		run(w, updateCorePath, args...)
+	case "/api/core/upload":
+		handleCoreUpload(w, r)
+	case "/api/config/export":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
 		}
-		run(w, "/usr/local/bin/armwall-update-core", args...)
+		data, err := marshalConfigArchive(s)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", "attachment; filename=armwall-config.json")
+		_, _ = w.Write(data)
+	case "/api/config/import":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := readLimitedBody(r.Body, maxConfigSize)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		imported, err := parseConfigArchive(data)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, err := createConfigBackup(s, "pre-import"); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := persistStore(imported, true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(imported)
+	case "/api/backups":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		backups, err := listConfigBackups()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(backups)
+	case "/api/backups/create":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		backup, err := createConfigBackup(s, "armwall-backup")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(backup)
+	case "/api/backups/download":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		path, err := configBackupPath(r.URL.Query().Get("name"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			http.Error(w, "backup not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(path))
+		_, _ = w.Write(data)
+	case "/api/backups/restore":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct{ Name string }
+		if json.NewDecoder(r.Body).Decode(&request) != nil {
+			http.Error(w, "backup name is required", http.StatusBadRequest)
+			return
+		}
+		path, err := configBackupPath(request.Name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			http.Error(w, "backup not found", http.StatusNotFound)
+			return
+		}
+		restored, err := parseConfigArchive(data)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, err := createConfigBackup(s, "pre-restore"); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := persistStore(restored, true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(restored)
+	case "/api/backups/delete":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct{ Name string }
+		if json.NewDecoder(r.Body).Decode(&request) != nil {
+			http.Error(w, "backup name is required", http.StatusBadRequest)
+			return
+		}
+		path, err := configBackupPath(request.Name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := os.Remove(path); err != nil {
+			http.Error(w, "backup not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"deleted": true})
 	default:
 		http.NotFound(w, r)
 	}
@@ -903,9 +2411,27 @@ func page(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	template.Must(template.New("p").Parse(indexHTML2)).Execute(w, nil)
+	b, err := webFiles.ReadFile("web/index.html")
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	_, _ = w.Write(b)
 }
+
+//go:embed web/index.html web/styles.css web/app.js
+var webFiles embed.FS
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Printf("armwall %s\n", version)
+		return
+	}
+	if v := os.Getenv("ARMWALL_DB"); v != "" {
+		dbPath = v
+	}
 	if v := os.Getenv("ARMWALL_DATA"); v != "" {
 		dataPath = v
 	}
@@ -928,6 +2454,27 @@ func main() {
 	if v := os.Getenv("ARMWALL_CONFIG"); v != "" {
 		configPath = v
 	}
+	if v := os.Getenv("ARMWALL_LOG_DIR"); v != "" {
+		logDir = v
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--write-config" {
+		s := load()
+		if s.Mode == "" {
+			s.Mode = "bypass_cn"
+		}
+		if s.ProxyPort == 0 {
+			s.ProxyPort = proxyPort
+		}
+		normalizeStore(&s)
+		if err := writeConfig(s); err != nil {
+			log.Fatal(err)
+		}
+		if err := save(s); err != nil {
+			log.Fatal(err)
+		}
+		log.Print("configuration generated")
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "--update-subscriptions" {
 		if err := updateSubscriptions(); err != nil {
 			log.Fatal(err)
@@ -942,6 +2489,14 @@ func main() {
 		}
 		api(w, r)
 	})
+	staticFS, err := fs.Sub(webFiles, "web")
+	if err != nil {
+		log.Fatal(err)
+	}
+	http.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))).ServeHTTP(w, r)
+	}))
 	http.HandleFunc("/", page)
 	addr := os.Getenv("ARMWALL_LISTEN")
 	if addr == "" {
@@ -950,10 +2505,3 @@ func main() {
 	log.Printf("armwall listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
-
-var indexHTML = `<!doctype html><html><head><meta charset="utf-8"><title>ArmWall</title><style>body{font:15px sans-serif;max-width:900px;margin:32px auto;padding:0 16px;background:#f5f6f8}section{background:#fff;padding:20px;margin:14px 0;border:1px solid #ddd}input,select,button{padding:8px;margin:4px}button{cursor:pointer}</style></head><body><h1>ArmWall</h1><section><h2>认证</h2><input id="token" type="password" placeholder="管理 Token" onchange="localStorage.token=this.value"><button onclick="token.value='';localStorage.removeItem('token')">清除</button></section><section><h2>服务</h2><button onclick="svc('start')">启动/重启</button><button onclick="svc('stop')">停止</button><button onclick="svc('status')">状态</button><pre id="out"></pre></section><section><h2>订阅</h2><input id="sub" size="60" placeholder="HTTPS 订阅地址"><button onclick="importSub()">导入订阅</button></section><section><h2>分流模式</h2><select id="mode"><option value="bypass_cn">绕过国内</option><option value="gfw">GFW 模式</option><option value="global">全局代理</option></select><button onclick="saveMode()">保存</button></section><section><h2>添加节点</h2><input id="name" placeholder="名称"><input id="server" placeholder="服务器"><input id="port" type="number" value="443"><input id="uuid" placeholder="UUID/密码"><select id="type"><option>vless</option><option>trojan</option><option>shadowsocks</option></select><button onclick="add()">添加</button></section><section><h2>本机代理</h2><p>SOCKS5/HTTP mixed: <code>Armbian_IP:11080</code></p></section><script>token.value=localStorage.token||'';async function api(p,o){o=o||{};o.headers=Object.assign({},o.headers,{'Authorization':'Bearer '+token.value});return fetch(p,o)}async function svc(x){let r=await api('/api/service/'+x,{method:'POST'});out.textContent=await r.text()}async function add(){let d={name:name.value,server:server.value,port:+port.value,uuid:uuid.value,type:type.value,tls:true};let r=await api('/api/node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});out.textContent=await r.text()}async function saveMode(){let r=await api('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode.value})});out.textContent=await r.text()}async function importSub(){let r=await api('/api/subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:sub.value})});out.textContent=await r.text()}</script></body></html>`
-
-var indexHTML2 = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ArmWall</title><style>
-:root{font:14px system-ui,sans-serif;color:#202735;background:#eef1f5}*{box-sizing:border-box}body{margin:0}.top{height:58px;background:#172335;color:#fff;display:flex;align-items:center;padding:0 24px;gap:28px}.brand{font-size:20px;font-weight:650}.top small{color:#aebbd0}.layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:calc(100vh - 58px)}aside{background:#fff;border-right:1px solid #d9dee7;padding:18px 12px}aside button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:11px 13px;color:#4b5667;border-radius:5px;cursor:pointer}aside button.active,aside button:hover{background:#e8edf6;color:#1c4c98;font-weight:600}.main{padding:24px;max-width:1200px;width:100%}.view{display:none}.view.active{display:block}.title{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}.title h1{font-size:23px;margin:0}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{background:#fff;border:1px solid #d9dee7;border-radius:6px;padding:17px}.card h3{margin:0 0 12px;font-size:15px}.metric{font-size:25px;font-weight:650}.muted{color:#687487}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}label{display:block;color:#5c6879;font-size:13px;margin:12px 0 5px}input,select,textarea{border:1px solid #cbd3df;border-radius:4px;padding:9px;background:#fff;min-width:180px}textarea{width:100%;min-height:85px}button.primary,button.danger{border:0;border-radius:4px;padding:9px 14px;color:#fff;cursor:pointer}button.primary{background:#2765b8}button.danger{background:#b84a4a}table{border-collapse:collapse;width:100%;background:#fff}th,td{padding:10px;border-bottom:1px solid #e5e8ee;text-align:left}th{background:#f7f8fa;color:#566275;font-weight:600}pre{white-space:pre-wrap;background:#172335;color:#d8e2f2;padding:12px;border-radius:4px;min-height:50px}.sitebtn{display:flex;flex-direction:column;justify-content:center;align-items:center;gap:7px;width:112px;height:94px;border:1px solid #d6dce6;background:#fff;color:#273449;border-radius:6px;padding:10px;cursor:pointer}.sitebtn:hover{border-color:#2765b8;box-shadow:0 2px 8px rgba(39,101,184,.14)}.sitebtn img{width:28px;height:28px;object-fit:contain}.test-result{font-size:12px;color:#2765b8;min-height:16px}.status{display:inline-block;border-radius:10px;padding:3px 9px;background:#e4f5e9;color:#18753a;font-size:12px}@media(max-width:760px){.layout{grid-template-columns:1fr}aside{display:flex;overflow:auto;border-right:0;border-bottom:1px solid #d9dee7}.grid{grid-template-columns:1fr}.main{padding:15px}}
-</style></head><body><header class="top"><span class="brand">ArmWall</span><small>Armbian proxy gateway</small><span style="margin-left:auto" id="badge">未连接</span></header><div class="layout"><aside><button class="active" data-tab="dashboard">概览</button><button data-tab="nodes">节点管理</button><button data-tab="subscriptions">订阅管理</button><button data-tab="routing">分流与 DNS</button><button data-tab="service">服务与组件</button><button data-tab="logs">运行日志</button></aside><main class="main"><section id="dashboard" class="view active"><div class="title"><h1>概览</h1><button class="primary" onclick="service('start')">启动 / 重启</button></div><div class="grid"><div class="card"><h3>代理服务</h3><div class="metric" id="svc">检查中</div><p class="muted">mixed SOCKS5 / HTTP · 11080</p></div><div class="card"><h3>节点数量</h3><div class="metric" id="nodeCount">-</div><p class="muted">当前配置中的出站节点</p></div><div class="card"><h3>运行模式</h3><div class="metric" id="modeText">-</div><p class="muted">可在“分流与 DNS”中调整</p></div></div><div class="card" style="margin-top:14px"><h3>当前运行节点</h3><select id="activeNode" style="min-width:360px"></select><button class="primary" onclick="selectNode()">切换节点</button><h3 style="margin-top:18px">网络测试</h3><div class="row"><button class="sitebtn" onclick="netTest('google',this)"><img src="https://www.google.com/favicon.ico">Google</button><button class="sitebtn" onclick="netTest('youtube',this)"><img src="https://www.youtube.com/favicon.ico">YouTube</button><button class="sitebtn" onclick="netTest('github',this)"><img src="https://github.com/favicon.ico">GitHub</button><button class="sitebtn" onclick="netTest('facebook',this)"><img src="https://www.facebook.com/favicon.ico">Facebook</button><button class="sitebtn" onclick="netTest('baidu',this)"><img src="https://www.baidu.com/favicon.ico">百度</button><button class="sitebtn" onclick="netTest('qq',this)"><img src="https://www.qq.com/favicon.ico">腾讯</button><button class="sitebtn" onclick="netTest('bilibili',this)"><img src="https://www.bilibili.com/favicon.ico">哔哩哔哩</button><button class="sitebtn" onclick="netTest('microsoft',this)"><img src="https://www.microsoft.com/favicon.ico">Microsoft</button></div></div><div class="card" style="margin-top:14px"><h3>快速连接</h3><p>SOCKS5 / HTTP mixed：<input id="proxyPort" type="number" value="11080" style="min-width:100px"><button class="primary" onclick="savePort()">应用端口</button></p><p class="muted">透明网关端口：11081（需要手动启用 nftables 网关规则）</p></div></section><section id="nodes" class="view"><div class="title"><h1>节点管理</h1><button class="primary" onclick="document.getElementById('nodeForm').hidden=!document.getElementById('nodeForm').hidden">添加节点</button></div><div class="card" id="nodeForm" hidden><div class="row"><input id="nName" placeholder="备注名称"><select id="nType"><option>vless</option><option>trojan</option><option>hysteria2</option><option>anytls</option><option>vmess</option><option>naive</option></select><input id="nServer" placeholder="服务器地址"><input id="nPort" type="number" value="443"><input id="nUser" placeholder="用户名"><input id="nSecret" placeholder="密码 / UUID"><input id="nSNI" placeholder="TLS SNI"><input id="nHost" placeholder="HTTP Host"><input id="nPath" placeholder="路径"><input id="nALPN" placeholder="ALPN, 逗号分隔"><input id="nFlow" placeholder="VLESS Flow"><input id="nMethod" placeholder="SS 加密方法"><label><input id="nInsecure" type="checkbox">跳过证书验证</label></div><button class="primary" onclick="addNode()">保存节点</button><label>分享链接导入（每行一个）</label><textarea id="shareLinks" placeholder="vless://... 或 naive://..."></textarea><button class="primary" onclick="importLinks()">导入分享链接</button></div><div class="card" style="margin-top:14px;padding:0;overflow:auto"><table><thead><tr><th>备注</th><th>协议</th><th>服务器</th><th>端口</th><th>操作</th></tr></thead><tbody id="nodesTable"></tbody></table></div></section><section id="subscriptions" class="view"><div class="title"><h1>订阅管理</h1></div><div class="card"><h3>已添加订阅</h3><div id="subscriptionList" class="muted"></div><div class="row"><button class="primary" onclick="updateSubscriptions()">手动更新全部</button><label>自动更新间隔（小时）</label><input id="updateHours" type="number" min="1" max="168" value="6"><button class="primary" onclick="saveSchedule()">保存间隔</button></div><label>HTTPS 订阅地址</label><input id="subURL" style="width:75%" placeholder="https://..."><div class="row"><button class="primary" onclick="importSubscription()">立即更新并导入</button><span class="muted">更新成功后会自动生成并校验 sing-box 配置</span></div></div></section><section id="routing" class="view"><div class="title"><h1>分流与 DNS</h1><button class="primary" onclick="saveRouting()">保存并重启</button></div><div class="card"><label>代理模式</label><select id="routeMode"><option value="bypass_cn">绕过国内：国内直连，其余代理</option><option value="gfw">GFW：规则匹配代理，其余直连</option><option value="global">全局代理</option></select><label>DNS 说明</label><p class="muted">当前使用 sing-box DNS 和远程 GeoIP/Geosite 规则集。透明网关部署时请将客户端 DNS 指向本机。</p><h3 style="margin-top:22px">规则更新</h3><div id="ruleManager"></div><label>透明网关</label><div class="row"><input id="lanIf" value="eth0" placeholder="LAN 接口"><input id="wanIf" value="eth0" placeholder="WAN 接口"><button class="primary" onclick="gatewayEnable()">启用网关</button><button class="primary" onclick="gateway('status')">查看状态</button><button class="danger" onclick="gateway('disable')">关闭网关规则</button><span class="muted">启用前请确认 LAN/WAN 接口，避免影响现有网络。</span></div><pre id="gatewayOut"></pre></div></section><section id="service" class="view"><div class="title"><h1>服务与组件</h1></div><div class="grid"><div class="card"><h3>ArmWall Web</h3><span class="status">运行中</span><p class="muted">systemd · :8080</p></div><div class="card"><h3>sing-box</h3><p id="coreVersion">检查中</p><button class="primary" onclick="updateCore('sing-box','version')">检查版本</button><button class="primary" onclick="updateCore('sing-box','latest')">更新</button></div><div class="card"><h3>代理服务</h3><button class="primary" onclick="service('start')">启动</button><button class="danger" onclick="service('stop')">停止</button><p id="serviceOut" class="muted"></p></div></div></section><section id="logs" class="view"><div class="title"><h1>运行日志</h1><div><select id="logLevel"><option>trace</option><option>debug</option><option selected>info</option><option>warn</option><option>error</option></select><button class="primary" onclick="saveLogLevel()">应用级别</button><button class="primary" onclick="refreshLogs()">刷新</button><button class="primary" onclick="exportLogs()">导出</button><button class="danger" onclick="clearLogs()">清屏</button></div></div><pre id="logOut">点击服务状态按钮查看 sing-box 状态。</pre></section><div id="out" hidden></div></main></div><script>
-const $=id=>document.getElementById(id);let token=localStorage.armwallToken||'';function api(path,opt={}){opt.headers=Object.assign({},opt.headers,{'Authorization':'Bearer '+token});return fetch(path,opt)}function show(msg){$('out').textContent=typeof msg==='string'?msg:JSON.stringify(msg,null,2)}document.querySelectorAll('aside button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));document.querySelectorAll('aside button').forEach(x=>x.classList.remove('active'));$(b.dataset.tab).classList.add('active');b.classList.add('active')});async function state(){let r=await api('/api/state');if(r.status===401){token=prompt('请输入 ArmWall 管理 Token')||'';localStorage.armwallToken=token;r=await api('/api/state')}let s=await r.json();$('nodeCount').textContent=(s.nodes||[]).length;$('modeText').textContent={bypass_cn:'绕过国内',gfw:'GFW 模式',global:'全局代理'}[s.mode]||s.mode;$('routeMode').value=s.mode;renderNodes(s.nodes||[]);renderSelectors(s);renderRules();$('badge').textContent='已连接';service('status')}function renderNodes(ns){let b=document.getElementById("nodesTable");b.textContent="";ns.forEach(function(n){let r=b.insertRow();[n.Name||n.name||"未命名",n.Type||n.type,n.Server||n.server,n.Port||n.port].forEach(function(v){r.insertCell().textContent=v});let c=r.insertCell(),x=document.createElement("button");x.className="danger";x.textContent="删除";x.onclick=function(){deleteNode(n.ID||n.id)};c.appendChild(x);["ping","tcp","urltest"].forEach(function(m){let y=document.createElement("button");y.className="primary";y.textContent=m;y.onclick=function(){testNode(n.id,m,y)};c.appendChild(y)})})}function testNode(id,m,b){let old=b.textContent;b.textContent="测试中";api("/api/node/test?id="+encodeURIComponent(id)+"&method="+m,{method:"POST"}).then(function(r){return r.json()}).then(function(d){b.textContent=m+" "+(d.ms??d.delay)+"ms"}).catch(function(){b.textContent=old+" 失败"})}function esc(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function service(a){let r=await api('/api/service/'+a,{method:'POST'});let t=await r.text();$('svc').textContent=t.trim()||'已提交';$('serviceOut').textContent=t;$('logOut').textContent=t}async function addNode(){let d={Name:$('nName').value,Type:$('nType').value,Server:$('nServer').value,Port:+$('nPort').value,Username:$('nUser').value,UUID:$('nSecret').value,ServerName:$('nSNI').value,Host:$('nHost').value,Path:$('nPath').value,ALPN:$('nALPN').value,Flow:$('nFlow').value,Method:$('nMethod').value,Insecure:$('nInsecure').checked,TLS:true};let r=await api('/api/node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});show(await r.text());state()}async function importLinks(){let r=await api("/api/node/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Links:$("shareLinks").value})});show(await r.text());state()}async function savePort(){let r=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ProxyPort:+$("proxyPort").value})});show(await r.text());state()}async function importSubscription(){let r=await api('/api/subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({URL:$('subURL').value})});show(await r.text());state()}async function saveRouting(){let r=await api('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Mode:$('routeMode').value})});show(await r.text());state()}async function deleteNode(id){let r=await api('/api/node/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ID:id})});show(await r.text());state()}async function gatewayEnable(){let r=await api("/api/gateway/enable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({LAN:document.getElementById("lanIf").value,WAN:document.getElementById("wanIf").value})});document.getElementById("gatewayOut").textContent=await r.text()}async function gateway(a){let r=await api("/api/gateway/"+a,{method:a==="status"?"GET":"POST"});document.getElementById("gatewayOut").textContent=await r.text()}async function refreshLogs(){let r=await api("/api/logs");document.getElementById("logOut").textContent=await r.text()}async function renderRules(){let r=await api("/api/rules");if(!r.ok)return;let d=await r.json(),box=document.getElementById("ruleManager");box.innerHTML="";Object.keys(d.rules||{}).forEach(function(tag){let row=document.createElement("div");row.className="row";row.innerHTML="<b>"+tag+"</b><input id=\"rule-"+tag+"\" placeholder=\"备用规则 URL\" value=\""+((d.backups||{})[tag]||"")+"\"><input id=\"hours-"+tag+"\" type=\"number\" min=\"1\" max=\"168\" value=\""+(d.update_hours||6)+"\"><button class=\"primary\">更新</button>";row.querySelector("button").onclick=function(){updateRule(tag)};box.appendChild(row)})}async function updateRule(tag){let r=await api("/api/rules/update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Tag:tag})});alert(r.ok?"规则更新成功":await r.text())}function renderSelectors(s){let n=document.getElementById("activeNode");n.innerHTML="";(s.nodes||[]).forEach(function(x){let o=document.createElement("option");o.value=x.id;o.textContent=(x.name||"未命名")+" ["+x.type+"]";o.selected=x.id===s.selected_node;n.appendChild(o)});document.getElementById("subscriptionList").textContent=(s.subscription_urls||[]).join("\n")||"暂无订阅";document.getElementById("updateHours").value=s.update_hours||6;document.getElementById("logLevel").value=s.log_level||"info"}async function selectNode(){let r=await api("/api/node/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ID:document.getElementById("activeNode").value})});alert(r.ok?"节点切换成功":await r.text());state()}async function netTest(t,b){let result=b.querySelector(".test-result");if(!result){result=document.createElement("span");result.className="test-result";b.appendChild(result)}result.textContent="测试中";let r=await api("/api/network/test?target="+t);if(r.ok){let d=await r.json();result.textContent=(d.ms??d.delay)+"ms"}else{result.textContent="失败"}}async function updateSubscriptions(){let r=await api("/api/subscription/update",{method:"POST"});alert(r.ok?"订阅更新成功":await r.text());state()}async function saveSchedule(){let r=await api("/api/subscription/schedule",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Hours:+document.getElementById("updateHours").value})});alert(r.ok?"更新间隔已保存":await r.text());state()}async function saveLogLevel(){let r=await api("/api/log/level",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Level:document.getElementById("logLevel").value})});alert(r.ok?"日志级别已应用":await r.text())}function exportLogs(){window.open("/api/logs?download=1","_blank")}async function clearLogs(){let r=await api("/api/log/clear",{method:"POST"});if(r.ok){document.getElementById("logOut").textContent=""}else{alert(await r.text())}}async function updateCore(c,a){let r=await api('/api/core/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Core:c,Action:a})});$('coreVersion').textContent=await r.text()}state();</script></body></html>`
