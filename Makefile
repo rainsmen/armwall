@@ -1,19 +1,26 @@
 VERSION ?= dev
 GO ?= go
+GOFMT ?= gofmt
 LDFLAGS = -s -w -X main.version=$(VERSION)
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall .
 
 test:
+	test -z "$$($(GOFMT) -l *.go)"
+	$(GO) vet ./...
 	$(GO) test ./...
 	node --check web/app.js
-	sh -n gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh
+	sh -n gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh
 
 release:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall-linux-armv6 .
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall-linux-armv7 .
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall-linux-arm64 .
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall-linux-amd64 .
+	$(MAKE) checksums
 
-.PHONY: build test release
+checksums:
+	sha256sum armwall-linux-* > SHA256SUMS
+
+.PHONY: build test release checksums

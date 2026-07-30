@@ -1,0 +1,11 @@
+/var/log/armwall/*.log {
+    daily
+    rotate 7
+    size 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+}

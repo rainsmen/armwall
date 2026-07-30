@@ -9,5 +9,12 @@ StandardError=append:/var/log/armwall/sing-box.log
 Restart=on-failure
 RestartSec=3
 User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/armwall
+ReadWritePaths=/var/log/armwall /var/lib/armwall
 [Install]
 WantedBy=multi-user.target

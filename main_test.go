@@ -51,7 +51,7 @@ func TestConfigArchiveAndBackupLifecycle(t *testing.T) {
 	oldBackupDir := backupDir
 	backupDir = dir
 	t.Cleanup(func() { backupDir = oldBackupDir })
-	want := Store{Mode: "global", ProxyPort: 11080, LogLevel: "info", SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", Enabled: true}}}
+	want := Store{Mode: "global", ProxyPort: 11080, LogLevel: "info", SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true}}}
 	created, err := createConfigBackup(want, "armwall-backup")
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +158,59 @@ func TestStrategyRuntimeStatusAndDelay(t *testing.T) {
 	}
 }
 
+func TestClashDelayChecksHTTPStatusBeforeDecoding(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not json", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	oldBase := clashAPIBase
+	clashAPIBase = server.URL
+	t.Cleanup(func() { clashAPIBase = oldBase })
+	_, err := clashDelay("missing", "https://example.com/204")
+	if err == nil || !strings.Contains(err.Error(), "urltest failed: 503") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAPIAuthAndServerHardening(t *testing.T) {
+	if _, err := validateAuthToken(""); err == nil {
+		t.Fatal("empty token should be rejected")
+	}
+	token, err := validateAuthToken("0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := newHTTPServer("127.0.0.1:0", token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if server.ReadHeaderTimeout == 0 || server.ReadTimeout == 0 || server.WriteTimeout == 0 || server.IdleTimeout == 0 || server.MaxHeaderBytes == 0 {
+		t.Fatalf("server is missing hardening timeouts: %+v", server)
+	}
+	handler := authHandler(token, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	recorder := httptest.NewRecorder()
+	handler(recorder, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("missing token status=%d", recorder.Code)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	recorder = httptest.NewRecorder()
+	handler(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token status=%d", recorder.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	recorder = httptest.NewRecorder()
+	handler(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("valid token status=%d", recorder.Code)
+	}
+}
+
 func callAPI(t *testing.T, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
@@ -231,6 +284,35 @@ func TestRealityOutboundDefaultsToUTLS(t *testing.T) {
 	}
 }
 
+func TestValidateNodeRequiresProtocolCredentials(t *testing.T) {
+	validUUID := "11111111-1111-1111-1111-111111111111"
+	cases := []struct {
+		name    string
+		node    Node
+		wantErr bool
+	}{
+		{"anytls missing tls", Node{Name: "n", Type: "anytls", Server: "example.com", Port: 443, Password: "pw"}, true},
+		{"anytls valid", Node{Name: "n", Type: "anytls", Server: "example.com", Port: 443, Password: "pw", TLS: true}, false},
+		{"hysteria2 missing password", Node{Name: "n", Type: "hysteria2", Server: "example.com", Port: 443, TLS: true}, true},
+		{"trojan missing tls", Node{Name: "n", Type: "trojan", Server: "example.com", Port: 443, Password: "pw"}, true},
+		{"vless missing uuid", Node{Name: "n", Type: "vless", Server: "example.com", Port: 443, TLS: true}, true},
+		{"vless valid", Node{Name: "n", Type: "vless", Server: "example.com", Port: 443, UUID: validUUID, TLS: true}, false},
+		{"shadowsocks missing method", Node{Name: "n", Type: "shadowsocks", Server: "example.com", Port: 8388, Password: "pw"}, true},
+		{"naive valid", Node{Name: "n", Type: "naive", Server: "example.com", Port: 443, Username: "user", Password: "pw"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateNode(&tc.node)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestNaiveProxyUsesLocalSOCKSBridge(t *testing.T) {
 	dir := t.TempDir()
 	oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir, oldNaivePort := configPath, macACLPath, naiveConfigDir, logDir, naiveProxyPort
@@ -278,13 +360,48 @@ func TestSQLiteRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	dbPath = filepath.Join(dir, "armwall.db")
 	dataPath = filepath.Join(dir, "store.json")
-	want := Store{Mode: "gfw", ProxyPort: 11080, SelectedNode: "n1", TCPOutbound: "g1", UDPOutbound: "same", DNS: DNSSettings{Enabled: true, RemoteServer: "https://1.1.1.1/dns-query", RemoteSNI: "cloudflare-dns.com", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true}, RuleSettings: map[string]RuleUpdateSetting{"geosite-ads": {BackupURL: "https://example.com/ads.srs", AutoUpdate: true, UpdateHours: 12, LastUpdated: time.Now().UTC().Truncate(time.Second)}}, ACLRules: []ACLRule{{ID: "a1", Name: "客户端", Enabled: true, SourceCIDRs: []string{"192.168.10.20/32"}, Network: "tcp", PortRanges: []string{"443"}, Outbound: "direct"}}, StrategyGroups: []StrategyGroup{{ID: "g1", Name: "自动选择", Type: "urltest", NodeIDs: []string{"n1"}, Selected: "n1", TestURL: "https://example.com/204", IntervalSec: 180, ToleranceMS: 50}}, Subscriptions: []Subscription{{ID: "s1", Name: "测试订阅", URL: "https://example.com/sub", UpdateHours: 6, Enabled: true}}, Nodes: []Node{{ID: "n1", Name: "节点", Type: "anytls", Server: "example.com", Port: 443, Enabled: true, Group: "测试订阅", SubscriptionID: "s1"}}}
+	want := Store{Mode: "gfw", ProxyPort: 11080, SelectedNode: "n1", TCPOutbound: "g1", UDPOutbound: "same", DNS: DNSSettings{Enabled: true, RemoteServer: "https://1.1.1.1/dns-query", RemoteSNI: "cloudflare-dns.com", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true}, RuleSettings: map[string]RuleUpdateSetting{"geosite-ads": {BackupURL: "https://example.com/ads.srs", AutoUpdate: true, UpdateHours: 12, LastUpdated: time.Now().UTC().Truncate(time.Second)}}, ACLRules: []ACLRule{{ID: "a1", Name: "客户端", Enabled: true, SourceCIDRs: []string{"192.168.10.20/32"}, Network: "tcp", PortRanges: []string{"443"}, Outbound: "direct"}}, StrategyGroups: []StrategyGroup{{ID: "g1", Name: "自动选择", Type: "urltest", NodeIDs: []string{"n1"}, Selected: "n1", TestURL: "https://example.com/204", IntervalSec: 180, ToleranceMS: 50}}, Subscriptions: []Subscription{{ID: "s1", Name: "测试订阅", URL: "https://example.com/sub", UpdateHours: 6, Enabled: true}}, Nodes: []Node{{ID: "n1", Name: "节点", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true, Group: "测试订阅", SubscriptionID: "s1"}}}
 	if err := save(want); err != nil {
 		t.Fatal(err)
 	}
 	got := load()
 	if len(got.Nodes) != 1 || len(got.Subscriptions) != 1 || len(got.StrategyGroups) != 1 || len(got.ACLRules) != 1 || !got.DNS.Enabled || got.Nodes[0].SubscriptionID != "s1" || got.ProxyPort != 11080 || got.TCPOutbound != "g1" || !got.RuleSettings["geosite-ads"].AutoUpdate || got.RuleSettings["geosite-ads"].UpdateHours != 12 {
 		t.Fatalf("unexpected round trip: %+v", got)
+	}
+}
+
+func TestSQLiteSettingsWithoutNodesDoNotFallBackToJSON(t *testing.T) {
+	oldDB, oldData := dbPath, dataPath
+	t.Cleanup(func() { dbPath = oldDB; dataPath = oldData })
+	dir := t.TempDir()
+	dbPath = filepath.Join(dir, "armwall.db")
+	dataPath = filepath.Join(dir, "store.json")
+	if err := saveDB(Store{Mode: "global", ProxyPort: 12080, LogLevel: "debug", DNS: DNSSettings{Enabled: true, ListenAddress: "192.168.10.1", ListenPort: 53, RemoteServer: "https://1.1.1.1/dns-query", DirectServer: "udp://223.5.5.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveJSON(Store{Mode: "bypass_cn", ProxyPort: 11080}); err != nil {
+		t.Fatal(err)
+	}
+	got := load()
+	if got.Mode != "global" || got.ProxyPort != 12080 || got.LogLevel != "debug" || !got.DNS.Enabled {
+		t.Fatalf("settings-only database was not used: %+v", got)
+	}
+}
+
+func TestCorruptSQLiteDoesNotFallBackToJSON(t *testing.T) {
+	oldDB, oldData := dbPath, dataPath
+	t.Cleanup(func() { dbPath, dataPath = oldDB, oldData })
+	dir := t.TempDir()
+	dbPath = filepath.Join(dir, "armwall.db")
+	dataPath = filepath.Join(dir, "store.json")
+	if err := os.WriteFile(dbPath, []byte("not a sqlite database"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveJSON(Store{Mode: "global", ProxyPort: 12080}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadStore(); err == nil {
+		t.Fatal("corrupt SQLite database unexpectedly fell back to JSON")
 	}
 }
 
@@ -317,6 +434,24 @@ func TestConfigRoutingModes(t *testing.T) {
 	}
 }
 
+func TestConfigCanDisableAdBlockingRule(t *testing.T) {
+	disabled := false
+	s := Store{Mode: "global", AdBlockEnabled: &disabled, Nodes: []Node{{ID: "n1", Type: "anytls", Server: "example.com", Port: 443, Password: "pw", TLS: true, Enabled: true}}}
+	route := config(s)["route"].(map[string]any)
+	for _, raw := range route["rules"].([]any) {
+		rule := raw.(map[string]any)
+		if fmt.Sprint(rule["rule_set"]) == "[geosite-ads]" {
+			t.Fatalf("ad block rule should be disabled: %+v", route["rules"])
+		}
+	}
+	for _, raw := range route["rule_set"].([]any) {
+		ruleSet := raw.(map[string]any)
+		if ruleSet["tag"] == "geosite-ads" {
+			t.Fatalf("ad rule set should be disabled: %+v", route["rule_set"])
+		}
+	}
+}
+
 func TestParseSubscriptionIgnoresUnsupported(t *testing.T) {
 	nodes := parseSubscription(strings.Join([]string{"not-a-node", "https://example.com/no-protocol"}, "\n"))
 	if len(nodes) != 0 {
@@ -326,8 +461,8 @@ func TestParseSubscriptionIgnoresUnsupported(t *testing.T) {
 
 func TestToggleSelectedNodeChoosesEnabledFallback(t *testing.T) {
 	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, SelectedNode: "n1", Nodes: []Node{
-		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Enabled: true},
-		{ID: "n2", Name: "two", Type: "anytls", Server: "two.example", Port: 443, Enabled: true},
+		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
+		{ID: "n2", Name: "two", Type: "anytls", Server: "two.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
 	}})
 	recorder := callAPI(t, "/api/node/toggle", `{"ID":"n1","Enabled":false}`)
 	if recorder.Code != http.StatusOK {
@@ -341,8 +476,8 @@ func TestToggleSelectedNodeChoosesEnabledFallback(t *testing.T) {
 
 func TestBatchToggleAndCopyNode(t *testing.T) {
 	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080, SelectedNode: "n1", Nodes: []Node{
-		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Enabled: true, SubscriptionID: "s1", Group: "source"},
-		{ID: "n2", Name: "two", Type: "hysteria2", Server: "two.example", Port: 8443, Enabled: true},
+		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true, SubscriptionID: "s1", Group: "source"},
+		{ID: "n2", Name: "two", Type: "hysteria2", Server: "two.example", Port: 8443, Password: "secret", TLS: true, Enabled: true},
 	}})
 	recorder := callAPI(t, "/api/node/batch-toggle", `{"IDs":["n1","n2"],"Enabled":false}`)
 	if recorder.Code != http.StatusOK {
@@ -362,8 +497,22 @@ func TestBatchToggleAndCopyNode(t *testing.T) {
 	}
 }
 
+func TestAPIRejectsMalformedJSON(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
+	for _, path := range []string{"/api/node/delete", "/api/node/copy", "/api/node/toggle", "/api/rules/settings"} {
+		recorder := callAPI(t, path, `{"id":`)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+	recorder := callAPI(t, "/api/node", strings.Repeat(" ", maxAPIJSONBodySize+1))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("oversized status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestSubscriptionEditUpdatesOwnedNodeGroup(t *testing.T) {
-	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080, Subscriptions: []Subscription{{ID: "s1", Name: "old", URL: "https://example.com/old", UpdateHours: 6, Enabled: true}}, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Enabled: true, SubscriptionID: "s1", Group: "old"}}})
+	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080, Subscriptions: []Subscription{{ID: "s1", Name: "old", URL: "https://example.com/old", UpdateHours: 6, Enabled: true}}, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true, SubscriptionID: "s1", Group: "old"}}})
 	recorder := callAPI(t, "/api/subscription/edit", `{"id":"s1","name":"new","url":"https://example.com/new","update_hours":12,"enabled":false}`)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -371,6 +520,28 @@ func TestSubscriptionEditUpdatesOwnedNodeGroup(t *testing.T) {
 	got := load()
 	if got.Subscriptions[0].Name != "new" || got.Subscriptions[0].Enabled || got.Nodes[0].Group != "new" {
 		t.Fatalf("unexpected edit: %+v", got)
+	}
+}
+
+func TestSubscriptionClearPreservesManualSubPrefixedNode(t *testing.T) {
+	setupAPITest(t, Store{
+		Mode:      "global",
+		ProxyPort: 11080,
+		Subscriptions: []Subscription{
+			{ID: "s1", Name: "sub", URL: "https://example.com/sub", UpdateHours: 6, Enabled: true},
+		},
+		Nodes: []Node{
+			{ID: "sub-manual", Name: "manual", Type: "anytls", Server: "manual.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
+			{ID: "owned", Name: "owned", Type: "anytls", Server: "owned.example", Port: 443, Password: "secret", TLS: true, SubscriptionID: "s1", Group: "sub", Enabled: true},
+		},
+	})
+	recorder := callAPI(t, "/api/subscription/clear", `{}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	got := load()
+	if len(got.Nodes) != 1 || got.Nodes[0].ID != "sub-manual" || len(got.Subscriptions) != 0 {
+		t.Fatalf("unexpected cleared state: %+v", got)
 	}
 }
 
@@ -385,8 +556,8 @@ func TestEmbeddedWebAssets(t *testing.T) {
 
 func TestConfigStrategyAndSeparateUDPOutbound(t *testing.T) {
 	s := Store{Mode: "global", SelectedNode: "n1", TCPOutbound: "g1", UDPOutbound: "n2", Nodes: []Node{
-		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Enabled: true},
-		{ID: "n2", Name: "two", Type: "hysteria2", Server: "two.example", Port: 8443, Enabled: true},
+		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
+		{ID: "n2", Name: "two", Type: "hysteria2", Server: "two.example", Port: 8443, Password: "secret", TLS: true, Enabled: true},
 	}, StrategyGroups: []StrategyGroup{{ID: "g1", Name: "auto", Type: "urltest", NodeIDs: []string{"n1", "n2"}, Selected: "n1", TestURL: "https://example.com/204", IntervalSec: 120, ToleranceMS: 75}}}
 	c := config(s)
 	outbounds := c["outbounds"].([]any)
@@ -418,8 +589,8 @@ func TestConfigStrategyAndSeparateUDPOutbound(t *testing.T) {
 
 func TestStrategyAPIAndRoutingSelection(t *testing.T) {
 	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080, SelectedNode: "n1", Nodes: []Node{
-		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Enabled: true},
-		{ID: "n2", Name: "two", Type: "hysteria2", Server: "two.example", Port: 8443, Enabled: true},
+		{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
+		{ID: "n2", Name: "two", Type: "hysteria2", Server: "two.example", Port: 8443, Password: "secret", TLS: true, Enabled: true},
 	}})
 	recorder := callAPI(t, "/api/strategy", `{"name":"auto","type":"urltest","node_ids":["n1","n2"],"selected":"n1","test_url":"https://example.com/204","interval_sec":60,"tolerance_ms":50}`)
 	if recorder.Code != http.StatusOK {
@@ -456,12 +627,12 @@ func TestSubscriptionDueUsesPerSubscriptionInterval(t *testing.T) {
 func TestReconcileSubscriptionNodesPreservesIdentityAndEnabledState(t *testing.T) {
 	sub := Subscription{ID: "subscription-1", Name: "测试订阅"}
 	existing := []Node{
-		{ID: "existing-node-id", Name: "旧名称", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", SubscriptionID: sub.ID, Group: sub.Name, Enabled: false},
-		{ID: "manual-node", Name: "手动", Type: "trojan", Server: "manual.example", Port: 443, Password: "secret", Enabled: true},
+		{ID: "existing-node-id", Name: "旧名称", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, SubscriptionID: sub.ID, Group: sub.Name, Enabled: false},
+		{ID: "manual-node", Name: "手动", Type: "trojan", Server: "manual.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
 	}
 	fetched := []Node{
-		{ID: "temporary-1", Name: "新名称", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", Enabled: true},
-		{ID: "temporary-2", Name: "新增节点", Type: "hysteria2", Server: "two.example", Port: 8443, Password: "new", Enabled: true},
+		{ID: "temporary-1", Name: "新名称", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
+		{ID: "temporary-2", Name: "新增节点", Type: "hysteria2", Server: "two.example", Port: 8443, Password: "new", TLS: true, Enabled: true},
 	}
 	first := reconcileSubscriptionNodes(existing, fetched, sub)
 	if first[0].ID != "existing-node-id" || first[0].Enabled || first[0].Name != "新名称" || first[0].SubscriptionID != sub.ID || first[0].Group != sub.Name {
@@ -485,7 +656,7 @@ func TestSubscriptionRefreshContinuesAfterOneSourceFails(t *testing.T) {
 			{ID: "bad", Name: "故障订阅", URL: "https://bad.example/sub", UpdateHours: 6, Enabled: true},
 		},
 		Nodes: []Node{
-			{ID: "good-node", Name: "旧名称", Type: "anytls", Server: "good.example", Port: 443, Password: "secret", SubscriptionID: "good", Group: "可用订阅", Enabled: false},
+			{ID: "good-node", Name: "旧名称", Type: "anytls", Server: "good.example", Port: 443, Password: "secret", TLS: true, SubscriptionID: "good", Group: "可用订阅", Enabled: false},
 			{ID: "bad-node", Name: "保留节点", Type: "trojan", Server: "bad.example", Port: 443, Password: "secret", SubscriptionID: "bad", Group: "故障订阅", Enabled: true},
 		},
 	}
@@ -494,7 +665,7 @@ func TestSubscriptionRefreshContinuesAfterOneSourceFails(t *testing.T) {
 		if strings.Contains(rawURL, "bad.example") {
 			return nil, fmt.Errorf("temporary failure")
 		}
-		return []Node{{Name: "新名称", Type: "anytls", Server: "good.example", Port: 443, Password: "secret", Enabled: true}}, nil
+		return []Node{{Name: "新名称", Type: "anytls", Server: "good.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}, nil
 	}
 	err := updateSubscriptionsWithForce(true)
 	if err == nil || !strings.Contains(err.Error(), "故障订阅") {
@@ -574,6 +745,25 @@ func TestRuleSettingsAPIStoresAutoUpdate(t *testing.T) {
 	}
 }
 
+func TestRuleSettingsAPITogglesAdBlocking(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
+	recorder := callAPI(t, "/api/rules/settings", `{"tag":"geosite-ads","hours":6,"autoUpdate":false,"adBlockEnabled":false}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	got := load()
+	if got.AdBlockEnabled == nil || *got.AdBlockEnabled {
+		t.Fatalf("ad blocking was not disabled: %+v", got.AdBlockEnabled)
+	}
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(configBytes), "geosite-ads") {
+		t.Fatalf("generated config still includes ads rule: %s", configBytes)
+	}
+}
+
 func TestShareLinkImportPreservesRuntimeConfiguration(t *testing.T) {
 	initial := Store{
 		Mode:         "global",
@@ -581,7 +771,7 @@ func TestShareLinkImportPreservesRuntimeConfiguration(t *testing.T) {
 		SelectedNode: "n1",
 		LogLevel:     "debug",
 		DNS:          DNSSettings{Enabled: true, ListenAddress: "192.168.10.217", ListenPort: 53, RemoteServer: "https://1.1.1.1/dns-query", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true},
-		Nodes:        []Node{{ID: "n1", Name: "existing", Type: "anytls", Server: "existing.example", Port: 443, Password: "secret", Enabled: true}},
+		Nodes:        []Node{{ID: "n1", Name: "existing", Type: "anytls", Server: "existing.example", Port: 443, Password: "secret", TLS: true, Enabled: true}},
 		ACLRules:     []ACLRule{{ID: "a1", Name: "client", Enabled: true, SourceCIDRs: []string{"192.168.10.20/32"}, Network: "tcp", Outbound: "direct"}},
 	}
 	setupAPITest(t, initial)
@@ -604,7 +794,7 @@ func TestShareLinkImportPreservesRuntimeConfiguration(t *testing.T) {
 }
 
 func TestProxyPortAPIUsesTransactionalReload(t *testing.T) {
-	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", Enabled: true}}})
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
 	recorder := callAPI(t, "/api/settings", `{"proxyPort":12080}`)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -650,7 +840,7 @@ func TestLogPreviewIsBoundedAndExportIsComplete(t *testing.T) {
 }
 
 func TestConfigurationReloadsActiveGateway(t *testing.T) {
-	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", Enabled: true}}})
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
 	if err := os.WriteFile(gatewayStatePath, []byte("eth0\teth0\t11081\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -666,7 +856,7 @@ func TestConfigurationReloadsActiveGateway(t *testing.T) {
 }
 
 func TestConfigurationWhileStoppedDoesNotStartProxy(t *testing.T) {
-	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", Enabled: true}}})
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
 	proxyRunningFn = func() bool { return false }
 	restarts := 0
 	restartProxyFn = func() error {
@@ -680,7 +870,7 @@ func TestConfigurationWhileStoppedDoesNotStartProxy(t *testing.T) {
 }
 
 func TestConfigACLAndDNS(t *testing.T) {
-	s := Store{Mode: "global", SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Enabled: true}}, ACLRules: []ACLRule{{ID: "a1", Name: "client", Enabled: true, SourceCIDRs: []string{"192.168.10.20/32"}, SourceMACs: []string{"00:11:22:33:44:55"}, Network: "tcp", PortRanges: []string{"443", "1000:2000"}, Outbound: "direct"}}, DNS: DNSSettings{Enabled: true, ListenAddress: "192.168.10.217", ListenPort: 53, RemoteServer: "https://1.1.1.1/dns-query", RemoteSNI: "cloudflare-dns.com", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true, FakeIP: true}}
+	s := Store{Mode: "global", SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}, ACLRules: []ACLRule{{ID: "a1", Name: "client", Enabled: true, SourceCIDRs: []string{"192.168.10.20/32"}, SourceMACs: []string{"00:11:22:33:44:55"}, Network: "tcp", PortRanges: []string{"443", "1000:2000"}, Outbound: "direct"}}, DNS: DNSSettings{Enabled: true, ListenAddress: "192.168.10.217", ListenPort: 53, RemoteServer: "https://1.1.1.1/dns-query", RemoteSNI: "cloudflare-dns.com", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true, FakeIP: true}}
 	c := config(s)
 	dns, ok := c["dns"].(map[string]any)
 	if !ok || dns["final"] != "remote-dns" {
@@ -702,6 +892,9 @@ func TestConfigACLAndDNS(t *testing.T) {
 			t.Fatalf("sing-box 1.13 does not support source_mac_address: %+v", rule)
 		}
 		if rule["source_ip_cidr"] != nil && rule["outbound"] == "direct" {
+			if fmt.Sprint(rule["port"]) != "[443]" || fmt.Sprint(rule["port_range"]) != "[1000:2000]" {
+				t.Fatalf("ACL ports were not split correctly: %+v", rule)
+			}
 			aclFound = true
 		}
 		if inbound, ok := rule["inbound"].([]string); ok && len(inbound) == 1 && inbound[0] == "acl-mac-1" && rule["outbound"] == "direct" {
@@ -745,7 +938,7 @@ func TestWriteConfigCreatesMACACLBindings(t *testing.T) {
 	t.Cleanup(func() {
 		configPath, macACLPath, naiveConfigDir, logDir, tproxyPort = oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir, oldTProxyPort
 	})
-	s := Store{Mode: "global", SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "pw", Enabled: true}}, ACLRules: []ACLRule{{ID: "a1", Name: "client", Enabled: true, SourceMACs: []string{"00:11:22:33:44:55", "aa:bb:cc:dd:ee:ff"}, Network: "tcp", PortRanges: []string{"443", "1000:2000"}, Outbound: "n1"}}}
+	s := Store{Mode: "global", SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "pw", TLS: true, Enabled: true}}, ACLRules: []ACLRule{{ID: "a1", Name: "client", Enabled: true, SourceMACs: []string{"00:11:22:33:44:55", "aa:bb:cc:dd:ee:ff"}, Network: "tcp", PortRanges: []string{"443", "1000:2000"}, Outbound: "n1"}}}
 	if err := writeConfig(s); err != nil {
 		t.Fatal(err)
 	}
@@ -768,7 +961,7 @@ func TestWriteConfigCreatesMACACLBindings(t *testing.T) {
 }
 
 func TestACLAndDNSAPI(t *testing.T) {
-	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Enabled: true}}})
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
 	recorder := callAPI(t, "/api/acl", `{"name":"客户端","enabled":true,"source_cidrs":["192.168.10.20"],"source_macs":["00:11:22:33:44:55"],"network":"tcp","port_ranges":["443"],"outbound":"direct"}`)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("ACL status=%d body=%s", recorder.Code, recorder.Body.String())

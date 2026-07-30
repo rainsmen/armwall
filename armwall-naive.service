@@ -5,10 +5,16 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/armwall-naive-supervisor
-Restart=on-failure
+Restart=always
 RestartSec=3
 User=root
 UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/armwall/naive
+ReadWritePaths=/var/log/armwall
 
 [Install]
 WantedBy=multi-user.target

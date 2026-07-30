@@ -6,6 +6,7 @@ const nodeTests = new Map();
 const strategyRuntime = new Map();
 let selectedCore = "sing-box";
 let toastTimer;
+let refreshTimer;
 
 const sites = [
   ["google", "Google", "https://www.google.com/favicon.ico", "G"],
@@ -41,7 +42,8 @@ async function request(path, options = {}, text = false, retry = true) {
   const response = await fetch(path, { ...options, headers });
   if (response.status === 401 && retry) {
     token = window.prompt("请输入 ArmWall 管理 Token") || "";
-    localStorage.armwallToken = token;
+    if (token) localStorage.armwallToken = token;
+    else localStorage.removeItem("armwallToken");
     return request(path, options, text, false);
   }
   if (!response.ok) {
@@ -127,6 +129,7 @@ async function loadState(showErrors = true) {
     appState = await request("/api/state");
     appState.nodes ||= [];
     appState.subscriptions ||= [];
+    pruneNodeTests();
     renderState();
     $("connectionText").textContent = "已连接";
     document.querySelector(".top-status").classList.add("ready");
@@ -135,6 +138,13 @@ async function loadState(showErrors = true) {
     $("connectionText").textContent = "连接失败";
     document.querySelector(".top-status").classList.remove("ready");
     if (showErrors) toast(error.message, true);
+  }
+}
+
+function pruneNodeTests() {
+  const ids = new Set((appState.nodes || []).map((node) => node.id));
+  for (const id of nodeTests.keys()) {
+    if (!ids.has(id)) nodeTests.delete(id);
   }
 }
 
@@ -298,9 +308,8 @@ function renderStrategies() {
             .map((id) => names.get(id) || id)
             .join("、");
           const type =
-            { selector: "Selector", urltest: "URLTest", fallback: "Fallback" }[
-              group.type
-            ] || group.type;
+            { selector: "Selector", urltest: "URLTest" }[group.type] ||
+            group.type;
           const runtime = strategyRuntime.get(group.id);
           const selected = runtime?.selected || group.selected || "";
           const currentName = names.get(selected) || selected || "-";
@@ -764,7 +773,7 @@ async function testSite(site, card) {
 async function refreshServiceStatus(notify = true) {
   try {
     const status = (
-      await request("/api/service/status", { method: "POST" }, true)
+      await request("/api/service/status", {}, true)
     ).trim();
     $("serviceMetric").textContent = status || "未知";
     $("serviceOutput").textContent = status || "未知";
@@ -773,6 +782,24 @@ async function refreshServiceStatus(notify = true) {
     $("serviceMetric").textContent = "异常";
     if (notify) toast(error.message, true);
   }
+}
+
+async function refreshLogs() {
+  $("logOut").textContent = await request("/api/logs", {}, true);
+}
+
+function activeViewID() {
+  return document.querySelector(".view.active")?.id || "";
+}
+
+function startAutoRefresh() {
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    if (document.hidden) return;
+    void refreshServiceStatus(false);
+    if ((appState.strategy_groups || []).length) void loadStrategyStatus();
+    if (activeViewID() === "logs") void refreshLogs();
+  }, 15000);
 }
 
 async function service(action) {
@@ -799,6 +826,7 @@ async function renderRules() {
       "geoip-cn": "中国 IP",
       "geosite-proxy": "代理域名",
     };
+    const adBlockEnabled = data.ad_block_enabled !== false;
     $("ruleManager").innerHTML = Object.entries(data.rules || {})
       .map(([tag, primary]) => {
         const setting = (data.settings || {})[tag] || {};
@@ -810,7 +838,8 @@ async function renderRules() {
           <div class="rule-source"><strong>${escapeHTML(names[tag] || tag)}</strong><div class="node-server">${escapeHTML(primary)}</div></div>
           <label class="rule-field"><span>备用地址</span><input class="rule-backup" value="${escapeHTML(setting.backup_url || (data.backups || {})[tag] || "")}" placeholder="https://"></label>
           <label class="rule-field rule-interval"><span>更新间隔</span><span class="inline"><input class="rule-hours" type="number" min="1" max="168" value="${escapeHTML(setting.update_hours || data.update_hours || 6)}"><span>小时</span></span></label>
-          <label class="rule-auto"><input type="checkbox" ${setting.auto_update ? "checked" : ""}>自动更新</label>
+          ${tag === "geosite-ads" ? `<label class="rule-auto"><input class="rule-ad-block" type="checkbox" ${adBlockEnabled ? "checked" : ""}>启用拦截</label>` : ""}
+          <label class="rule-auto"><input class="rule-auto-update" type="checkbox" ${setting.auto_update ? "checked" : ""}>自动更新</label>
           <div class="rule-updated"><span>上次更新</span><strong>${escapeHTML(lastUpdated)}</strong></div>
           <div class="row-actions"><button class="small-btn" data-action="save-rule" data-tag="${escapeHTML(tag)}">保存</button><button class="small-btn" data-action="update-rule" data-tag="${escapeHTML(tag)}">立即更新</button></div>
         </div>`;
@@ -902,9 +931,14 @@ async function handleAction(button) {
       await loadState(false);
     } else if (action === "test-node") await testNode(id, method, button);
     else if (action === "move-node") {
+      const visibleIDs = filteredNodes().map((node) => node.id);
+      const visibleFrom = visibleIDs.indexOf(id);
+      const visibleTo = visibleFrom + Number(direction);
+      if (visibleFrom < 0 || visibleTo < 0 || visibleTo >= visibleIDs.length)
+        return;
       const ids = appState.nodes.map((node) => node.id);
       const from = ids.indexOf(id);
-      const to = from + Number(direction);
+      const to = ids.indexOf(visibleIDs[visibleTo]);
       if (from < 0 || to < 0 || to >= ids.length) return;
       [ids[from], ids[to]] = [ids[to], ids[from]];
       await request("/api/node/reorder", { method: "POST", body: { ids } });
@@ -1065,13 +1099,15 @@ async function handleAction(button) {
       );
     } else if (action === "save-rule") {
       const row = button.closest(".rule-row");
+      const adBlock = row.querySelector(".rule-ad-block");
       await request("/api/rules/settings", {
         method: "POST",
         body: {
           tag,
           backup: row.querySelector(".rule-backup").value.trim(),
           hours: Number(row.querySelector(".rule-hours").value),
-          autoUpdate: row.querySelector(".rule-auto input").checked,
+          autoUpdate: row.querySelector(".rule-auto-update").checked,
+          ...(adBlock ? { adBlockEnabled: adBlock.checked } : {}),
         },
       });
       toast("规则设置已保存");
@@ -1135,8 +1171,7 @@ async function handleAction(button) {
       });
       toast("备份已删除");
       await loadBackups();
-    } else if (action === "refresh-logs")
-      $("logOut").textContent = await request("/api/logs", {}, true);
+    } else if (action === "refresh-logs") await refreshLogs();
     else if (action === "save-log-level") {
       await request("/api/log/level", {
         method: "POST",
@@ -1158,6 +1193,10 @@ async function handleAction(button) {
       link.download = "armwall.log";
       link.click();
       URL.revokeObjectURL(url);
+    } else if (action === "reset-token") {
+      token = "";
+      localStorage.removeItem("armwallToken");
+      toast("本地 Token 已清除");
     }
   } catch (error) {
     toast(error.message, true);
@@ -1178,8 +1217,7 @@ document.querySelectorAll(".nav-item").forEach((button) =>
       );
     if (button.dataset.view === "routing") renderRules();
     if (button.dataset.view === "system") loadBackups();
-    if (button.dataset.view === "logs")
-      handleAction(document.querySelector('[data-action="refresh-logs"]'));
+    if (button.dataset.view === "logs") void refreshLogs();
   }),
 );
 
@@ -1235,3 +1273,4 @@ $("configImportFile").addEventListener("change", async (event) => {
 
 renderSites();
 loadState();
+startAutoRefresh();

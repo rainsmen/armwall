@@ -12,6 +12,9 @@
       <div class="brand">ArmWall <span>Armbian proxy gateway</span></div>
       <div class="top-status">
         <span id="connectionDot"></span><span id="connectionText">未连接</span>
+        <button class="top-token-btn" data-action="reset-token" type="button">
+          清除 Token
+        </button>
       </div>
     </header>
     <div class="shell">
@@ -495,7 +498,6 @@
                     >类型<select id="strategyType">
                       <option value="selector">Selector 手动</option>
                       <option value="urltest">URLTest 自动</option>
-                      <option value="fallback">Fallback 健康优先</option>
                     </select></label
                   ><label
                     >测速 URL<input

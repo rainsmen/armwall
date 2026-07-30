@@ -6,9 +6,9 @@ ArmWall 是面向 Armbian/Debian 设备的局域网代理网关。它使用 sing
 
 - 手动节点、分享链接和 HTTPS 订阅导入，支持 VLESS、VMess、Trojan、Shadowsocks、Hysteria2、AnyTLS 与 NaiveProxy。
 - 绕过国内、GFW 规则和全局代理模式，TCP/UDP 可分别选择节点或策略组。
-- Selector、URLTest、Fallback 策略组，显示实际运行成员与最近延迟。
+- Selector、URLTest 策略组，显示实际运行成员与最近延迟。
 - Ping、TCP、URLTest 节点测速，以及常用国内外网站连通测试。
-- sing-box DNS、DNS 劫持、FakeIP、GeoSite/GeoIP 规则与广告阻止规则；规则支持逐项备用地址、自动更新间隔与手动更新。
+- sing-box DNS、DNS 劫持、FakeIP、GeoSite/GeoIP 规则与广告阻止规则；规则支持逐项备用地址、自动更新间隔、手动更新和广告拦截开关。
 - 按源 IP/CIDR、MAC、协议和目标端口设置 ACL。MAC ACL 由 nftables 分流到独立 TProxy 入口。
 - sing-box、NaiveProxy 在线更新和手动上传，更新前自动保留旧二进制。
 - SQLite 持久化、配置导入导出、服务器端备份和恢复。
@@ -26,7 +26,7 @@ ArmWall 本身四种架构均为静态二进制。上游 sing-box 不发布 ARMv
 
 ## 构建
 
-需要 Go 1.22 或更高版本和 Node.js（用于 JavaScript 语法检查）。
+需要 Go 1.26 或更高版本和 Node.js（用于 JavaScript 语法检查）。已用 `sing-box 1.13.15` 验证过配置生成。
 
 ```bash
 make test
@@ -41,7 +41,13 @@ make release VERSION=0.1.0
 curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh | sudo sh
 ```
 
-脚本会下载完整安装包，根据 `uname -m` 自动选择 ARMv6、ARMv7、ARM64 或 AMD64 架构的 ArmWall 程序，并安装、启用所需服务。安装完成后打开 `http://设备IP:8080`，首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
+脚本会下载完整安装包，根据 `uname -m` 自动选择 ARMv6、ARMv7、ARM64 或 AMD64 架构的 ArmWall 程序，并安装、启用所需服务。安装完成后默认只监听 `127.0.0.1:8080`；如需局域网访问，请在 `/etc/armwall/armwall.env` 明确设置 `ARMWALL_LISTEN`。首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
+
+生产安装建议固定 `ARMWALL_REF` 到 release tag，并设置 `ARMWALL_ARCHIVE_SHA256` 校验源码归档。
+
+升级会保留 `/etc/armwall/armwall.env`、SQLite 数据库和配置备份；升级核心前会在
+`/var/lib/armwall/backups/` 保留最近 3 份旧核心。生产环境不要直接跟随 `main`，
+应使用固定 tag，并在下载前验证归档 SHA256。
 
 ### 离线安装
 
@@ -64,6 +70,21 @@ sudo ./install.sh ./armwall-linux-armv7
 - `/etc/armwall/naive/`
 - `/var/lib/armwall/armwall.db`
 - `/var/log/armwall/`
+
+### 端口与安全
+
+| 用途 | 默认地址/端口 | 说明 |
+| --- | --- | --- |
+| Web 管理面板 | `127.0.0.1:8080` | 明文 HTTP；需要管理 Token，不建议暴露公网 |
+| Mixed SOCKS/HTTP | `0.0.0.0:11080` | 由 sing-box 配置决定 |
+| 透明代理 TProxy | `0.0.0.0:11081` | 仅供本机网关规则使用 |
+| Clash API | `127.0.0.1:9090` | 随机 secret，仅供 ArmWall 后端访问 |
+| NaiveProxy 本地 SOCKS | `127.0.0.1:12000+` | 每个 Naive 节点占用一个端口 |
+
+管理 Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。轮换 Token 时编辑
+该文件后执行 `systemctl restart armwall.service`；浏览器中的旧 Token 需要在页面点击
+“清除 Token”后重新输入。若要从局域网访问管理面板，先设置防火墙，再在
+`/etc/armwall/armwall.env` 中明确设置 `ARMWALL_LISTEN`，并理解 HTTP 未启用 TLS。
 
 ## 客户端接入
 
@@ -94,4 +115,25 @@ systemctl status armwall-rule-update.timer
 
 NaiveProxy 节点由独立本地 SOCKS 入口承载，再由 sing-box 统一纳入分流和策略组。未安装 NaiveProxy 核心时仍可保存节点，但该节点在安装核心前不可连接。
 
+日志默认写入 `/var/log/armwall/`，安装器会配置 logrotate（每日轮转，单文件超过
+10 MiB 时提前轮转，保留 7 份）。规则或订阅首次更新失败时，可查看
+`journalctl -u armwall-rule-update.service`、`journalctl -u armwall-subscription-update.service`
+以及 sing-box 日志，再从 Web 页面手动重试。
+
 配置备份包含节点密码、订阅地址等敏感数据。下载后应按凭据文件保护；导入或恢复前 ArmWall 会自动创建一份当前配置备份。
+
+### 卸载
+
+卸载前请先导出配置。确认不再需要数据后优先运行安装器放置的脚本：
+
+```bash
+sudo armwall-uninstall
+```
+
+如需连数据一起清空，可执行：
+
+```bash
+sudo armwall-uninstall --purge
+```
+
+`--purge` 会删除 Token、节点密码、订阅地址、数据库和备份，无法恢复。

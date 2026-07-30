@@ -1,0 +1,11 @@
+armwall
+armwall-linux-*
+SHA256SUMS
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.candidate
+*.tmp
+dist/
+tmp/

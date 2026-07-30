@@ -170,7 +170,21 @@ func createConfigBackup(s Store, prefix string) (backupInfo, error) {
 	if err := writeAtomicFile(path, data, 0600); err != nil {
 		return backupInfo{}, err
 	}
+	pruneConfigBackups(20)
 	return backupInfo{Name: name, Size: int64(len(data)), CreatedAt: stamp}, nil
+}
+
+func pruneConfigBackups(keep int) {
+	if keep <= 0 {
+		return
+	}
+	backups, err := listConfigBackups()
+	if err != nil || len(backups) <= keep {
+		return
+	}
+	for _, backup := range backups[keep:] {
+		_ = os.Remove(filepath.Join(backupDir, backup.Name))
+	}
 }
 
 func validBackupName(name string) bool {

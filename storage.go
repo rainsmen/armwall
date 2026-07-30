@@ -93,20 +93,46 @@ func loadDB() (Store, error) {
 		case "rule_update_hours":
 			s.RuleUpdateHours, _ = strconv.Atoi(v)
 		case "rule_backups":
-			json.Unmarshal([]byte(v), &s.RuleBackups)
+			if err := json.Unmarshal([]byte(v), &s.RuleBackups); err != nil {
+				rows.Close()
+				return s, err
+			}
 		case "rule_settings":
-			json.Unmarshal([]byte(v), &s.RuleSettings)
+			if err := json.Unmarshal([]byte(v), &s.RuleSettings); err != nil {
+				rows.Close()
+				return s, err
+			}
 		case "strategy_groups":
-			json.Unmarshal([]byte(v), &s.StrategyGroups)
+			if err := json.Unmarshal([]byte(v), &s.StrategyGroups); err != nil {
+				rows.Close()
+				return s, err
+			}
 		case "tcp_outbound":
 			s.TCPOutbound = v
 		case "udp_outbound":
 			s.UDPOutbound = v
 		case "acl_rules":
-			json.Unmarshal([]byte(v), &s.ACLRules)
+			if err := json.Unmarshal([]byte(v), &s.ACLRules); err != nil {
+				rows.Close()
+				return s, err
+			}
 		case "dns":
-			json.Unmarshal([]byte(v), &s.DNS)
+			if err := json.Unmarshal([]byte(v), &s.DNS); err != nil {
+				rows.Close()
+				return s, err
+			}
+		case "ad_block_enabled":
+			enabled, err := strconv.ParseBool(v)
+			if err != nil {
+				rows.Close()
+				return s, err
+			}
+			s.AdBlockEnabled = &enabled
 		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return s, err
 	}
 	rows.Close()
 	ss, err := db.Query("SELECT id,name,url,update_hours,enabled,last_updated FROM subscriptions ORDER BY name")
@@ -127,6 +153,10 @@ func loadDB() (Store, error) {
 		}
 		s.Subscriptions = append(s.Subscriptions, sub)
 		s.SubscriptionURLs = append(s.SubscriptionURLs, sub.URL)
+	}
+	if err := ss.Err(); err != nil {
+		ss.Close()
+		return s, err
 	}
 	ss.Close()
 	ns, err := db.Query("SELECT id,subscription_id,group_name,enabled,sort_order,payload FROM nodes ORDER BY sort_order,id")
@@ -151,10 +181,11 @@ func loadDB() (Store, error) {
 		n.SortOrder = order
 		s.Nodes = append(s.Nodes, n)
 	}
-	ns.Close()
-	if len(s.Nodes) == 0 && len(s.Subscriptions) == 0 {
-		return s, sql.ErrNoRows
+	if err := ns.Err(); err != nil {
+		ns.Close()
+		return s, err
 	}
+	ns.Close()
 	return s, nil
 }
 
@@ -177,7 +208,7 @@ func saveDB(s Store) error {
 	groups, _ := json.Marshal(s.StrategyGroups)
 	aclRules, _ := json.Marshal(s.ACLRules)
 	dnsSettings, _ := json.Marshal(s.DNS)
-	settings := map[string]string{"mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "rule_settings": string(ruleSettings), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings)}
+	settings := map[string]string{"mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "rule_settings": string(ruleSettings), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings), "ad_block_enabled": strconv.FormatBool(boolValue(s.AdBlockEnabled, true))}
 	for k, v := range settings {
 		if _, err = tx.Exec("INSERT INTO settings(key,value) VALUES(?,?)", k, v); err != nil {
 			return err

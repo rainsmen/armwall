@@ -9,3 +9,6 @@ Environment=ARMWALL_TPROXY=1
 Environment=ARMWALL_TPROXY_PORT=11081
 EnvironmentFile=-/etc/armwall/armwall.env
 ExecStart=/usr/local/bin/armwall --update-rules
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true

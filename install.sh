@@ -3,13 +3,13 @@ set -eu
 [ "$(id -u)" -eq 0 ] || { echo "install.sh must run as root" >&2; exit 1; }
 SRC_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 missing=
-for command in curl file tar xz nft ip ping sysctl; do
+for command in curl file tar xz nft ip ping sysctl python3 logrotate; do
   command -v "$command" >/dev/null 2>&1 || missing="$missing $command"
 done
 if [ -n "$missing" ]; then
   command -v apt-get >/dev/null 2>&1 || { echo "missing commands:$missing" >&2; exit 1; }
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl file xz-utils nftables iproute2 iputils-ping procps
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl file xz-utils nftables iproute2 iputils-ping procps python3 logrotate
 fi
 case "$(uname -m)" in
   armv6*) ARMWALL_ARCH=armv6;;
@@ -28,12 +28,24 @@ if [ -z "$ARMWALL_BINARY" ]; then
 fi
 [ -f "$ARMWALL_BINARY" ] || { echo "ArmWall binary not found: $ARMWALL_BINARY" >&2; exit 1; }
 
+generate_token(){
+  if [ -n "${ARMWALL_TOKEN:-}" ]; then
+    printf '%s\n' "$ARMWALL_TOKEN"
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16
+  else
+    tr -d '-' < /proc/sys/kernel/random/uuid
+  fi
+}
+
 install -d -m 0750 /etc/armwall /var/lib/armwall /var/lib/armwall/backups/config /var/lib/armwall/uploads /var/lib/armwall/rules /var/log/armwall
+install -d -m 0755 /etc/logrotate.d
 install -m 0755 "$ARMWALL_BINARY" /usr/local/bin/armwall
 /usr/local/bin/armwall --version
 install -m 0755 "$SRC_DIR/gateway.sh" /usr/local/bin/armwall-gateway
 install -m 0755 "$SRC_DIR/update-core.sh" /usr/local/bin/armwall-update-core
 install -m 0755 "$SRC_DIR/naive-supervisor.sh" /usr/local/bin/armwall-naive-supervisor
+install -m 0755 "$SRC_DIR/uninstall.sh" /usr/local/bin/armwall-uninstall
 install -m 0644 "$SRC_DIR/armwall.service" /etc/systemd/system/armwall.service
 install -m 0644 "$SRC_DIR/armwall-sing-box.service" /etc/systemd/system/armwall-sing-box.service
 install -m 0644 "$SRC_DIR/armwall-naive.service" /etc/systemd/system/armwall-naive.service
@@ -42,17 +54,23 @@ install -m 0644 "$SRC_DIR/armwall-subscription-update.service" /etc/systemd/syst
 install -m 0644 "$SRC_DIR/armwall-subscription-update.timer" /etc/systemd/system/armwall-subscription-update.timer
 install -m 0644 "$SRC_DIR/armwall-rule-update.service" /etc/systemd/system/armwall-rule-update.service
 install -m 0644 "$SRC_DIR/armwall-rule-update.timer" /etc/systemd/system/armwall-rule-update.timer
+install -m 0644 "$SRC_DIR/armwall.logrotate" /etc/logrotate.d/armwall
 if [ ! -f /etc/armwall/armwall.env ]; then
-  ARMWALL_ADMIN_TOKEN=${ARMWALL_TOKEN:-}
-  if [ -z "$ARMWALL_ADMIN_TOKEN" ]; then
-    if command -v openssl >/dev/null 2>&1; then
-      ARMWALL_ADMIN_TOKEN=$(openssl rand -hex 16)
-    else
-      ARMWALL_ADMIN_TOKEN=$(tr -d '-' < /proc/sys/kernel/random/uuid)
-    fi
-  fi
+  ARMWALL_ADMIN_TOKEN=$(generate_token)
   umask 077
   printf 'ARMWALL_TOKEN=%s\nARMWALL_MAC_ACL_FILE=/etc/armwall/mac-acl.tsv\n' "$ARMWALL_ADMIN_TOKEN" > /etc/armwall/armwall.env
+else
+  ARMWALL_ADMIN_TOKEN=$(sed -n 's/^ARMWALL_TOKEN=//p' /etc/armwall/armwall.env | tail -1)
+  if [ "${#ARMWALL_ADMIN_TOKEN}" -lt 16 ]; then
+    ARMWALL_ADMIN_TOKEN=$(generate_token)
+    umask 077
+    printf '\nARMWALL_TOKEN=%s\n' "$ARMWALL_ADMIN_TOKEN" >> /etc/armwall/armwall.env
+  fi
+  if ! grep -q '^ARMWALL_MAC_ACL_FILE=' /etc/armwall/armwall.env; then
+    umask 077
+    printf 'ARMWALL_MAC_ACL_FILE=/etc/armwall/mac-acl.tsv\n' >> /etc/armwall/armwall.env
+  fi
+  chmod 0600 /etc/armwall/armwall.env
 fi
 
 if ! command -v sing-box >/dev/null 2>&1; then
@@ -62,12 +80,14 @@ if ! command -v sing-box >/dev/null 2>&1; then
     /usr/local/bin/armwall-update-core sing-box latest || echo "sing-box installation failed; retry from the Web UI" >&2
   fi
 fi
+ARMWALL_TOKEN=$ARMWALL_ADMIN_TOKEN /usr/local/bin/armwall --check-config
 ARMWALL_PROXY_PORT=11080 ARMWALL_TPROXY=1 ARMWALL_TPROXY_PORT=11081 /usr/local/bin/armwall --write-config
 systemctl daemon-reload
 systemctl enable armwall.service
 systemctl enable armwall-subscription-update.timer
 systemctl enable armwall-rule-update.timer
 systemctl enable armwall-naive.service
+systemctl start armwall-rule-update.service || true
 systemctl restart armwall.service
 systemctl restart armwall-subscription-update.timer
 systemctl restart armwall-rule-update.timer
@@ -76,6 +96,6 @@ if command -v sing-box >/dev/null 2>&1; then
   systemctl enable armwall-sing-box.service
   systemctl restart armwall-sing-box.service
 fi
-ARMWALL_ADMIN_TOKEN=$(sed -n 's/^ARMWALL_TOKEN=//p' /etc/armwall/armwall.env | head -1)
-echo "ArmWall installed at http://<server-ip>:8080"
+echo "ArmWall installed at http://127.0.0.1:8080"
+echo "Set ARMWALL_LISTEN in /etc/armwall/armwall.env if you need LAN access."
 echo "Management token: $ARMWALL_ADMIN_TOKEN"

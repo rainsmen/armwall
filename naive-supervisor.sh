@@ -16,9 +16,18 @@ while ! command -v naive >/dev/null 2>&1; do
 done
 
 mkdir -p "$(dirname "$LOG_FILE")"
+run_instance(){
+  config=$1
+  while [ -f "$config" ]; do
+    naive "$config" >> "$LOG_FILE" 2>&1 || true
+    [ -f "$config" ] || break
+    sleep 2
+  done
+}
+
 for config in "$CONFIG_DIR"/*.json; do
   [ -f "$config" ] || continue
-  naive "$config" >> "$LOG_FILE" 2>&1 &
+  run_instance "$config" &
   PIDS="$PIDS $!"
 done
 

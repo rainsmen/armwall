@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Go test
+        run: go test ./...
+
+      - name: Go race
+        run: go test -race ./...
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: ShellCheck
+        run: shellcheck gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh
+
+      - name: Shell syntax
+        run: sh -n gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh
+
+      - name: JS syntax
+        run: node --check web/app.js

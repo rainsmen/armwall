@@ -25,6 +25,17 @@ type clashProxyInfo struct {
 
 var clashAPIBase = "http://127.0.0.1:9090"
 
+func clashRequest(method, path string) (*http.Request, error) {
+	req, err := http.NewRequest(method, clashAPIBase+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if secret := currentClashAPISecret(); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	return req, nil
+}
+
 func latestClashDelay(proxy clashProxyInfo) int64 {
 	for i := len(proxy.History) - 1; i >= 0; i-- {
 		if proxy.History[i].Delay > 0 {
@@ -43,7 +54,11 @@ func strategyRuntimeStatuses(s Store) []strategyRuntimeStatus {
 		return statuses
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(clashAPIBase + "/proxies")
+	req, err := clashRequest(http.MethodGet, "/proxies")
+	if err != nil {
+		return statuses
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return statuses
 	}
@@ -83,20 +98,27 @@ func clashDelay(tag, testURL string) (int64, error) {
 	}
 	endpoint := clashAPIBase + "/proxies/" + url.PathEscape(tag) + "/delay?url=" + url.QueryEscape(testURL) + "&timeout=10000"
 	client := &http.Client{Timeout: 12 * time.Second}
-	resp, err := client.Get(endpoint)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+	if secret := currentClashAPISecret(); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("urltest failed: %d", resp.StatusCode)
+	}
 	var result struct {
 		Delay int64 `json:"delay"`
 		MS    int64 `json:"ms"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return 0, fmt.Errorf("invalid urltest response")
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("urltest failed: %d", resp.StatusCode)
 	}
 	if result.MS <= 0 {
 		result.MS = result.Delay

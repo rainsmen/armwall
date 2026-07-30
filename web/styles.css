@@ -43,6 +43,18 @@ body {
   color: #dce6f5;
   font-size: 13px;
 }
+.top-token-btn {
+  border: 1px solid #52647a;
+  background: transparent;
+  color: #dce6f5;
+  border-radius: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+  font: inherit;
+}
+.top-token-btn:hover {
+  background: #24344a;
+}
 .top-status span:first-child {
   width: 8px;
   height: 8px;

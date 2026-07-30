@@ -4,12 +4,16 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/armwall
-Environment=ARMWALL_LISTEN=0.0.0.0:8080
+ExecStartPre=/usr/local/bin/armwall --check-config
+Environment=ARMWALL_LISTEN=127.0.0.1:8080
 Environment=ARMWALL_PROXY_PORT=11080
 Environment=ARMWALL_TPROXY=1
 Environment=ARMWALL_TPROXY_PORT=11081
-EnvironmentFile=-/etc/armwall/armwall.env
+EnvironmentFile=/etc/armwall/armwall.env
 UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
 Restart=on-failure
 RestartSec=3
 [Install]

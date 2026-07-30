@@ -10,6 +10,7 @@ LAST_BACKUP=
 PROXY_PORT=${ARMWALL_PROXY_PORT:-}
 
 die(){ echo "armwall-update-core: $*" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
 fetch_file(){
   url=$1; destination=$2
   if [ -n "$PROXY_PORT" ]; then
@@ -44,6 +45,20 @@ install_binary(){
     naive) "$BIN_DIR/$name.new" --version >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "binary self-check failed"; };;
   esac
   mv "$BIN_DIR/$name.new" "$BIN_DIR/$name"
+  prune_backups "$name"
+}
+prune_backups(){
+  name=$1
+  keep=${ARMWALL_BACKUP_KEEP:-3}
+  case "$keep" in
+    ''|*[!0-9]*) keep=3;;
+  esac
+  [ "$keep" -gt 0 ] || return 0
+  # shellcheck disable=SC2012
+  old_files=$(ls -1t "$BACKUP_DIR"/"$name".* 2>/dev/null | tail -n +"$((keep + 1))" || true)
+  for file in $old_files; do
+    [ -e "$file" ] && rm -f -- "$file"
+  done
 }
 restart_sing_box(){
   [ -f "$CONFIG" ] || return 0
@@ -60,7 +75,13 @@ latest_sing_box(){
   a=$(arch); [ "$a" != armv6 ] || die "official sing-box releases do not provide armv6 builds; use manual"
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   fetch_file https://api.github.com/repos/SagerNet/sing-box/releases/latest "$tmp/release.json"
-  version=$(sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' "$tmp/release.json" | head -1)
+  version=$(python3 - "$tmp/release.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    tag = json.load(fh).get("tag_name", "")
+print(tag[1:] if tag.startswith("v") else tag)
+PY
+)
   [ -n "$version" ] || die "cannot determine latest sing-box version"
   url="https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-$a-glibc.tar.gz"
   fetch_file "$url" "$tmp/core.tgz"
@@ -79,7 +100,12 @@ latest_naive(){
   esac
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   fetch_file https://api.github.com/repos/klzgrad/naiveproxy/releases/latest "$tmp/release.json"
-  tag=$(sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' "$tmp/release.json" | head -1)
+  tag=$(python3 - "$tmp/release.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    print(json.load(fh).get("tag_name", ""))
+PY
+)
   [ -n "$tag" ] || die "cannot determine latest NaiveProxy version"
   url="https://github.com/klzgrad/naiveproxy/releases/download/$tag/naiveproxy-$tag-linux-$a.tar.xz"
   fetch_file "$url" "$tmp/core.tar.xz"
