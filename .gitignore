@@ -1,6 +1,7 @@
 armwall
 armwall-linux-*
 SHA256SUMS
+armwall-install-files.tar.gz
 *.log
 *.db
 *.db-shm

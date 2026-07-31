@@ -30,7 +30,7 @@ ArmWall 本身四种架构均为静态二进制。上游 sing-box 不发布 ARMv
 
 ```bash
 make test
-make release VERSION=0.1.0
+make release VERSION=1.2.3
 ```
 
 ## 安装
@@ -38,30 +38,43 @@ make release VERSION=0.1.0
 在目标 Armbian/Debian 设备上执行一键安装命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh | sudo sh
+curl -fsSL https://github.com/rainsmen/armwall/releases/latest/download/one-click-install.sh | sudo sh
 ```
 
-脚本会下载完整安装包，根据 `uname -m` 自动选择 ARMv6、ARMv7、ARM64 或 AMD64 架构的 ArmWall 程序，并安装、启用所需服务。全新安装默认使用 `lan` 模式，在 `0.0.0.0:8080` 监听 IPv4，并只允许来自回环地址及 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 的客户端。安装器会输出主机当前可用的访问地址。首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
+脚本默认解析 GitHub 最新正式 Release，根据 `uname -m` 下载 ARMv6、ARMv7、ARM64 或 AMD64 二进制及安装支持包，并使用同一 Release 的 `SHA256SUMS` 强制验证两个文件后才安装。全新安装默认使用 `lan` 模式，在 `0.0.0.0:8080` 监听 IPv4，并只允许来自回环地址及 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 的客户端。安装器会输出主机当前可用的访问地址。首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
 
 可在安装时选择访问模式：
 
 ```bash
 # 只允许本机访问
-curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh |
+curl -fsSL https://github.com/rainsmen/armwall/releases/latest/download/one-click-install.sh |
   sudo env ARMWALL_WEB_ACCESS=local sh
 
 # 自定义监听地址和允许访问的客户端网段
-curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh |
+curl -fsSL https://github.com/rainsmen/armwall/releases/latest/download/one-click-install.sh |
   sudo env ARMWALL_WEB_ACCESS=custom \
     ARMWALL_LISTEN=0.0.0.0:9000 \
     ARMWALL_WEB_ALLOWED_CIDRS=192.168.50.0/24 sh
 ```
 
-生产安装建议固定 `ARMWALL_REF` 到 release tag，并设置 `ARMWALL_ARCHIVE_SHA256` 校验源码归档。
+默认安装最新正式版本。需要固定版本时设置 `ARMWALL_RELEASE`：
+
+```bash
+curl -fsSL https://github.com/rainsmen/armwall/releases/latest/download/one-click-install.sh |
+  sudo env ARMWALL_RELEASE=v0.3.1 sh
+```
+
+开发测试可显式选择源码通道。该通道不会使用 Release 资产；生产环境不应使用：
+
+```bash
+curl -fsSL https://github.com/rainsmen/armwall/releases/latest/download/one-click-install.sh |
+  sudo env ARMWALL_INSTALL_CHANNEL=source ARMWALL_REF=main sh
+```
+
+为兼容旧命令，只要显式设置 `ARMWALL_REF`，安装器也会切换到源码通道。可通过 `ARMWALL_ARCHIVE_SHA256` 校验源码归档。
 
 升级会保留已有 Web 访问模式、`/etc/armwall/armwall.env`、SQLite 数据库和配置备份，不会静默扩大管理面板的访问范围；升级核心前会在
-`/var/lib/armwall/backups/` 保留最近 3 份旧核心。生产环境不要直接跟随 `main`，
-应使用固定 tag，并在下载前验证归档 SHA256。
+`/var/lib/armwall/backups/` 保留最近 3 份旧核心。生产环境不要使用源码通道直接跟随 `main`。
 
 ### 离线安装
 
