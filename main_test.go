@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,7 +181,12 @@ func TestAPIAuthAndServerHardening(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := newHTTPServer("127.0.0.1:0", token, nil)
+	webConfig := webAccessConfig{
+		Mode:            "local",
+		ListenAddress:   "127.0.0.1:0",
+		AllowedPrefixes: mustWebPrefixes(t, "127.0.0.0/8,::1/128"),
+	}
+	server, err := newHTTPServer(webConfig, token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,6 +214,82 @@ func TestAPIAuthAndServerHardening(t *testing.T) {
 	handler(recorder, req)
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("valid token status=%d", recorder.Code)
+	}
+}
+
+func mustWebPrefixes(t *testing.T, raw string) []netip.Prefix {
+	t.Helper()
+	prefixes, err := parseWebAllowedCIDRs(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prefixes
+}
+
+func TestWebAccessConfigAndMiddleware(t *testing.T) {
+	t.Setenv("ARMWALL_WEB_ACCESS", "lan")
+	t.Setenv("ARMWALL_LISTEN", "0.0.0.0:8080")
+	t.Setenv("ARMWALL_WEB_ALLOWED_CIDRS", "192.168.0.0/16,10.0.0.0/8")
+	config, err := loadWebAccessConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Mode != "lan" || config.ListenAddress != "0.0.0.0:8080" {
+		t.Fatalf("unexpected web config: %+v", config)
+	}
+
+	handler := webAccessMiddleware(config, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, test := range []struct {
+		name       string
+		remoteAddr string
+		wantStatus int
+	}{
+		{name: "private lan", remoteAddr: "192.168.50.12:1234", wantStatus: http.StatusNoContent},
+		{name: "second private range", remoteAddr: "10.20.30.40:1234", wantStatus: http.StatusNoContent},
+		{name: "public address", remoteAddr: "203.0.113.5:1234", wantStatus: http.StatusForbidden},
+		{name: "invalid address", remoteAddr: "invalid", wantStatus: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = test.remoteAddr
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d", recorder.Code, test.wantStatus)
+			}
+		})
+	}
+}
+
+func TestWebAccessConfigValidation(t *testing.T) {
+	t.Setenv("ARMWALL_WEB_ACCESS", "local")
+	t.Setenv("ARMWALL_LISTEN", "0.0.0.0:8080")
+	if _, err := loadWebAccessConfig(); err == nil {
+		t.Fatal("local mode should reject a non-loopback listener")
+	}
+	t.Setenv("ARMWALL_WEB_ACCESS", "custom")
+	t.Setenv("ARMWALL_LISTEN", "0.0.0.0:8080")
+	t.Setenv("ARMWALL_WEB_ALLOWED_CIDRS", "")
+	if _, err := loadWebAccessConfig(); err == nil {
+		t.Fatal("custom mode should require allowed CIDRs")
+	}
+}
+
+func TestWebListenNetwork(t *testing.T) {
+	for _, test := range []struct {
+		address string
+		want    string
+	}{
+		{address: "0.0.0.0:8080", want: "tcp4"},
+		{address: "127.0.0.1:8080", want: "tcp4"},
+		{address: "[::1]:8080", want: "tcp6"},
+		{address: "localhost:8080", want: "tcp"},
+	} {
+		if got := webListenNetwork(test.address); got != test.want {
+			t.Errorf("webListenNetwork(%q)=%q want=%q", test.address, got, test.want)
+		}
 	}
 }
 

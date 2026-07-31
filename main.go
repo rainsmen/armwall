@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -523,9 +524,18 @@ var clashAPISecret string
 var clashSecretMu sync.Mutex
 
 const (
-	maxAPIJSONBodySize = 1 << 20
-	minAuthTokenLength = 16
+	maxAPIJSONBodySize       = 1 << 20
+	minAuthTokenLength       = 16
+	defaultWebListenLocal    = "127.0.0.1:8080"
+	defaultWebListenLAN      = "0.0.0.0:8080"
+	defaultWebAllowedPrivate = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 )
+
+type webAccessConfig struct {
+	Mode            string
+	ListenAddress   string
+	AllowedPrefixes []netip.Prefix
+}
 
 func boolValue(value *bool, fallback bool) bool {
 	if value == nil {
@@ -2140,6 +2150,156 @@ func recordAuthFailure(remoteAddr string) bool {
 	return len(kept) > 10
 }
 
+func parseWebAllowedCIDRs(raw string) ([]netip.Prefix, error) {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	})
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("ARMWALL_WEB_ALLOWED_CIDRS is required")
+	}
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	for _, part := range parts {
+		prefix, err := netip.ParsePrefix(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ARMWALL_WEB_ALLOWED_CIDRS entry %q: %w", part, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
+}
+
+func parseWebListenAddress(addr string) (string, error) {
+	host, portRaw, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid ARMWALL_LISTEN %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portRaw)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid ARMWALL_LISTEN port %q", portRaw)
+	}
+	if host == "localhost" {
+		return host, nil
+	}
+	if host != "" {
+		if _, err := netip.ParseAddr(host); err != nil {
+			return "", fmt.Errorf("ARMWALL_LISTEN host must be an IP address or localhost")
+		}
+	}
+	return host, nil
+}
+
+func webListenNetwork(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "localhost" {
+		return "tcp"
+	}
+	parsed, err := netip.ParseAddr(host)
+	if err == nil && parsed.Is6() {
+		return "tcp6"
+	}
+	return "tcp4"
+}
+
+func loadWebAccessConfig() (webAccessConfig, error) {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("ARMWALL_WEB_ACCESS")))
+	addr := strings.TrimSpace(os.Getenv("ARMWALL_LISTEN"))
+	legacy := false
+	if mode == "" {
+		if addr == "" {
+			mode = "local"
+		} else {
+			host, err := parseWebListenAddress(addr)
+			if err != nil {
+				return webAccessConfig{}, err
+			}
+			ip, _ := netip.ParseAddr(host)
+			if host == "localhost" || ip.IsLoopback() {
+				mode = "local"
+			} else {
+				mode = "legacy"
+				legacy = true
+			}
+		}
+	}
+	switch mode {
+	case "local":
+		if addr == "" {
+			addr = defaultWebListenLocal
+		}
+	case "lan":
+		if addr == "" {
+			addr = defaultWebListenLAN
+		}
+	case "custom", "legacy":
+		if addr == "" {
+			return webAccessConfig{}, fmt.Errorf("ARMWALL_LISTEN is required for %s web access", mode)
+		}
+	default:
+		return webAccessConfig{}, fmt.Errorf("ARMWALL_WEB_ACCESS must be local, lan, or custom")
+	}
+	host, err := parseWebListenAddress(addr)
+	if err != nil {
+		return webAccessConfig{}, err
+	}
+	parsedHost, _ := netip.ParseAddr(host)
+	if mode == "local" && host != "localhost" && !parsedHost.IsLoopback() {
+		return webAccessConfig{}, fmt.Errorf("local web access requires a loopback ARMWALL_LISTEN address")
+	}
+	if mode == "lan" && host != "" && host != "0.0.0.0" {
+		return webAccessConfig{}, fmt.Errorf("lan web access requires ARMWALL_LISTEN=0.0.0.0:<port>")
+	}
+
+	allowed := strings.TrimSpace(os.Getenv("ARMWALL_WEB_ALLOWED_CIDRS"))
+	switch mode {
+	case "local":
+		allowed = "127.0.0.0/8,::1/128"
+	case "lan":
+		if allowed == "" {
+			allowed = defaultWebAllowedPrivate
+		}
+	case "legacy":
+		allowed = "0.0.0.0/0,::/0"
+	}
+	prefixes, err := parseWebAllowedCIDRs(allowed)
+	if err != nil {
+		return webAccessConfig{}, err
+	}
+	config := webAccessConfig{Mode: mode, ListenAddress: addr, AllowedPrefixes: prefixes}
+	if legacy {
+		log.Printf("warning: non-loopback ARMWALL_LISTEN without ARMWALL_WEB_ACCESS uses unrestricted legacy access")
+	}
+	return config, nil
+}
+
+func webClientAllowed(remoteAddr string, prefixes []netip.Prefix) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func webAccessMiddleware(config webAccessConfig, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !webClientAllowed(r.RemoteAddr, config.AllowedPrefixes) {
+			log.Printf("web access denied from %s path=%s", r.RemoteAddr, r.URL.Path)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func authHandler(token string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(token, r.Header.Get("Authorization")) {
@@ -3595,7 +3755,7 @@ func securityHeaderMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func newHTTPServer(addr, token string, staticFS fs.FS) (*http.Server, error) {
+func newHTTPServer(config webAccessConfig, token string, staticFS fs.FS) (*http.Server, error) {
 	if _, err := validateAuthToken(token); err != nil {
 		return nil, err
 	}
@@ -3609,8 +3769,8 @@ func newHTTPServer(addr, token string, staticFS fs.FS) (*http.Server, error) {
 	}
 	mux.HandleFunc("/", page)
 	return &http.Server{
-		Addr:              addr,
-		Handler:           securityHeaderMiddleware(mux),
+		Addr:              config.ListenAddress,
+		Handler:           securityHeaderMiddleware(webAccessMiddleware(config, mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -3661,6 +3821,9 @@ func main() {
 		if _, err := validateAuthToken(os.Getenv("ARMWALL_TOKEN")); err != nil {
 			log.Fatal(err)
 		}
+		if _, err := loadWebAccessConfig(); err != nil {
+			log.Fatal(err)
+		}
 		log.Print("configuration ok")
 		return
 	}
@@ -3706,18 +3869,22 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	addr := os.Getenv("ARMWALL_LISTEN")
-	if addr == "" {
-		addr = "127.0.0.1:8080"
+	webAccess, err := loadWebAccessConfig()
+	if err != nil {
+		log.Fatal(err)
 	}
 	token, err := validateAuthToken(os.Getenv("ARMWALL_TOKEN"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("armwall listening on %s", addr)
-	server, err := newHTTPServer(addr, token, staticFS)
+	log.Printf("armwall listening on %s web_access=%s", webAccess.ListenAddress, webAccess.Mode)
+	server, err := newHTTPServer(webAccess, token, staticFS)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Fatal(server.ListenAndServe())
+	listener, err := net.Listen(webListenNetwork(webAccess.ListenAddress), webAccess.ListenAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(server.Serve(listener))
 }

@@ -41,11 +41,25 @@ make release VERSION=0.1.0
 curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh | sudo sh
 ```
 
-脚本会下载完整安装包，根据 `uname -m` 自动选择 ARMv6、ARMv7、ARM64 或 AMD64 架构的 ArmWall 程序，并安装、启用所需服务。安装完成后默认只监听 `127.0.0.1:8080`；如需局域网访问，请在 `/etc/armwall/armwall.env` 明确设置 `ARMWALL_LISTEN`。首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
+脚本会下载完整安装包，根据 `uname -m` 自动选择 ARMv6、ARMv7、ARM64 或 AMD64 架构的 ArmWall 程序，并安装、启用所需服务。全新安装默认使用 `lan` 模式，在 `0.0.0.0:8080` 监听 IPv4，并只允许来自回环地址及 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 的客户端。安装器会输出主机当前可用的访问地址。首次访问输入安装器输出的管理 Token；Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。
+
+可在安装时选择访问模式：
+
+```bash
+# 只允许本机访问
+curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh |
+  sudo env ARMWALL_WEB_ACCESS=local sh
+
+# 自定义监听地址和允许访问的客户端网段
+curl -fsSL https://raw.githubusercontent.com/rainsmen/armwall/main/one-click-install.sh |
+  sudo env ARMWALL_WEB_ACCESS=custom \
+    ARMWALL_LISTEN=0.0.0.0:9000 \
+    ARMWALL_WEB_ALLOWED_CIDRS=192.168.50.0/24 sh
+```
 
 生产安装建议固定 `ARMWALL_REF` 到 release tag，并设置 `ARMWALL_ARCHIVE_SHA256` 校验源码归档。
 
-升级会保留 `/etc/armwall/armwall.env`、SQLite 数据库和配置备份；升级核心前会在
+升级会保留已有 Web 访问模式、`/etc/armwall/armwall.env`、SQLite 数据库和配置备份，不会静默扩大管理面板的访问范围；升级核心前会在
 `/var/lib/armwall/backups/` 保留最近 3 份旧核心。生产环境不要直接跟随 `main`，
 应使用固定 tag，并在下载前验证归档 SHA256。
 
@@ -75,16 +89,23 @@ sudo ./install.sh ./armwall-linux-armv7
 
 | 用途 | 默认地址/端口 | 说明 |
 | --- | --- | --- |
-| Web 管理面板 | `127.0.0.1:8080` | 明文 HTTP；需要管理 Token，不建议暴露公网 |
+| Web 管理面板 | `0.0.0.0:8080` | 新安装默认为 `lan` 模式；明文 HTTP，需要管理 Token，不允许公网客户端 |
 | Mixed SOCKS/HTTP | `0.0.0.0:11080` | 由 sing-box 配置决定 |
 | 透明代理 TProxy | `0.0.0.0:11081` | 仅供本机网关规则使用 |
 | Clash API | `127.0.0.1:9090` | 随机 secret，仅供 ArmWall 后端访问 |
 | NaiveProxy 本地 SOCKS | `127.0.0.1:12000+` | 每个 Naive 节点占用一个端口 |
 
-管理 Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。轮换 Token 时编辑
-该文件后执行 `systemctl restart armwall.service`；浏览器中的旧 Token 需要在页面点击
-“清除 Token”后重新输入。若要从局域网访问管理面板，先设置防火墙，再在
-`/etc/armwall/armwall.env` 中明确设置 `ARMWALL_LISTEN`，并理解 HTTP 未启用 TLS。
+管理 Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。轮换 Token 或修改 Web
+访问配置后执行 `systemctl restart armwall.service`；浏览器中的旧 Token 需要在页面点击
+“清除 Token”后重新输入。
+
+Web 访问由以下变量控制：
+
+- `ARMWALL_WEB_ACCESS=local`：只允许回环地址，监听地址必须是回环地址。
+- `ARMWALL_WEB_ACCESS=lan`：监听 `0.0.0.0`，默认允许常见 IPv4 私网地址；可通过 `ARMWALL_WEB_ALLOWED_CIDRS` 缩小或扩展范围。
+- `ARMWALL_WEB_ACCESS=custom`：必须同时明确设置 `ARMWALL_LISTEN` 和 `ARMWALL_WEB_ALLOWED_CIDRS`。
+
+`0.0.0.0` 使监听不受 DHCP 地址变化影响，但浏览器仍需使用主机变化后的新地址。主机防火墙也必须允许相应端口。管理面板当前使用明文 HTTP；公网访问应使用 VPN 或带 HTTPS 的反向代理，不能通过加入 `0.0.0.0/0` 直接暴露。
 
 ## 客户端接入
 
