@@ -1058,7 +1058,7 @@ func TestACLAndDNSAPI(t *testing.T) {
 	}
 }
 
-func TestTProxyInboundsHaveSniffing(t *testing.T) {
+func TestRouteRulesHaveSniffing(t *testing.T) {
 	tproxyEnabled = true
 	defer func() { tproxyEnabled = false }()
 	s := Store{
@@ -1072,27 +1072,24 @@ func TestTProxyInboundsHaveSniffing(t *testing.T) {
 		},
 	}
 	c := config(s)
-	inbounds := c["inbounds"].([]any)
-	var foundTproxy, foundMAC bool
-	for _, raw := range inbounds {
-		inbound := raw.(map[string]any)
-		if inbound["tag"] == "tproxy-in" {
-			foundTproxy = true
-			sniff, ok := inbound["sniff"].(map[string]any)
-			if !ok || sniff["enabled"] != true {
-				t.Fatalf("tproxy-in missing sniff: %+v", inbound)
-			}
-		}
-		if inbound["tag"] == "acl-mac-1" {
-			foundMAC = true
-			sniff, ok := inbound["sniff"].(map[string]any)
-			if !ok || sniff["enabled"] != true {
-				t.Fatalf("acl-mac-1 missing sniff: %+v", inbound)
-			}
+	route, ok := c["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing route in config: %+v", c)
+	}
+	rules, ok := route["rules"].([]any)
+	if !ok {
+		t.Fatalf("missing rules in route: %+v", route)
+	}
+	var foundSniff bool
+	for _, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if ok && rule["action"] == "sniff" {
+			foundSniff = true
+			break
 		}
 	}
-	if !foundTproxy || !foundMAC {
-		t.Fatalf("missing expected inbounds: foundTproxy=%v foundMAC=%v", foundTproxy, foundMAC)
+	if !foundSniff {
+		t.Fatalf("missing sniff rule in route: %+v", rules)
 	}
 }
 

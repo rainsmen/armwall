@@ -1708,6 +1708,7 @@ func config(s Store) map[string]any {
 	if s.DNS.Enabled && s.DNS.Hijack {
 		rules = append(rules, map[string]any{"protocol": "dns", "action": "hijack-dns"})
 	}
+	rules = append(rules, map[string]any{"action": "sniff"})
 	for _, acl := range s.ACLRules {
 		if !acl.Enabled {
 			continue
@@ -1772,12 +1773,11 @@ func config(s Store) map[string]any {
 	if s.DNS.Enabled {
 		inbounds = append(inbounds, map[string]any{"type": "direct", "tag": "dns-in", "listen": s.DNS.ListenAddress, "listen_port": s.DNS.ListenPort})
 	}
-	sniffConfig := map[string]any{"enabled": true, "dest_override": []string{"http", "tls"}}
 	if tproxyEnabled {
-		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": tproxyPort, "sniff": sniffConfig})
+		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": tproxyPort})
 	}
 	for _, binding := range macBindings {
-		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": binding.Tag, "listen": "0.0.0.0", "listen_port": binding.Port, "sniff": sniffConfig})
+		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": binding.Tag, "listen": "0.0.0.0", "listen_port": binding.Port})
 	}
 	level := s.LogLevel
 	if level == "" {
