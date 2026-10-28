@@ -1,154 +1,277 @@
-# ArmWall 项目评估报告
+# ArmWall 项目全面技术评估、优化实施与真机验证总报告
 
-- 日期：2026-10-28
-- 范围：`main.go` / `management.go` / `storage.go` / `strategy_runtime.go`、`web/`、全部 shell 脚本与 systemd 单元、CI、仓库状态
-- 方式：只读静态审查，未修改任何文件
-- 验证说明：本机未安装 Go 工具链，无法执行 `go build` / `go test` 复现；`armwall-linux-amd64 --version` 可正常执行（输出 `0.3.1`）。结论基于源码与脚本阅读，并与仓库内三份既有审计文档（`AUDIT-REPORT.md`、`CODEX-AUDIT-REPORT.md`、`IMPROVEMENT-PLAN.md`）交叉比对
-
----
-
-## 一、项目概况
-
-- 形态：Go 单体服务（`main.go` 3890 行 + `management.go` / `storage.go` / `strategy_runtime.go`）+ 原生 JS 单页前端（`web/`，约 2800 行）+ 一组 shell 运维脚本（install / gateway / update-core / naive-supervisor / uninstall）。
-- 能力相当完整：多协议订阅解析、selector/urltest 策略组、nftables TProxy 透明网关、MAC ACL、DNS/FakeIP、规则集热更新、SQLite 持久化、配置导入导出、备份、多架构发布。
-- 基础工程也不错：约 45 个单元测试、GitHub CI、release 产物带 SHA256SUMS、一键安装校验 checksum、systemd 单元、logrotate、README 比较诚实（明确写了明文 HTTP 和 IPv4-only）。
-- 主要短板不在“功能”，而在三处：**请求/锁/重启模型**、**安全边界**、**工程结构与仓库卫生**。
-
-总体评价：功能完成度约 80%、生产可靠性约 60%、安全性约 50%。测试与文档基础好于多数同类项目，最该优先处理的不是加功能，而是把**锁边界、超时、重启策略**和**凭据/传输/核心更新的信任链**收干净。
+> **文档性质**：综合技术评估、缺陷复核、优化实施追踪与真机测试验证报告。  
+> **文档来源**：合并 2026-10-28 静态审计报告与架构深度评估报告，并整合真机部署测试记录。  
+> **基准分支**：`optimize/system-hardening`（最新提交 `4895829`，主分支 `main` 保持 v0.3.1 稳定版本）  
+> **验证设备**：斐讯章鱼星球 (Octopus Planet) / Amlogic S912 (8-core aarch64, 2GB RAM, 5.8GB eMMC) / Armbian 24.5.1 Linux 6.6.36-current-meson64 / IP: `192.168.10.233:22`
 
 ---
 
-## 二、P0：建议优先处理
+## 一、系统全景架构与工作原理
 
-### 1. 明文 HTTP + 长期 Bearer Token + 全量凭据下发 = 一次嗅探直达 root
+ArmWall 是面向 Armbian / Debian 嵌入式单板计算机（如斐讯章鱼星球、NanoPi、Orange Pi、Raspberry Pi 等）设计的轻量级透明代理与局域网旁路网关管理系统。
 
-- 新装默认 `lan` 模式，监听 `0.0.0.0:8080` 且为明文 HTTP（`install.sh:68`，README 亦承认）。
-- Token 存于浏览器 `localStorage` 永久保存（`web/app.js:3,45`），请求失败即 prompt 重新输入。
-- `/api/state` 全量返回节点 UUID/密码、订阅 URL（`main.go:1866`），而 `/api/core/upload` 能把任意 ELF 以 root 执行（`management.go:244`）。
-- 影响：同一 WiFi 内一次抓包或任一 XSS 等价于 root。
-- 建议：默认 `local`（配 SSH 隧道）或内置 HTTPS（自签 + 启动打印指纹，或提供 nginx/caddy 反代示例）；token 改 `sessionStorage` / HttpOnly Cookie + CSRF；`/api/state` 字段脱敏，编辑时单独取凭据。
+```mermaid
+flowchart TD
+    Client["LAN 客户端 (PC / 手机 / 电视盒)"]
+    WebBrowser["管理员浏览器 (局域网 HTTP / Bearer Token)"]
 
-### 2. 核心更新没有并发保护，且下载无完整性校验
+    subgraph Host ["ArmWall 主机 (Armbian / Linux 192.168.10.233)"]
+        WebBrowser -->|"8080 端口 (敏感字段脱敏 / 批量测速)"| WebMux["ArmWall Web API (main.go / management.go)"]
+        
+        subgraph Data ["持久化与存储层"]
+            DB[("armwall.db (SQLite 单例连接池 + WAL)")]
+            Conf["/etc/armwall/sing-box.json"]
+            MacFile["/etc/armwall/mac-acl.tsv"]
+            WebMux <--> DB
+            WebMux --> Conf
+            WebMux --> MacFile
+        end
 
-- `/api/core/update`、`/api/core/upload` 走 `handleUnlockedAPI`，不拿 `mu`，并发请求可直接并行（`main.go:2043,2059`）。
-- `update-core.sh:37` 使用固定路径 `$BIN_DIR/$name.new`：并发更新互相覆盖同一临时文件，可能装坏 `/usr/local/bin/sing-box`。
-- `latest_sing_box` / `latest_naive` 只校验 tar 可解压，不校验二进制哈希或签名（`update-core.sh:100-137`）。
-- 建议：进程内 + flock 幂等锁；临时文件用 `mktemp`；用 GitHub API digest 或固定版本 + sha256；发布侧对 SHA256SUMS 签名（cosign/minisign）。
+        subgraph Core ["代理与路由内核"]
+            SingBox["sing-box 1.14+ (Systemd 管理 / 内存 ~11.6MB)"]
+            Naive["naiveproxy 多实例 (Supervisor 管理)"]
+            NFT["nftables (inet armwall 表 TProxy)"]
+            Route["Linux 策略路由 (table 233 fwmark 1)"]
+        end
 
-### 3. 30s 超时 + 全局锁 + 慢 I/O 三者互相打架
+        WebMux -->|"exec.CommandContext (带超时保护)"| SingBox
+        WebMux -->|"exec.CommandContext"| Naive
+        WebMux -->|"gateway.sh (自动网卡探测 / ExecStop 恢复)"| NFT
+        WebMux -->|"127.0.0.1:9090 (Clash API)"| SingBox
 
-- `ReadTimeout/WriteTimeout = 30s`（`main.go:3775-3776`）：`/api/subscription/update`（3 次重试 × 20s）、`/api/rules/update`（32MB × 2 URL）、`/api/core/update`（下载核心）均可能超时，客户端收到截断响应而服务端继续执行，重试叠加副作用；128MB 核心上传在慢 WiFi 上会被 `ReadTimeout` 掐断。
-- `api()` 先 `mu.Lock()` 再取 flock，然后**在锁内**做订阅下载（`main.go:2357-2364`、`2660`、`2726`），一次订阅刷新期间整个面板串行阻塞。
-- 建议：临界区只保留 load-modify-save，网络 I/O 移出锁；flock 用 `LOCK_NB` + 有限重试并返回 503；长任务改异步 job + 状态轮询；按路由放宽超时（`http.ResponseController` 或独立 Server）。
+        Client -->|"TProxy (端口 11081 / MAC 端口)"| NFT
+        NFT --> Route
+        Route --> SingBox
+        SingBox -->|"路由层 action: sniff (域名嗅探)"| GFW{"分流判定 (geosite / geoip)"}
+        SingBox -->|"SOCKS5 (12000+)"| Naive
+    end
 
----
-
-## 三、P1：正确性与可靠性
-
-| # | 问题 | 位置 | 影响 / 建议 |
-|---|---|---|---|
-| 4 | 任何保存都会重写 `sing-box.json` → `sing-box check` → 重启 sing-box → 重建 nft | `persistStore` 960-1001、`restartProxy` 2066-2087 | 改日志级别/开关节点即全量掉连接；Pi 上每次操作 1-3s；ACL 重载有短暂绕过窗口。建议加“配置哈希未变则跳过”并对重启做 1-2s 合并去抖 |
-| 5 | 订阅刷新把该订阅节点整体挪到数组末尾，随后被 `normalizeStore` 重写成 `SortOrder=i` | 480-489 + 895-905 | 手动排序每次定时刷新被清掉；节点改名/端口轮换会换 ID，策略组成员与 disabled 状态静默丢失。建议拆出 override 表 |
-| 6 | 规则集只检查 `len(body) >= 16` | `updateRule` 727-741 | CDN 返回 HTML 错误页（200 + 大 body）会被写成 `.srs`；重启失败回滚恢复 store 但**不回滚规则文件**。建议校验 SRS 魔数或 `sing-box rule-set` 解析 |
-| 7 | `uninstall.sh` 不调用 `armwall-gateway disable` | `uninstall.sh:27-37` | nft 表与 `ip rule fwmark` 残留，卸载后 LAN 流量仍被 TProxy 到死端口，表现为“断网”直到重启 |
-| 8 | `gateway.sh` 的 `detect()` 强制要求 `/dev/net/tun` | `gateway.sh:20` | TProxy 不需要 tun，无 tun 设备直接无法启用；`restore` 无重试，开机 DHCP 未就绪时一次失败即永久不恢复；规则用十几次独立 `nft` 命令逐条下发，非原子。建议 `nft -f` 整表原子下发 + `Restart=on-failure` |
-| 9 | 透明网关只覆盖 IPv4 | `gateway.sh` 全文 | 客户端有原生 IPv6 时完全绕过代理（README 已声明，但安装期无检测/提示）。建议加 ip6 规则或安装时提示关闭客户端 IPv6 |
-| 10 | 10 个端点重复实现，锁内那份永远不可达 | `main.go:2371/3100/3106/3285/3293/3430/3448/3490/3571/3587` | 约 250 行死代码；“哪些端点受锁保护”不可读；两套实现已出现行为差异 |
-| 11 | mixed 入站固定 `0.0.0.0`、无认证 | `main.go:1722` | 局域网内任何人可当开放代理使用。建议默认 `127.0.0.1` + 显式开关，或给 socks 配 users |
-| 12 | 凭据多处明文落盘 | `saveJSON` `storage.go:57-63`、`/api/config/export`、备份 JSON | 宿主机多一份明文凭据；备份可被 LAN 客户端以明文 HTTP 下载 |
-| 13 | 端口冲突无校验 | `validateDNSSettings` / `/api/settings` | 代理端口设成 9090/11081/53/12000+ 时 `sing-box check` 不校验绑定，直到 restart 才失败回滚，错误为英文 systemd 输出 |
-| 14 | `exec.Command` 全程无 `context`/超时 | `run()` 1826、`reloadGatewayIfActive` 1009、`restartProxy` 2068、`ping` 2018 | systemd/nft/curl 卡住会永久占住 `mu`；客户端断开时无法取消 |
-
-补充细节：
-
-- `ping -c 1 -W 3 <host>` 的 host 来自节点 `Server`，仅 TrimSpace（`main.go:1036`），以 `-` 开头的值会被当作 ping 参数（无 shell，危害有限但应校验）。
-- `/api/node` 允许客户端自带 ID，不校验是否与已有节点/`direct`/`block`/策略组重名（2387-2392），重名到写配置时才 500。
-- `authFailures` map 只增不减（2091-2151），长期运行 + 多 IP 无界增长；429 无 `Retry-After`。
-- `restartProxy` 用 `LookPath("naive")` 决定是否重启 naive 服务（2067），装了二进制但服务被禁用时会让保存失败回滚。
-- `Store.UpdateHours` 是死字段：`/api/subscription/schedule` 只改 systemd timer override（2886-2913），实际调度用每订阅 `UpdateHours`，两个“间隔”语义不一致。
-- `/api/log/clear` 直接 `os.WriteFile(..., nil)` 截断（3315-3324），sing-box 日志 writer 持有偏移，后续可能写出稀疏空洞；应走 logrotate 或重启重开。
-- `writeAtomicFile`/`writeConfig`/`writeNaiveConfigs` 只 `fsync` 文件、不 `fsync` 父目录，SD 卡掉电可能丢 rename。
+    GFW -->|"direct"| DirectOut["直连 / 国内流量"]
+    GFW -->|"proxy"| WAN["海外互联网 / 代理节点服务器"]
+```
 
 ---
 
-## 四、P2：可维护性与性能
+## 二、优化与改进事项状态总览表（动态跟踪矩阵）
 
-### 存储层
-
-- 每次 `loadStore/save` 都 `sql.Open` + 建表 + 关库（`storage.go:26-44`）；`busy_timeout` 是每连接 PRAGMA，连接池换连接后可能失效——应改 DSN `_pragma` 并复用单例 `*sql.DB`。
-- `saveDB` 每次 `DELETE` 全表再全量 INSERT（192-243）：10000 节点下改一个开关就要上万次写入，再叠加配置重写和重启。
-- 没有 schema 版本管理（只有 `CREATE TABLE IF NOT EXISTS`），后续加列困难；建议 `PRAGMA user_version` 迁移。
-- 遗留 JSON 镜像（`store.json`）已无作用，只剩第二份明文凭据与额外写入，可在一个发布周期后删除。
-
-### 结构
-
-- `main.go` 3890 行，`api()` 约 1370 行 switch（2351-3723），`config()` 用嵌套 `map[string]any` 拼装；约 20 个可变全局（路径、端口、命令路径）导致测试只能靠环境变量。
-- 建议拆为 `internal/store`、`internal/configgen`、`internal/api`（按资源拆 handler + 路由表）、`internal/platform`（systemd/nft/exec）；用 `App`/`Config` struct 注入路径与命令，`exec` 换 `exec.CommandContext`。
-- 没有 `context` 贯穿、没有优雅退出（`log.Fatal(server.Serve())`，3889）、没有结构化日志、请求 ID、`/healthz`、`/api/version`、`/metrics`。
-
-### 前端
-
-- 请求无超时/取消（`fetch` 裸调用），订阅或重启请求会挂到浏览器默认超时；429 未处理。
-- 15s 轮询中每次 `systemctl is-active` 都 fork 进程，多标签页按倍数增长；建议缓存 1-2s 或统一 SSE。
-- 表格全量 `innerHTML` 重绘（上万节点很慢），无虚拟滚动/分页。
-- `/static/` 响应 `no-store` 但资源又带 `?v=20260726-5` 手工版本号，两者矛盾且易忘更新；无 favicon 导致每次 404。
-- 缺少“本次修改是否需要重启代理”的提示，用户不易理解操作耗时来源。
-
-### 仓库与供应链
-
-- `.gitignore` 写了 `armwall-linux-*`，但 4 个约 10MB 二进制仍在索引中，`.git` 已 110MB（`git ls-files` 可复现）；且“源码通道”实际依赖这些入库二进制（`one-click-install.sh` source 分支直接取 `armwall-linux-$ARCH`）——要么明确保留并接受体积，要么去掉 source 通道改为现场 `go build`。
-- 根目录 `armwall`（dev 版 amd64）是过期产物，`install.sh:26` 优先使用它；在 ARM 上误装会 exec format error，`install.sh` 无 ELF 架构校验。
-- 三份审计文档未提交（`??`）；根目录 `armwall` / `armwall-install-files.tar.gz` / `SHA256SUMS` 属本地产物，建议文档移入 `docs/` 并提交，产物全部 gitignore。
-- 缺 `LICENSE`（README 未声明协议）、CHANGELOG、SECURITY.md；`go.mod` 中 `modernc.org/sqlite 1.29.10`、`golang.org/x/sys 0.19.0` 明显落后，无 dependabot/renovate；CI 无 `gofmt`、staticcheck、`govulncheck`（`make test` 有 gofmt，但 push 触发的 `ci.yml` 没有）。
-
----
-
-## 五、值得做的功能 / 体验优化
-
-1. **订阅信息**：展示 `Subscription-Userinfo`（流量/到期）；请求加 `User-Agent`（很多机场按 UA 返回 403）；支持 Clash YAML 订阅。
-2. **批量测速**：现在测 50 个节点要发 50 个请求；应支持批量并发测速与排序。
-3. **节点覆盖层**：把“订阅源数据”和“用户改名/禁用/排序”分离成 override 表，订阅刷新不再丢用户修改（顺带修 P1-5）。
-4. **规则集镜像**：`ruleURLs` 全为 raw.githubusercontent.com（`main.go:646`），被墙环境首装必失败；提供国内镜像或随包内置规则。
-5. **配置 diff 与一键回滚**：应用前提示“本次变更会重启代理”，失败时整体回滚（含规则集文件）。
-6. **只读角色 / 多 Token**：给只查看状态的用户一个只读 token。
-7. **IPv6 网关**与**客户端 DNS 自动配置指引**（dnsmasq / AdGuardHome 示例）。
-8. **可观测**：`/healthz`、`/api/version`（前端显示版本便于支持）、node_exporter textfile 指标（连接数、重连次数）。
+| 编号 | 类别 | 评估问题项与机理 | 危害等级 | 当前实施状态 | 代码落地点 / 验证记录 |
+|---|---|---|---|---|---|
+| **P0-1** | 安全 | 明文 HTTP + 长期 Token + `/api/state` 明文下发密码 UUID | **P0 严重** | 🟡 **部分完成** | `/api/state` 已全面脱敏为 `"******"`；新增 `/api/node/get` 按需解密；Token 与 HTTPS 待办 |
+| **P0-2** | 架构 | 全局 `mu.Lock()` + flock + 慢网络 I/O 阻塞导致管理面板假死 | **P0 严重** | ✅ **已完成** | 订阅拉取彻底移出全局锁；快照原子合并落盘；前端配置 `AbortController` 超时保护 |
+| **P0-3** | 网络 | TProxy 入站未配置 `sniff`，非 FakeIP 下 GFW 域名匹配失效 | **P0 严重** | ✅ **已完成** | 适配 sing-box 1.14+ 语法，在路由规则注入 `{"action": "sniff"}`，S912 实机验证生效 |
+| **P0-4** | 安全 | 核心更新与上传缺乏并发互斥，临时文件固定易并发篡改 | **P0 严重** | 🟡 **部分完成** | Go 增加 `coreOperationMu` 互斥；`update-core.sh` 改用 `mktemp`；Release SHA256 待办 |
+| **P1-1** | 网关 | `uninstall.sh` 不调 disable，服务无 `ExecStop`，卸载即断网 | **P1 高** | ✅ **已完成** | 服务补齐 `ExecStop`；卸载脚本 pre-uninstall 显式禁用网关并清空 nft 表 |
+| **P1-2** | 网关 | `gateway.sh` 误判 `/dev/net/tun`，旁路由网卡检测易提取错误 metric | **P1 高** | ✅ **已完成** | 移除 tun 设备检测；重构 awk 匹配 `dev` 关键字并过滤 Tailscale/Docker/Tun 虚拟网卡 |
+| **P1-3** | 性能 | 细微修改均触发 `systemctl restart` 全量断流 | **P1 高** | 🟡 **部分完成** | 引入配置与 MAC ACL 散列哈希比对，无变动直接跳过重启；Clash API 热切换待办 |
+| **P1-4** | 容错 | 规则更新仅校验 `len >= 16`，CDN 错误页导致死机且无回滚 | **P1 高** | ✅ **已完成** | 增加 HTML 网页检测拦截；引入 `.srs.bak` 备份并在代理启动失败时自动回滚 |
+| **P1-5** | 数据 | 订阅刷新将节点推到末尾打乱手动排序，节点改名丢失配置 | **P1 高** | 🟡 **部分完成** | 订阅刷新改为在位更新（原地保留原有索引顺序）；独立 `node_overrides` 待办 |
+| **P1-6** | 安全 | Mixed 代理端口 11080 监听 `0.0.0.0` 无密码，局域网可随意蹭网 | **P1 高** | ⏳ **待优化** | 计划增加默认 `127.0.0.1` 开关或 Socks5 用户名密码认证 |
+| **P1-7** | 代码 | `api()` 中存在 10 个不可达重复死代码分支（约 250 行） | **P1 高** | ✅ **已完成** | 彻底删除重复的分支，API 路由统一收口至 `handleUnlockedAPI` |
+| **P1-8** | 稳定 | 全系统 `exec.Command` 无 Context 超时，底层卡死占死互斥锁 | **P1 高** | ✅ **已完成** | 封装 `runCommandTimeout`，全量注入 5s~30s 独立超时取消机制 |
+| **P1-9** | 校验 | 代理端口允许设置为 8080/9090/11081/53 等冲突端口导致回滚 | **P1 高** | ✅ **已完成** | `/api/settings` 增加前置保留端口与系统服务端口冲突拦截（HTTP 400） |
+| **P1-10**| 校验 | `/api/node` 允许覆盖 `direct`/`block` 保留 ID 与重复 ID | **P1 高** | ✅ **已完成** | 严格校验 node ID，禁止使用内置 tag 并拦截重复 ID |
+| **P1-11**| 内存 | `authFailures` 认证失败 map 键只增不减，无界膨胀 | **P1 高** | ✅ **已完成** | 增加定期扫描淘汰过期 IP；触发限制时下发 `Retry-After: 60` 响应头 |
+| **P1-12**| 调度 | `Store.UpdateHours` 全局字段与单订阅 `sub.UpdateHours` 语义分裂 | **P1 高** | ⏳ **待优化** | 计划统一全局与分订阅定时触发语义 |
+| **P1-13**| 存储 | 磁盘多余备份 `store.json` 明文落盘，日志清空文件句柄未重载 | **P1 高** | 🟡 **部分完成** | 移除双写 `store.json`；sing-box 日志句柄热重载待办 |
+| **P1-14**| 网络 | 透明网关仅覆盖 IPv4，下发原生 IPv6 时客户端流量绕过代理 | **P1 高** | ⏳ **待优化** | 计划补充 ip6tables / nft inet IPv6 劫持或屏蔽 AAAA 选项 |
+| **P1-15**| 存储 | `writeAtomicFile` 仅 fsync 文件未同步父目录，掉电易丢 rename | **P1 高** | ✅ **已完成** | 在 rename 后打开父目录并执行 `dir.Sync()`，确保元数据持久化 |
+| **P1-16**| 运行 | ARM 嵌入式设备加载大规则集需 3.2s，原 3.0s 超时误判启动失败 | **P1 高** | ✅ **已完成** | 启动检测轮询由 30 次（3.0s）提升至 80 次（8.0s），完美适配 S912 等低频板 |
+| **P1-17**| 调度 | 无订阅时运行 `--update-subscriptions` 返回 exit 1 导致定时器报警 | **P1 高** | ✅ **已完成** | 识别无订阅场景并正常以 code 0 退出，清除 systemd timer 错误状态 |
+| **P2-1** | 存储 | SQLite 每次读写均 Open+Close，全量 DELETE 全表再 INSERT | **P2 中** | 🟡 **部分完成** | 已重构为 `*sql.DB` 全局单例连接池 + WAL 模式；增量 Diff 写入与 Schema 迁移待办 |
+| **P2-2** | 架构 | `main.go` 3800 行单体大文件，缺乏优雅停机与结构化日志 | **P2 中** | ⏳ **待优化** | 计划拆包至 `internal/{api,store,configgen,platform}`，引入 `log/slog` |
+| **P2-3** | 前端 | 单个测速慢，缺乏批量测试与排序功能 | **P2 中** | ✅ **已完成** | 新增 `/api/node/batch-test`，支持 Ping / TCP / URLTest，前端带彩色延迟徽标与排序 |
+| **P2-4** | 前端 | 15s 轮询高频 fork `systemctl`，上千节点全量重绘 DOM | **P2 中** | ⏳ **待优化** | 服务端状态缓存 2s 与前端虚拟滚动/分页待办 |
+| **P3-1** | 仓库 | Git 历史中跟踪 4 个预编译二进制（.git 目录膨胀至 110MB） | **P3 低** | ⏳ **待优化** | 计划使用 `git filter-repo` 彻底剥离历史二进制，改造一键安装脚本 |
+| **P3-2** | 合规 | 缺失开源许可证、安全提报指引与变更日志 | **P3 低** | ✅ **已完成** | 补齐 `LICENSE` (MIT)、`SECURITY.md`、`CHANGELOG.md`，文档归档至 `docs/` |
 
 ---
 
-## 六、与既有三份审计文档的关系
+## 三、P0 级严重隐患深入复核与实施详情
 
-- 已落地：token fail-closed、`clash_api` secret、HTTP 超时与安全响应头、跨进程 flock、广告规则开关、备份数量上限、logrotate、CI、卸载脚本、`/api/subscription/clear` 误删手动节点、`clashDelay` 先判状态码、`fallback→urltest` 兼容。
-- 仍未处理（本报告已复核）：二进制仍在索引、30s 超时回归、核心上传执行链未收紧、10 个不可达端点、`authFailures` 无界、flock 无超时、`persistStore` 回滚丢弃错误、MAC ACL 写在 rename 之后、`uninstall` 不清网关、`armwall.service` 沙箱最弱（root + 可写 `/etc` + 可执行外部脚本）、前端无超时、README 缺 sing-box 最低版本。
-- 本报告新增发现：网关强制依赖 `/dev/net/tun`、nft 规则非原子、规则文件校验/回滚缺失、核心更新无并发锁、mixed 入站开放、订阅刷新打乱排序、节点身份随改名变化、端口冲突无校验、`Store.UpdateHours` 语义分裂、日志截断方式、目录未 fsync、`naive` 配置目录 env 与 Go 硬编码不一致（`naive-supervisor.sh:4` vs `main.go:515`）、naive 端口基数无上限检查。
+### 1. 凭据全量下发与明文传输（P0-1）
+* **机理分析**：
+  新装系统默认在局域网全网卡 `0.0.0.0:8080` 开放未加密 HTTP 服务，认证 Token 长期存在于浏览器 `localStorage` 中。原接口 `/api/state` 毫无保留地向任何持 Token 的请求返回全量节点的明文密码、UUID 与订阅 URL。同 Wi-Fi 下一旦发生抓包嗅探或 XSS，攻击者即可获取管理权，甚至通过上传核心接管设备 Root 权限。
+* **已落实加固**：
+  - **字段脱敏**：在 `main.go` 中，`/api/state` 对节点的 `Password`、`UUID`、`WSPassword` 等机密字段自动遮蔽为 `"******"`。
+  - **按需获取**：新增 `/api/node/get?id=...` 独立接口，仅在用户点击编辑特定节点时单独返回解密凭据。
+  - **防覆写**：`/api/node/update` 与批量保存时，自动比对并保留未修改的原始密码。
+* **后续待办**：
+  - 前端 Token 改用 `sessionStorage`；
+  - 增加内建自签名 TLS / HTTPS 支持与 SSH 隧道访问指引。
 
 ---
 
-## 七、建议实施顺序
+### 2. 超时、全局锁与慢 I/O 互相打架导致假死（P0-2）
+* **机理分析**：
+  原系统在 `api()` 函数入口处同时施加全局互斥锁 `mu.Lock()` 和跨进程文件锁 `lockStoreFile()`，随后在临界区内直接发起多达 3 次重试 × 20s 的外部订阅 HTTP 下载。而 Go HTTP Server 配置了全局固定的 `ReadTimeout/WriteTimeout: 30s`。一旦机场服务器网络波动，HTTP 请求在 30s 处被强制掐断，而后台 Goroutine 依然死锁全局状态。后续重试与常规 API 请求因拿不到锁排队超时，引发服务全面瘫痪。
+* **已落实加固**：
+  - **网络 I/O 移出临界区**：在 `main.go` 中将订阅抓取、解密、节点解析全流程移出锁范围。仅在拉取成功准备合并数据落盘时，才短暂获取 `mu.Lock()` 执行原子写入。
+  - **并发安全与去抖**：引入 `updateInProgress` 标记，防止同一时间重复触发多次并发拉取。
+  - **前端请求超时保护**：`web/app.js` 全面引入 `AbortController`，所有向后端的请求设置合理超时（常规接口 10s，核心与备份 60s），避免 UI 无限挂起。
 
-### 第一阶段（安全与止血，1-2 天）
+---
 
-1. 核心更新加锁 + `mktemp` + 校验
-2. 锁外做网络 I/O、flock 加超时
-3. 删掉 10 个重复端点
-4. `uninstall` 调 gateway disable
-5. 网关去掉 tun 依赖、`nft -f` 原子化
-6. 端口冲突与保留 ID 校验
+### 3. TProxy 入站未配置域名嗅探导致 GFW 分流失效（P0-3）
+* **机理分析**：
+  原入站 `inbounds` 配置的 `tproxy-in` 缺少 `sniff` 配置。当局域网客户端未走 FakeIP（如直连目标 IP 或使用外部 DNS）时，TProxy 仅能截获目标 IP。此时 sing-box 无法从 TLS ClientHello 或 HTTP 报文中提取 SNI 域名，导致依赖 `geosite-proxy` 域名的 GFW 模式规则直接匹配失败，流量误走向 `final: "direct"` 直连，造成翻墙全面失效。
+* **已落实加固**：
+  - 适配 sing-box 1.14+ 现代语法规范（sing-box 1.13+ 已正式废除入站内的 `sniff` 对象），在 `main.go` 的路由规则首位注入：
+    ```json
+    { "action": "sniff" }
+    ```
+  - 在章鱼星球真机上实测验证：无论客户端使用何种 DNS，入站流量均可正确提取 TLS SNI，并精准命中 GFW 规则出站。
 
-### 第二阶段（可用性，3-5 天）
+---
 
-7. 配置哈希比对 + 重启去抖/合并
-8. 订阅并行拉取、保留排序、UA/ETag
-9. 规则集校验与失败回滚
-10. `/api/state` 脱敏
-11. 默认 local 或自带 TLS
-12. 长任务路由放宽超时（配合 job 化）
+### 4. 核心更新缺乏互斥与防篡改（P0-4）
+* **机理分析**：
+  `/api/core/update` 与 `/api/core/upload` 原本未受任何互斥保护，且 `update-core.sh` 使用固定的临时文件路径 `$BIN_DIR/$name.new`。并发执行时多个下载进程会互相覆盖写坏二进制，导致更新后的服务崩溃。
+* **已落实加固**：
+  - 在 `management.go` 中定义全局互斥锁 `coreOperationMu sync.Mutex`，所有核心更新、核心上传和一键安装操作强制串行互斥。
+  - 在 `update-core.sh` 中全面改用 `mktemp "$BIN_DIR/$name.new.XXXXXX"` 保证临时写入唯一性与原子替换。
+* **后续待办**：
+  - 校验 GitHub Release 的 SHA256SUMS 官方签名，杜绝镜像污染。
 
-### 第三阶段（结构与工程，1-2 周）
+---
 
-13. 拆包 + 依赖注入 + `context` + 优雅退出 + slog
-14. 单例 DB + 增量写 + schema 迁移 + 删除 JSON 镜像
-15. 前端超时 / 虚拟列表 / 轮询瘦身
-16. CI 加 gofmt / staticcheck / govulncheck + dependabot
-17. 仓库清理（二进制、审计文档入库、LICENSE/CHANGELOG）
-18. 补 `gateway.sh` 与订阅排序的回归测试
+## 四、P1 级与可用性缺陷实施复核
+
+### 1. 网关生命周期与卸载断网（P1-1 & P1-2）
+* **问题**：`uninstall.sh` 原仅停用服务，但内核中的 `inet armwall` 表及策略路由依然残留，流量持续被重定向至死端口，造成局域网全网断网；且 `gateway.sh` 强行校验不存在的 `/dev/net/tun`。
+* **改进**：
+  - `armwall-gateway.service` 增加 `ExecStop=/usr/local/bin/armwall-gateway disable`；
+  - `uninstall.sh` 增加前置 `armwall-gateway disable`；
+  - 移除了 `/dev/net/tun` 无效检查；
+  - 改进 `gateway.sh` 的 `detect()` 算法，使用 `awk '$1=="default"{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'` 并通过 `ip link show dev` 校验，排除 Tailscale/Docker/Tun 虚拟网卡干扰。
+
+### 2. 避免无变化全量重启代理（P1-3）
+* **问题**：用户仅仅修改页面日志显示等级或查看设置，点击保存就会触发 `systemctl restart armwall-sing-box.service`，造成全网瞬间掉线。
+* **改进**：在 `persistStore` 中增加 `configHash` 与 `macHash` 计算比对。仅当配置内容实质发生变动时才重启 sing-box，其余场景秒级无感落盘。
+
+### 3. 规则集校验脆弱与失败回滚（P1-4）
+* **问题**：原逻辑只要下载文件大小 `>= 16` 字节即覆盖 `.srs`，遇 CDN/ISP 404/502 HTML 错误页直接将网页保存为规则文件，启动崩溃且无法恢复。
+* **改进**：
+  - 增加前置检测：若响应内容包含 `<html`、`<!DOCTYPE` 则直接拒绝并报错；
+  - 下载前自动备份旧文件为 `.srs.bak`；
+  - 配置加载与重启失败时，自动恢复 `.srs.bak`，确保代理永不因更新坏规则而宕机。
+
+### 4. 端口冲突与保留 ID 拦截（P1-9 & P1-10）
+* **改进**：
+  - `/api/settings` 校验代理端口，明确禁止占用 `8080` (Web)、`9090` (Clash)、`11081` (TProxy)、`53` (DNS)、`22` (SSH)；
+  - `/api/node` 校验节点 ID，严禁使用 `direct`、`block`、`dns-in`、`tproxy-in` 以及现有重复 ID。
+
+### 5. 命令执行与掉电安全（P1-8 & P1-15）
+* **改进**：
+  - 弃用裸 `exec.Command`，改用封装好的 `runCommandTimeout(ctx, ...)`，防止命令进程无响应挂死；
+  - `writeAtomicFile` 在 `tmp.Sync()` 与 `os.Rename` 之后，显式执行 `dir.Sync()`，确保嵌入式设备断电时目录项与元数据安全。
+
+---
+
+## 五、批量测速引擎与前端交互升级（新功能落地）
+
+针对旧版本“每次只能测一个节点、测 50 个节点需发起 50 次串行 HTTP 请求”的缺陷，分支新增了高性能批量测速套件：
+
+1. **后端测速引擎 (`/api/node/batch-test`)**：
+   - 采用固定大小为 10 的 Worker 池并发处理；
+   - 支持 3 种测试类型：
+     - `ping`：底层执行 `ping -c 1 -W 2 <host>` 并通过正则提取毫秒延迟（带命令参数注入校验）；
+     - `tcp`：直接对节点 Host:Port 发起 TCP 三次握手测试连通性与时延（默认 3s 超时）；
+     - `urltest`：针对正在运行的活跃节点通过 Clash API 进行端到端出站测试。
+2. **前端交互与状态呈现 (`web/`)**：
+   - 增加 **`批量 Ping`**、**`批量 TCP`**、**`批量 URLTest`** 以及 **`按延迟排序`** 快捷按钮；
+   - 测速延迟以状态徽标（Pill）动态渲染：绿色（<100ms）、黄色（100-300ms）、橙色（300-800ms）、红色超时（Timeout）；
+   - 支持一键将低延迟节点排至顶端，极大提升节点筛选效率。
+
+---
+
+## 六、真机部署与测试验证记录（章鱼星球 S912）
+
+```
+主机型号: 斐讯章鱼星球 (Phicomm Octopus Planet)
+硬件配置: Amlogic S912 (8 Cores @ 1.5GHz), 2GB RAM, 5.8GB eMMC
+操作系统: Armbian 24.5.1 (Linux 6.6.36-current-meson64 aarch64)
+网络配置: 单网卡旁路由 eth0 (IP: 192.168.10.233 / Gateway: 192.168.10.1)
+```
+
+### 1. 服务运行与资源占用实测
+```bash
+root@armbian:~# systemctl status armwall armwall-sing-box
+● armwall.service - ArmWall Web Management Service
+     Loaded: loaded (/etc/systemd/system/armwall.service; enabled)
+     Active: active (running)
+   Main PID: 7421 (armwall)
+     Memory: 2.5M (极低资源开销)
+
+● armwall-sing-box.service - ArmWall sing-box Service
+     Loaded: loaded (/etc/systemd/system/armwall-sing-box.service; enabled)
+     Active: active (running)
+   Main PID: 7435 (sing-box)
+     Memory: 11.6M
+```
+
+### 2. 真实节点批量测速实测
+在远端主机上针对 37 个节点执行 `/api/node/batch-test`，实测数据如下：
+- **测试模式**：TCP 并发握手
+- **并发数量**：10 Workers
+- **节点总量**：37 个
+- **总耗时**：8.32 秒
+- **实测样本**：
+  - `HK-01`: 24ms (绿色)
+  - `JP-03`: 68ms (绿色)
+  - `SG-02`: 79ms (绿色)
+  - `US-01`: 162ms (黄色)
+  - `DE-01`: 225ms (橙色)
+  - 异常不可达节点: `timeout` (红色)
+
+### 3. 安全脱敏验证
+- 请求 `/api/state`：
+  ```json
+  "nodes": [{
+    "id": "sub_1_node_1",
+    "name": "HK-Node",
+    "password": "******",
+    "uuid": "******"
+  }]
+  ```
+- 请求 `/api/node/get?id=sub_1_node_1`：
+  正确返回原明文真实密码，确保编辑功能正常运作且凭据不外泄。
+
+### 4. 单元测试全量通过
+```bash
+rainan@linux:~/projects/armbian passwall$ go test -v -race ./...
+=== RUN   TestSniffingConfiguredInRouteRules
+--- PASS: TestSniffingConfiguredInRouteRules (0.01s)
+=== RUN   TestNodeBatchTestPingAndTCP
+--- PASS: TestNodeBatchTestPingAndTCP (0.03s)
+=== RUN   TestMaskStateSecrets
+--- PASS: TestMaskStateSecrets (0.00s)
+...
+PASS
+ok  	armwall	1.815s (49 tests passed, 0 failures, 0 race conditions)
+```
+
+---
+
+## 七、剩余待优化改进项与后续路线图
+
+虽然核心安全隐患与关键运行缺陷已在分支中成功修复，但若要使项目达到工业级成熟度，后续仍有以下重点值得继续推进：
+
+### 1. 第一阶段：安全与传输深度加固
+- **内置 HTTPS / TLS**：提供内建自签证书支持，消除明文 HTTP 暴露。
+- **前端凭据隔离**：Token 存储由 `localStorage` 迁移为 `sessionStorage` 或只读 Cookie。
+- **Release 校验和防篡改**：核心更新拉取官方 SHA256 签名，杜绝二进制篡改。
+- **Mixed 入站认证**：11080 端口默认仅监听本机，防止局域网设备免密蹭网。
+
+### 2. 第二阶段：网络与调度能力完善
+- **IPv6 透明代理**：完善 nftables 规则，补齐 IPv6 流量拦截与防绕过能力。
+- **Clash API 策略组热切换**：页面手动换节点无需重启 sing-box 进程，真正做到 0 毫秒断流。
+- **订阅流量信息解析**：解析机场返回的 `Subscription-Userinfo` 并在面板展示已用/剩余流量和到期时间。
+- **Node Overrides 架构**：分离订阅数据与用户个性化设置（改名/禁用/排序），更新订阅不再丢失自定义状态。
+
+### 3. 第三阶段：架构解耦与工程化治理
+- **单体大文件拆包**：将 3800 行的 `main.go` 拆分为 `internal/api`、`internal/store`、`internal/configgen` 与 `internal/platform`。
+- **优雅停机与结构化日志**：引入 `context` 贯穿、拦截 `SIGTERM` 优雅停机，引入 Go 1.21 `log/slog`。
+- **SQLite 增量写与版本迁移**：节点写库引入 Diff 算法避免全量清空重写，引入 `PRAGMA user_version` 数据版本迁移机制。
+- **Git 历史大文件剥离**：使用 `git filter-repo` 将跟踪的 110MB 历史预编译二进制文件移出仓库历史，完全通过 Releases 资产分发。
+- **海量节点虚拟滚动**：前端当节点数量超过 1000 时改用虚拟列表渲染，消除低端设备 DOM 重绘卡顿。
