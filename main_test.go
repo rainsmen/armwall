@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1120,5 +1122,83 @@ func TestNodeTestRejectsFlagInjection(t *testing.T) {
 	recorder := callAPI(t, "/api/node/test?id=n1&method=ping", "")
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for flag-injected host, got %d", recorder.Code)
+	}
+}
+
+func TestBatchNodeTestAndCredentialMasking(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	setupAPITest(t, Store{
+		Mode:      "global",
+		ProxyPort: 11080,
+		Nodes: []Node{
+			{ID: "node-1", Name: "Local Test", Type: "shadowsocks", Server: "127.0.0.1", Port: port, Password: "supersecretpassword", Method: "aes-128-gcm", Enabled: true},
+			{ID: "node-2", Name: "Bad Node", Type: "shadowsocks", Server: "127.0.0.1", Port: 1, Password: "anotherpassword", Method: "aes-128-gcm", Enabled: true},
+		},
+	})
+
+	recorder := callAPI(t, "/api/state", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("state status=%d", recorder.Code)
+	}
+	var state Store
+	if err := json.Unmarshal(recorder.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Nodes) != 2 || state.Nodes[0].Password != "******" || state.Nodes[1].Password != "******" {
+		t.Fatalf("expected masked password '******', got: %+v", state.Nodes)
+	}
+
+	recorder = callAPI(t, "/api/node/get?id=node-1", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("node/get status=%d", recorder.Code)
+	}
+	var node1 Node
+	if err := json.Unmarshal(recorder.Body.Bytes(), &node1); err != nil {
+		t.Fatal(err)
+	}
+	if node1.Password != "supersecretpassword" {
+		t.Fatalf("expected unmasked password, got %s", node1.Password)
+	}
+
+	recorder = callAPI(t, "/api/node/batch-test", `{"ids":["node-1","node-2"],"method":"tcp"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("batch-test status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var batchResp struct {
+		Method  string `json:"method"`
+		Results map[string]struct {
+			MS    int64  `json:"ms"`
+			Error string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &batchResp); err != nil {
+		t.Fatal(err)
+	}
+	if batchResp.Method != "tcp" {
+		t.Fatalf("unexpected method: %s", batchResp.Method)
+	}
+	res1, ok1 := batchResp.Results["node-1"]
+	if !ok1 || res1.MS < 0 || res1.Error != "" {
+		t.Fatalf("expected node-1 to succeed: %+v", res1)
+	}
+	res2, ok2 := batchResp.Results["node-2"]
+	if !ok2 || res2.MS != -1 || res2.Error == "" {
+		t.Fatalf("expected node-2 to fail: %+v", res2)
+	}
+
+	recorder = callAPI(t, "/api/node/update", fmt.Sprintf(`{"id":"node-1","name":"Renamed Node","type":"shadowsocks","server":"127.0.0.1","port":%d,"password":"******","method":"aes-128-gcm"}`, port))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("node/update status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	saved := load()
+	if saved.Nodes[0].Password != "supersecretpassword" || saved.Nodes[0].Name != "Renamed Node" {
+		t.Fatalf("expected preserved password, got: %+v", saved.Nodes[0])
 	}
 }

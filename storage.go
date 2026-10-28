@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -23,7 +24,22 @@ type Subscription struct {
 
 var dbPath = "/var/lib/armwall/armwall.db"
 
+var (
+	dbInstance     *sql.DB
+	dbInstanceMu   sync.Mutex
+	dbInstancePath string
+)
+
 func openDB() (*sql.DB, error) {
+	dbInstanceMu.Lock()
+	defer dbInstanceMu.Unlock()
+	if dbInstance != nil && dbInstancePath == dbPath {
+		return dbInstance, nil
+	}
+	if dbInstance != nil {
+		_ = dbInstance.Close()
+		dbInstance = nil
+	}
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0750); err != nil {
 		return nil, err
 	}
@@ -31,16 +47,29 @@ func openDB() (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	_, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, update_hours INTEGER NOT NULL DEFAULT 6, enabled INTEGER NOT NULL DEFAULT 1, last_updated TEXT);
 CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, subscription_id TEXT, group_name TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL);`)
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	_, _ = db.Exec(`UPDATE nodes SET group_name = COALESCE((SELECT name FROM subscriptions WHERE subscriptions.id = nodes.subscription_id), '') WHERE group_name = '' AND subscription_id <> ''`)
-	return db, nil
+	dbInstance = db
+	dbInstancePath = dbPath
+	return dbInstance, nil
+}
+
+func closeDB() {
+	dbInstanceMu.Lock()
+	defer dbInstanceMu.Unlock()
+	if dbInstance != nil {
+		_ = dbInstance.Close()
+		dbInstance = nil
+		dbInstancePath = ""
+	}
 }
 
 func loadJSON() Store {
@@ -67,7 +96,6 @@ func loadDB() (Store, error) {
 	if err != nil {
 		return Store{}, err
 	}
-	defer db.Close()
 	s := Store{Mode: "bypass_cn"}
 	rows, err := db.Query("SELECT key,value FROM settings")
 	if err != nil {
@@ -194,7 +222,6 @@ func saveDB(s Store) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	tx, err := db.Begin()
 	if err != nil {
 		return err

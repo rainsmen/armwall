@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -286,7 +285,7 @@ func handleCoreUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or oversized core file", http.StatusBadRequest)
 		return
 	}
-	out, err := exec.Command(updateCorePath, core, "manual", tmpPath).CombinedOutput()
+	out, err := runCommandTimeout(60*time.Second, updateCorePath, core, "manual", tmpPath)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	if err != nil {
 		http.Error(w, strings.TrimSpace(string(out)), http.StatusInternalServerError)

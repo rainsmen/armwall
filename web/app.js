@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
 
-let token = localStorage.armwallToken || "";
+let token = sessionStorage.armwallToken || localStorage.armwallToken || "";
 let appState = { nodes: [], subscriptions: [] };
 const nodeTests = new Map();
 const strategyRuntime = new Map();
@@ -39,12 +39,33 @@ async function request(path, options = {}, text = false, retry = true) {
     headers.set("Content-Type", "application/json");
     options.body = JSON.stringify(options.body);
   }
-  const response = await fetch(path, { ...options, headers });
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs || 30000;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers, signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error("请求超时，请检查网络或稍后重试");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (response.status === 401 && retry) {
     token = window.prompt("请输入 ArmWall 管理 Token") || "";
-    if (token) localStorage.armwallToken = token;
-    else localStorage.removeItem("armwallToken");
+    if (token) {
+      sessionStorage.armwallToken = token;
+      localStorage.armwallToken = token;
+    } else {
+      sessionStorage.removeItem("armwallToken");
+      localStorage.removeItem("armwallToken");
+    }
     return request(path, options, text, false);
+  }
+  if (response.status === 429) {
+    throw new Error("请求过于频繁，请稍候再试 (HTTP 429)");
   }
   if (!response.ok) {
     const message =
@@ -216,13 +237,16 @@ function renderNodes() {
       const group = node.group || "未分组";
       const result = nodeTests.get(node.id);
       const measured = result && !result.error ? delayValue(result) : null;
-      const delay = result
-        ? result.error
-          ? "失败"
-          : measured === null
-            ? "-"
-            : `${measured}ms`
-        : "-";
+      let delay = "-";
+      if (result) {
+        if (result.error) {
+          delay = `<span class="pill red" title="${escapeHTML(result.message || "测试超时或失败")}">失败</span>`;
+        } else if (measured !== null) {
+          const color = measured < 150 ? "green" : measured < 350 ? "yellow" : "red";
+          const methodLabel = result.method ? result.method.toUpperCase() + ": " : "";
+          delay = `<span class="pill ${color}">${methodLabel}${measured}ms</span>`;
+        }
+      }
       const selected =
         node.id === appState.selected_node
           ? '<span class="pill green">当前</span>'
@@ -234,7 +258,7 @@ function renderNodes() {
       <td><div>${escapeHTML(group)}</div><div class="node-server">${escapeHTML(source?.name || "手动节点")}</div></td>
       <td><div>${escapeHTML(node.server || "-")}</div><div class="node-server">端口 ${escapeHTML(node.port || "-")}</div></td>
       <td><button class="small-btn" data-action="toggle-node" data-id="${escapeHTML(node.id)}">${node.enabled ? "已启用" : "已停用"}</button></td>
-      <td class="delay">${escapeHTML(delay)}</td>
+      <td class="delay">${delay}</td>
       <td><div class="row-actions"><button class="small-btn" data-action="test-node" data-method="ping" data-id="${escapeHTML(node.id)}">Ping</button><button class="small-btn" data-action="test-node" data-method="tcp" data-id="${escapeHTML(node.id)}">TCP</button><button class="small-btn" data-action="test-node" data-method="urltest" data-id="${escapeHTML(node.id)}">URLTest</button><button class="small-btn" data-action="edit-node" data-id="${escapeHTML(node.id)}">编辑</button><button class="small-btn" data-action="copy-node" data-id="${escapeHTML(node.id)}">复制</button><button class="small-btn" data-action="move-node" data-direction="-1" data-id="${escapeHTML(node.id)}">上移</button><button class="small-btn" data-action="move-node" data-direction="1" data-id="${escapeHTML(node.id)}">下移</button><button class="small-btn danger" data-action="delete-node" data-id="${escapeHTML(node.id)}">删除</button></div></td>
     </tr>`;
     })
@@ -443,7 +467,7 @@ function updateNodeFields() {
   });
 }
 
-function openNodeEditor(node = null) {
+async function openNodeEditor(node = null) {
   $("nodeEditor").hidden = false;
   $("linkImporter").hidden = true;
   $("nodeEditorTitle").textContent = node ? "编辑节点" : "添加节点";
@@ -480,6 +504,17 @@ function openNodeEditor(node = null) {
   $("nodeEnabled").checked = node ? Boolean(node.enabled) : true;
   updateNodeFields();
   $("nodeEditor").scrollIntoView({ behavior: "smooth", block: "start" });
+
+  if (node && (node.password === "******" || node.uuid === "******" || node.obfs_password === "******")) {
+    try {
+      const real = await request(`/api/node/get?id=${encodeURIComponent(node.id)}`);
+      if (real && $("nodeId").value === node.id) {
+        if (real.password) $("nodePassword").value = real.password;
+        if (real.uuid) $("nodeUUID").value = real.uuid;
+        if (real.obfs_password) $("nodeObfsPassword").value = real.obfs_password;
+      }
+    } catch (_) {}
+  }
 }
 
 function closeNodeEditor() {
@@ -748,6 +783,59 @@ async function testNode(id, method, button) {
   }
 }
 
+async function batchTestNodes(method, button) {
+  let ids = selectedNodeIDs();
+  if (!ids.length) {
+    ids = filteredNodes().map((n) => n.id);
+  }
+  if (!ids.length) {
+    throw new Error("没有可测试的节点");
+  }
+  const old = button.textContent;
+  button.disabled = true;
+  button.textContent = `测试中 (${ids.length})...`;
+  try {
+    toast(`正在批量 ${method.toUpperCase()} 测试 ${ids.length} 个节点...`);
+    const data = await request("/api/node/batch-test", {
+      method: "POST",
+      body: { ids, method },
+      timeoutMs: 60000,
+    });
+    if (data && data.results) {
+      let okCount = 0;
+      for (const [id, res] of Object.entries(data.results)) {
+        if (res.error || res.ms < 0) {
+          nodeTests.set(id, { error: true, method, message: res.error });
+        } else {
+          okCount++;
+          nodeTests.set(id, { ms: res.ms, method });
+        }
+      }
+      renderNodes();
+      toast(`批量 ${method.toUpperCase()} 完成：${okCount}/${ids.length} 成功`);
+    }
+  } catch (err) {
+    toast(`批量测试失败: ${err.message}`, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = old;
+  }
+}
+
+let delaySortAsc = true;
+function sortNodesByDelay() {
+  delaySortAsc = !delaySortAsc;
+  appState.nodes.sort((a, b) => {
+    const resA = nodeTests.get(a.id);
+    const resB = nodeTests.get(b.id);
+    const msA = resA && !resA.error && typeof resA.ms === "number" ? resA.ms : 999999;
+    const msB = resB && !resB.error && typeof resB.ms === "number" ? resB.ms : 999999;
+    return delaySortAsc ? msA - msB : msB - msA;
+  });
+  renderNodes();
+  toast(delaySortAsc ? "已按延迟由低到高排序" : "已按延迟由高到低排序");
+}
+
 async function testSite(site, card) {
   const result = card.querySelector(".test-result");
   card.setAttribute("aria-busy", "true");
@@ -930,6 +1018,8 @@ async function handleAction(button) {
       toast("节点已删除");
       await loadState(false);
     } else if (action === "test-node") await testNode(id, method, button);
+    else if (action === "batch-test") await batchTestNodes(method || "tcp", button);
+    else if (action === "sort-nodes-delay") sortNodesByDelay();
     else if (action === "move-node") {
       const visibleIDs = filteredNodes().map((node) => node.id);
       const visibleFrom = visibleIDs.indexOf(id);

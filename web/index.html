@@ -126,6 +126,10 @@
               </select>
             </div>
             <div class="toolbar">
+              <button class="btn secondary" data-action="batch-test" data-method="ping" title="对选中节点（未选则为全部）测试 Ping 延迟">批量 Ping</button>
+              <button class="btn secondary" data-action="batch-test" data-method="tcp" title="对选中节点（未选则为全部）测试 TCP 握手延迟">批量 TCP</button>
+              <button class="btn secondary" data-action="batch-test" data-method="urltest" title="对选中节点（未选则为全部）测试经由节点访问目标站点的实际网络延迟">批量 URLTest</button>
+              <button class="btn secondary" data-action="sort-nodes-delay" title="按延迟由低到高/由高到低排序">按延迟排序</button>
               <button class="btn secondary" data-action="batch-enable">
                 启用选中</button
               ><button class="btn secondary" data-action="batch-disable">
@@ -152,7 +156,7 @@
                     <th>分组 / 来源</th>
                     <th>服务器</th>
                     <th>状态</th>
-                    <th>延迟</th>
+                    <th class="delay" style="cursor:pointer;" title="点击按延迟排序" data-action="sort-nodes-delay">延迟 ⬍</th>
                     <th>操作</th>
                   </tr>
                 </thead>

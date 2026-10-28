@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -410,6 +411,7 @@ func reconcileSubscriptionNodes(existing, fetched []Node, sub Subscription) []No
 		if matches := previous[key]; len(matches) > 0 {
 			fetched[i].ID = matches[0].ID
 			fetched[i].Enabled = matches[0].Enabled
+			fetched[i].SortOrder = matches[0].SortOrder
 			previous[key] = matches[1:]
 			continue
 		}
@@ -435,78 +437,127 @@ func subscriptionDue(sub Subscription, now time.Time) bool {
 }
 
 func updateSubscriptionsWithForce(force bool) error {
-	return withStoreFileLock(func() error {
-		return updateSubscriptionsWithForceLocked(force)
-	})
-}
-
-func updateSubscriptionsWithForceLocked(force bool) error {
 	s, err := loadStore()
 	if err != nil {
 		return err
 	}
-	wasRunning := proxyRunningFn()
-	if len(s.Subscriptions) == 0 {
-		s = migrateLegacy(s)
-	}
-	fetchedBySub := map[string][]Node{}
-	errors := make([]string, 0)
-	now := time.Now()
-	for i := range s.Subscriptions {
-		sub := &s.Subscriptions[i]
-		if !sub.Enabled {
-			continue
-		}
-		if !force && !subscriptionDue(*sub, now) {
-			continue
-		}
-		fetched, err := fetchSubscriptionFn(sub.URL)
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("%s: %v", sub.Name, err))
-			continue
-		}
-		fetched = reconcileSubscriptionNodes(s.Nodes, fetched, *sub)
-		fetchedBySub[sub.ID] = fetched
-		sub.LastUpdated = now
-	}
 	if len(s.Subscriptions) == 0 {
 		return errNoSubscriptions
 	}
-	if len(fetchedBySub) == 0 {
-		if len(errors) > 0 {
-			return fmt.Errorf("%s", strings.Join(errors, "; "))
+	now := time.Now()
+	var subsToFetch []Subscription
+	for _, sub := range s.Subscriptions {
+		if !sub.Enabled {
+			continue
 		}
+		if force || subscriptionDue(sub, now) {
+			subsToFetch = append(subsToFetch, sub)
+		}
+	}
+	if len(subsToFetch) == 0 {
 		return nil
 	}
-	kept := make([]Node, 0, len(s.Nodes))
-	for _, n := range s.Nodes {
-		if _, ok := fetchedBySub[n.SubscriptionID]; !ok {
-			kept = append(kept, n)
+
+	type fetchRes struct {
+		subID string
+		nodes []Node
+		err   error
+	}
+	results := make([]fetchRes, len(subsToFetch))
+	var wg sync.WaitGroup
+	for i, sub := range subsToFetch {
+		wg.Add(1)
+		go func(idx int, targetSub Subscription) {
+			defer wg.Done()
+			nodes, fetchErr := fetchSubscriptionFn(targetSub.URL)
+			results[idx] = fetchRes{subID: targetSub.ID, nodes: nodes, err: fetchErr}
+		}(i, sub)
+	}
+	wg.Wait()
+
+	return withStoreFileLock(func() error {
+		cur, loadErr := loadStore()
+		if loadErr != nil {
+			return loadErr
 		}
-	}
-	for _, sub := range s.Subscriptions {
-		kept = append(kept, fetchedBySub[sub.ID]...)
-	}
-	s.Nodes = kept
-	s.SubscriptionURLs = nil
-	for _, sub := range s.Subscriptions {
-		s.SubscriptionURLs = append(s.SubscriptionURLs, sub.URL)
-	}
-	if err := writeConfig(s); err != nil {
-		return err
-	}
-	if err := save(s); err != nil {
-		return err
-	}
-	if wasRunning {
-		if err := restartProxyFn(); err != nil {
+		wasRunning := proxyRunningFn()
+		fetchedBySub := map[string][]Node{}
+		var errs []string
+		for _, res := range results {
+			var sub Subscription
+			for _, item := range cur.Subscriptions {
+				if item.ID == res.subID {
+					sub = item
+					break
+				}
+			}
+			if res.err != nil {
+				name := sub.Name
+				if name == "" {
+					name = res.subID
+				}
+				errs = append(errs, fmt.Sprintf("%s: %v", name, res.err))
+				continue
+			}
+			nodes := reconcileSubscriptionNodes(cur.Nodes, res.nodes, sub)
+			fetchedBySub[res.subID] = nodes
+			for j := range cur.Subscriptions {
+				if cur.Subscriptions[j].ID == res.subID {
+					cur.Subscriptions[j].LastUpdated = now
+					break
+				}
+			}
+		}
+		if len(fetchedBySub) == 0 {
+			if len(errs) > 0 {
+				return fmt.Errorf("%s", strings.Join(errs, "; "))
+			}
+			return nil
+		}
+		newNodes := make([]Node, 0, len(cur.Nodes))
+		insertedSubs := make(map[string]bool)
+		for _, n := range cur.Nodes {
+			subNodes, isUpdated := fetchedBySub[n.SubscriptionID]
+			if !isUpdated {
+				newNodes = append(newNodes, n)
+				continue
+			}
+			if !insertedSubs[n.SubscriptionID] {
+				newNodes = append(newNodes, subNodes...)
+				insertedSubs[n.SubscriptionID] = true
+			}
+		}
+		for _, sub := range cur.Subscriptions {
+			if !insertedSubs[sub.ID] && len(fetchedBySub[sub.ID]) > 0 {
+				newNodes = append(newNodes, fetchedBySub[sub.ID]...)
+				insertedSubs[sub.ID] = true
+			}
+		}
+		cur.Nodes = newNodes
+		cur.SubscriptionURLs = nil
+		for _, sub := range cur.Subscriptions {
+			cur.SubscriptionURLs = append(cur.SubscriptionURLs, sub.URL)
+		}
+		if err := writeConfig(cur); err != nil {
 			return err
 		}
-	}
-	if len(errors) > 0 {
-		return fmt.Errorf("%s", strings.Join(errors, "; "))
-	}
-	return nil
+		if err := save(cur); err != nil {
+			return err
+		}
+		if wasRunning {
+			if err := restartProxyFn(); err != nil {
+				return err
+			}
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		return nil
+	})
+}
+
+func updateSubscriptionsWithForceLocked(force bool) error {
+	return updateSubscriptionsWithForce(force)
 }
 
 var mu sync.Mutex
@@ -921,13 +972,7 @@ func load() Store {
 	return s
 }
 func save(s Store) error {
-	if err := saveDB(s); err != nil {
-		return err
-	}
-	if err := saveJSON(s); err != nil {
-		log.Printf("SQLite store saved but legacy JSON mirror could not be updated: %v", err)
-	}
-	return nil
+	return saveDB(s)
 }
 
 func normalizeStore(s *Store) {
@@ -1050,7 +1095,7 @@ func reloadGatewayIfActive() error {
 	} else if err != nil {
 		return err
 	}
-	out, err := exec.Command(gatewayPath, "reload").CombinedOutput()
+	out, err := runCommandTimeout(5*time.Second, gatewayPath, "reload")
 	if err != nil {
 		return fmt.Errorf("transparent gateway reload failed: %s", strings.TrimSpace(string(out)))
 	}
@@ -1060,7 +1105,9 @@ func reloadGatewayIfActive() error {
 var reloadGatewayFn = reloadGatewayIfActive
 
 func proxyRunning() bool {
-	return exec.Command("systemctl", "is-active", "--quiet", "armwall-sing-box.service").Run() == nil
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", "armwall-sing-box.service").Run() == nil
 }
 
 var proxyRunningFn = proxyRunning
@@ -1771,7 +1818,11 @@ func config(s Store) map[string]any {
 	if s.ProxyPort > 0 {
 		listenPort = s.ProxyPort
 	}
-	inbounds := []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": listenPort}}
+	mixedListen := "0.0.0.0"
+	if addr := os.Getenv("ARMWALL_PROXY_LISTEN"); addr != "" {
+		mixedListen = addr
+	}
+	inbounds := []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": mixedListen, "listen_port": listenPort}}
 	if s.DNS.Enabled {
 		inbounds = append(inbounds, map[string]any{"type": "direct", "tag": "dns-in", "listen": s.DNS.ListenAddress, "listen_port": s.DNS.ListenPort})
 	}
@@ -1857,7 +1908,7 @@ func writeConfig(s Store) error {
 	}
 	checker, lookErr := exec.LookPath("sing-box")
 	if lookErr == nil {
-		out, err := exec.Command(checker, "check", "-c", candidate).CombinedOutput()
+		out, err := runCommandTimeout(5*time.Second, checker, "check", "-c", candidate)
 		if err != nil {
 			return fmt.Errorf("invalid sing-box config: %s", strings.TrimSpace(string(out)))
 		}
@@ -1874,9 +1925,15 @@ func writeConfig(s Store) error {
 	candidate = ""
 	return nil
 }
+
+func runCommandTimeout(timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
 func run(w http.ResponseWriter, name string, args ...string) {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := runCommandTimeout(10*time.Second, name, args...)
 	if err != nil {
 		http.Error(w, string(out), 500)
 		return
@@ -1888,7 +1945,9 @@ func run(w http.ResponseWriter, name string, args ...string) {
 func runCoreUpdate(w http.ResponseWriter, args ...string) {
 	coreOperationMu.Lock()
 	defer coreOperationMu.Unlock()
-	cmd := exec.Command(updateCorePath, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, updateCorePath, args...)
 	mu.Lock()
 	port := proxyPort
 	mu.Unlock()
@@ -1911,6 +1970,50 @@ func loadAPIStoreSnapshot() (Store, error) {
 	return loadStore()
 }
 
+func runSingleNodeTest(n Node, method, customURL string) (int64, error) {
+	host := strings.TrimSpace(n.Server)
+	if host == "" {
+		return 0, fmt.Errorf("empty host")
+	}
+	start := time.Now()
+	switch method {
+	case "ping":
+		if strings.HasPrefix(host, "-") {
+			return 0, fmt.Errorf("invalid host")
+		}
+		out, err := runCommandTimeout(3*time.Second, "ping", "-c", "1", "-W", "2", host)
+		if err != nil {
+			return 0, fmt.Errorf("ping failed: %s", strings.TrimSpace(string(out)))
+		}
+		return time.Since(start).Milliseconds(), nil
+	case "tcp":
+		port := n.Port
+		if port <= 0 || port > 65535 {
+			return 0, fmt.Errorf("invalid port %d", port)
+		}
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
+		d := net.Dialer{Timeout: 3 * time.Second}
+		conn, err := d.Dial("tcp", addr)
+		if err != nil {
+			return 0, err
+		}
+		_ = conn.Close()
+		return time.Since(start).Milliseconds(), nil
+	case "urltest":
+		targetURL := customURL
+		if targetURL == "" {
+			targetURL = "https://www.gstatic.com/generate_204"
+		}
+		delay, err := clashDelay(n.ID, targetURL)
+		if err != nil {
+			return 0, err
+		}
+		return delay, nil
+	default:
+		return 0, fmt.Errorf("invalid method")
+	}
+}
+
 // handleUnlockedAPI handles read-only and externally slow endpoints before the
 // write mutex is acquired. Store snapshots are still protected by the
 // cross-process file lock, while network, systemctl, and core-update I/O do
@@ -1923,7 +2026,33 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return true
 		}
+		for i := range s.Nodes {
+			if s.Nodes[i].Password != "" {
+				s.Nodes[i].Password = "******"
+			}
+			if s.Nodes[i].UUID != "" {
+				s.Nodes[i].UUID = "******"
+			}
+			if s.Nodes[i].ObfsPassword != "" {
+				s.Nodes[i].ObfsPassword = "******"
+			}
+		}
 		json.NewEncoder(w).Encode(s)
+		return true
+	case "/api/node/get":
+		id := r.URL.Query().Get("id")
+		s, err := loadAPIStoreSnapshot()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return true
+		}
+		for _, n := range s.Nodes {
+			if n.ID == id {
+				json.NewEncoder(w).Encode(n)
+				return true
+			}
+		}
+		http.Error(w, "node not found", http.StatusNotFound)
 		return true
 	case "/api/strategy/status":
 		if r.Method != http.MethodGet {
@@ -2040,7 +2169,11 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
 			return true
 		}
-		var v struct{ ID string }
+		var v struct {
+			ID     string `json:"id"`
+			Method string `json:"method"`
+			URL    string `json:"url"`
+		}
 		if err := decodeOptionalJSONBody(r, &v); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return true
@@ -2048,55 +2181,206 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 		if v.ID == "" {
 			v.ID = r.URL.Query().Get("id")
 		}
+		if v.Method == "" {
+			v.Method = r.URL.Query().Get("method")
+		}
 		s, err := loadAPIStoreSnapshot()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return true
 		}
-		var host, tag string
-		var port int
-		for _, n := range s.Nodes {
-			if n.ID == v.ID {
-				host, tag, port = n.Server, n.ID, n.Port
+		var target *Node
+		for i := range s.Nodes {
+			if s.Nodes[i].ID == v.ID {
+				target = &s.Nodes[i]
 				break
 			}
 		}
-		if host == "" {
+		if target == nil {
 			http.Error(w, "node not found", http.StatusNotFound)
 			return true
 		}
-		method := r.URL.Query().Get("method")
-		start := time.Now()
-		switch method {
-		case "ping":
-			if strings.HasPrefix(host, "-") {
-				http.Error(w, "invalid host", http.StatusBadRequest)
-				return true
-			}
-			out, err := exec.Command("ping", "-c", "1", "-W", "3", host).CombinedOutput()
-			if err != nil {
-				http.Error(w, string(out), http.StatusBadGateway)
-				return true
-			}
-			json.NewEncoder(w).Encode(map[string]any{"method": "ping", "ms": time.Since(start).Milliseconds()})
-		case "tcp":
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return true
-			}
-			conn.Close()
-			json.NewEncoder(w).Encode(map[string]any{"method": "tcp", "ms": time.Since(start).Milliseconds()})
-		case "urltest":
-			delay, err := clashDelay(tag, "https://www.google.com/generate_204")
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return true
-			}
-			json.NewEncoder(w).Encode(map[string]any{"method": "urltest", "ms": delay, "delay": delay})
-		default:
-			http.Error(w, "invalid method", http.StatusBadRequest)
+		if v.Method == "ping" && strings.HasPrefix(target.Server, "-") {
+			http.Error(w, "invalid host", http.StatusBadRequest)
+			return true
 		}
+		ms, testErr := runSingleNodeTest(*target, v.Method, v.URL)
+		if testErr != nil {
+			http.Error(w, testErr.Error(), http.StatusBadGateway)
+			return true
+		}
+		json.NewEncoder(w).Encode(map[string]any{"method": v.Method, "ms": ms, "delay": ms})
+		return true
+	case "/api/node/batch-test":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		var req struct {
+			IDs    []string `json:"ids"`
+			Method string   `json:"method"`
+			URL    string   `json:"url"`
+		}
+		if err := decodeOptionalJSONBody(r, &req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return true
+		}
+		method := req.Method
+		if method == "" {
+			method = "tcp"
+		}
+		if method != "ping" && method != "tcp" && method != "urltest" {
+			http.Error(w, "invalid method", http.StatusBadRequest)
+			return true
+		}
+		s, err := loadAPIStoreSnapshot()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return true
+		}
+		idFilter := make(map[string]bool)
+		for _, id := range req.IDs {
+			idFilter[id] = true
+		}
+		var nodesToTest []Node
+		for _, n := range s.Nodes {
+			if len(idFilter) == 0 || idFilter[n.ID] {
+				nodesToTest = append(nodesToTest, n)
+			}
+		}
+		type testResult struct {
+			MS    int64  `json:"ms"`
+			Error string `json:"error,omitempty"`
+		}
+		results := make(map[string]testResult)
+		var resultsMu sync.Mutex
+
+		concurrency := 10
+		if len(nodesToTest) < concurrency {
+			concurrency = len(nodesToTest)
+		}
+		if concurrency < 1 {
+			concurrency = 1
+		}
+		ch := make(chan Node, len(nodesToTest))
+		for _, n := range nodesToTest {
+			ch <- n
+		}
+		close(ch)
+
+		var wg sync.WaitGroup
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for n := range ch {
+					ms, testErr := runSingleNodeTest(n, method, req.URL)
+					resultsMu.Lock()
+					if testErr != nil {
+						results[n.ID] = testResult{MS: -1, Error: testErr.Error()}
+					} else {
+						results[n.ID] = testResult{MS: ms}
+					}
+					resultsMu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"method":  method,
+			"results": results,
+		})
+		return true
+	case "/api/subscription/update":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		if err := updateSubscriptionsWithForce(true); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return true
+		}
+		json.NewEncoder(w).Encode(map[string]any{"updated": true})
+		return true
+	case "/api/subscription/update-one":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		var v struct{ ID string }
+		if decodeJSONBody(r, &v) != nil || v.ID == "" {
+			http.Error(w, "subscription id is required", 400)
+			return true
+		}
+		s, err := loadAPIStoreSnapshot()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return true
+		}
+		var sub *Subscription
+		for i := range s.Subscriptions {
+			if s.Subscriptions[i].ID == v.ID {
+				sub = &s.Subscriptions[i]
+				break
+			}
+		}
+		if sub == nil {
+			http.Error(w, "subscription not found", 404)
+			return true
+		}
+		nodes, err := fetchSubscriptionFn(sub.URL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return true
+		}
+		if len(nodes) == 0 {
+			http.Error(w, "subscription contains no supported nodes", http.StatusUnprocessableEntity)
+			return true
+		}
+		mu.Lock()
+		persistErr := withStoreFileLock(func() error {
+			current, loadErr := loadStore()
+			if loadErr != nil {
+				return loadErr
+			}
+			var curSub *Subscription
+			for i := range current.Subscriptions {
+				if current.Subscriptions[i].ID == v.ID {
+					curSub = &current.Subscriptions[i]
+					break
+				}
+			}
+			if curSub == nil {
+				return fmt.Errorf("subscription not found")
+			}
+			nodes = reconcileSubscriptionNodes(current.Nodes, nodes, *curSub)
+			newNodes := make([]Node, 0, len(current.Nodes))
+			inserted := false
+			for _, n := range current.Nodes {
+				if n.SubscriptionID == v.ID {
+					if !inserted {
+						newNodes = append(newNodes, nodes...)
+						inserted = true
+					}
+				} else {
+					newNodes = append(newNodes, n)
+				}
+			}
+			if !inserted {
+				newNodes = append(newNodes, nodes...)
+			}
+			current.Nodes = newNodes
+			curSub.LastUpdated = time.Now()
+			return persistStore(current, true)
+		})
+		mu.Unlock()
+		if persistErr != nil {
+			http.Error(w, persistErr.Error(), 500)
+			return true
+		}
+		json.NewEncoder(w).Encode(map[string]any{"updated": v.ID, "nodes": len(nodes)})
 		return true
 	case "/api/core/update":
 		if r.Method != http.MethodPost {
@@ -2123,12 +2407,12 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 
 func restartProxy() error {
 	if _, err := exec.LookPath("naive"); err == nil {
-		out, restartErr := exec.Command("systemctl", "restart", "armwall-naive.service").CombinedOutput()
+		out, restartErr := runCommandTimeout(10*time.Second, "systemctl", "restart", "armwall-naive.service")
 		if restartErr != nil {
 			return fmt.Errorf("NaiveProxy restart failed: %s", strings.TrimSpace(string(out)))
 		}
 	}
-	out, err := exec.Command("systemctl", "restart", "armwall-sing-box.service").CombinedOutput()
+	out, err := runCommandTimeout(10*time.Second, "systemctl", "restart", "armwall-sing-box.service")
 	if err != nil {
 		return fmt.Errorf("sing-box restart failed: %s", strings.TrimSpace(string(out)))
 	}
@@ -2530,6 +2814,15 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "node not found", 404)
 			return
 		}
+		if n.Password == "******" {
+			n.Password = s.Nodes[index].Password
+		}
+		if n.UUID == "******" {
+			n.UUID = s.Nodes[index].UUID
+		}
+		if n.ObfsPassword == "******" {
+			n.ObfsPassword = s.Nodes[index].ObfsPassword
+		}
 		n.SubscriptionID = s.Nodes[index].SubscriptionID
 		if strings.TrimSpace(n.Group) == "" {
 			n.Group = s.Nodes[index].Group
@@ -2802,60 +3095,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"cleared": true})
-	case "/api/subscription/update":
-		if r.Method != "POST" {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		if err := updateSubscriptionsWithForceLocked(true); err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"updated": true})
-	case "/api/subscription/update-one":
-		if r.Method != "POST" {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		var v struct{ ID string }
-		if decodeJSONBody(r, &v) != nil || v.ID == "" {
-			http.Error(w, "subscription id is required", 400)
-			return
-		}
-		var sub *Subscription
-		for i := range s.Subscriptions {
-			if s.Subscriptions[i].ID == v.ID {
-				sub = &s.Subscriptions[i]
-				break
-			}
-		}
-		if sub == nil {
-			http.Error(w, "subscription not found", 404)
-			return
-		}
-		nodes, err := fetchSubscriptionFn(sub.URL)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		if len(nodes) == 0 {
-			http.Error(w, "subscription contains no supported nodes", http.StatusUnprocessableEntity)
-			return
-		}
-		nodes = reconcileSubscriptionNodes(s.Nodes, nodes, *sub)
-		kept := make([]Node, 0, len(s.Nodes))
-		for _, n := range s.Nodes {
-			if n.SubscriptionID != sub.ID {
-				kept = append(kept, n)
-			}
-		}
-		s.Nodes = append(kept, nodes...)
-		sub.LastUpdated = time.Now()
-		if err := persistStore(s, true); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"updated": sub.ID, "nodes": len(nodes)})
 	case "/api/subscription/edit":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3322,16 +3561,16 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		gatewaySuspended := false
 		if _, statErr := os.Stat(gatewayStatePath); statErr == nil {
-			if gatewayOut, gatewayErr := exec.Command(gatewayPath, "suspend").CombinedOutput(); gatewayErr != nil {
+			if gatewayOut, gatewayErr := runCommandTimeout(5*time.Second, gatewayPath, "suspend"); gatewayErr != nil {
 				http.Error(w, string(gatewayOut), 500)
 				return
 			}
 			gatewaySuspended = true
 		}
-		out, err := exec.Command("systemctl", "stop", "armwall-sing-box.service", "armwall-naive.service").CombinedOutput()
+		out, err := runCommandTimeout(10*time.Second, "systemctl", "stop", "armwall-sing-box.service", "armwall-naive.service")
 		if err != nil {
 			if gatewaySuspended {
-				_, _ = exec.Command(gatewayPath, "restore").CombinedOutput()
+				_, _ = runCommandTimeout(5*time.Second, gatewayPath, "restore")
 			}
 			http.Error(w, strings.TrimSpace(string(out)), 500)
 			return
@@ -3471,7 +3710,9 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid interface", 400)
 			return
 		}
-		cmd := exec.Command(gatewayPath, "enable")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, gatewayPath, "enable")
 		cmd.Env = os.Environ()
 		if v.LAN != "" {
 			cmd.Env = append(cmd.Env, "ARMWALL_LAN_IF="+v.LAN)
@@ -3484,8 +3725,8 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, string(out), 500)
 			return
 		}
-		if serviceOut, serviceErr := exec.Command("systemctl", "enable", "--now", "armwall-gateway.service").CombinedOutput(); serviceErr != nil {
-			_, _ = exec.Command(gatewayPath, "disable").CombinedOutput()
+		if serviceOut, serviceErr := runCommandTimeout(5*time.Second, "systemctl", "enable", "--now", "armwall-gateway.service"); serviceErr != nil {
+			_, _ = runCommandTimeout(5*time.Second, gatewayPath, "disable")
 			http.Error(w, string(serviceOut), 500)
 			return
 		}
@@ -3496,12 +3737,12 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
 			return
 		}
-		out, err := exec.Command(gatewayPath, "disable").CombinedOutput()
+		out, err := runCommandTimeout(5*time.Second, gatewayPath, "disable")
 		if err != nil {
 			http.Error(w, string(out), 500)
 			return
 		}
-		if serviceOut, serviceErr := exec.Command("systemctl", "disable", "--now", "armwall-gateway.service").CombinedOutput(); serviceErr != nil {
+		if serviceOut, serviceErr := runCommandTimeout(5*time.Second, "systemctl", "disable", "--now", "armwall-gateway.service"); serviceErr != nil {
 			http.Error(w, string(serviceOut), 500)
 			return
 		}
