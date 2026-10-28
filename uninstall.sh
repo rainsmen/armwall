@@ -19,6 +19,10 @@ printf 'Type YES to continue: '
 IFS= read -r answer
 [ "$answer" = "YES" ] || exit 1
 
+if [ -x /usr/local/bin/armwall-gateway ]; then
+  /usr/local/bin/armwall-gateway disable 2>/dev/null || true
+fi
+
 systemctl disable --now \
   armwall.service \
   armwall-sing-box.service \

@@ -23,10 +23,10 @@ case "$(uname -m)" in
 esac
 ARMWALL_BINARY=${1:-}
 if [ -z "$ARMWALL_BINARY" ]; then
-  if [ -f "$SRC_DIR/armwall" ]; then
-    ARMWALL_BINARY="$SRC_DIR/armwall"
-  else
+  if [ -f "$SRC_DIR/armwall-linux-$ARMWALL_ARCH" ]; then
     ARMWALL_BINARY="$SRC_DIR/armwall-linux-$ARMWALL_ARCH"
+  elif [ -f "$SRC_DIR/armwall" ]; then
+    ARMWALL_BINARY="$SRC_DIR/armwall"
   fi
 fi
 [ -f "$ARMWALL_BINARY" ] || { echo "ArmWall binary not found: $ARMWALL_BINARY" >&2; exit 1; }

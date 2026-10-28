@@ -36,15 +36,16 @@ install_binary(){
     LAST_BACKUP="$BACKUP_DIR/$name.$stamp"
     cp -p "$BIN_DIR/$name" "$LAST_BACKUP"
   fi
-  install -m 0755 "$src" "$BIN_DIR/$name.new"
+  tmp_bin=$(mktemp "$BIN_DIR/.${name}.new.XXXXXX")
+  install -m 0755 "$src" "$tmp_bin"
   case "$name" in
     sing-box)
-      "$BIN_DIR/$name.new" version >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "binary self-check failed"; }
-      [ ! -f "$CONFIG" ] || "$BIN_DIR/$name.new" check -c "$CONFIG" >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "existing configuration is incompatible with the uploaded binary"; }
+      "$tmp_bin" version >/dev/null 2>&1 || { rm -f "$tmp_bin"; die "binary self-check failed"; }
+      [ ! -f "$CONFIG" ] || "$tmp_bin" check -c "$CONFIG" >/dev/null 2>&1 || { rm -f "$tmp_bin"; die "existing configuration is incompatible with the uploaded binary"; }
       ;;
-    naive) "$BIN_DIR/$name.new" --version >/dev/null 2>&1 || { rm -f "$BIN_DIR/$name.new"; die "binary self-check failed"; };;
+    naive) "$tmp_bin" --version >/dev/null 2>&1 || { rm -f "$tmp_bin"; die "binary self-check failed"; };;
   esac
-  mv "$BIN_DIR/$name.new" "$BIN_DIR/$name"
+  mv -f "$tmp_bin" "$BIN_DIR/$name"
   prune_backups "$name"
 }
 prune_backups(){

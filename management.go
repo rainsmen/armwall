@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,7 @@ type backupInfo struct {
 var backupDir = "/var/lib/armwall/backups/config"
 var coreUploadDir = "/var/lib/armwall/uploads"
 var updateCorePath = "/usr/local/bin/armwall-update-core"
+var coreOperationMu sync.Mutex
 
 func marshalConfigArchive(s Store) ([]byte, error) {
 	return json.MarshalIndent(configArchive{Format: configArchiveFormat, CreatedAt: time.Now().UTC(), Store: s}, "", "  ")
@@ -246,6 +248,8 @@ func handleCoreUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
 	}
+	coreOperationMu.Lock()
+	defer coreOperationMu.Unlock()
 	r.Body = http.MaxBytesReader(w, r.Body, maxCoreUploadSize+(1<<20))
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		http.Error(w, "invalid or oversized upload", http.StatusBadRequest)

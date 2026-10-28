@@ -733,13 +733,45 @@ func updateRule(tag, backup string) error {
 			last = fmt.Errorf("%s: %w", raw, err)
 			continue
 		}
+		checkLen := len(body)
+		if checkLen > 512 {
+			checkLen = 512
+		}
+		prefix := strings.TrimSpace(string(body[:min(len(body), 64)]))
+		if strings.HasPrefix(prefix, "<") || bytes.Contains(body[:checkLen], []byte("<!DOCTYPE html")) || bytes.Contains(body[:checkLen], []byte("<html")) {
+			last = fmt.Errorf("%s: downloaded rule returned html error page", raw)
+			continue
+		}
 		dir := "/var/lib/armwall/rules"
 		if err = os.MkdirAll(dir, 0750); err != nil {
 			return err
 		}
-		return writeAtomicFile(filepath.Join(dir, tag+".srs"), body, 0640)
+		target := filepath.Join(dir, tag+".srs")
+		bak := filepath.Join(dir, tag+".srs.bak")
+		if prev, readErr := os.ReadFile(target); readErr == nil {
+			_ = os.WriteFile(bak, prev, 0640)
+		}
+		return writeAtomicFile(target, body, 0640)
 	}
 	return last
+}
+
+func restoreRuleBackups(tags []string) {
+	dir := "/var/lib/armwall/rules"
+	for _, tag := range tags {
+		bak := filepath.Join(dir, tag+".srs.bak")
+		target := filepath.Join(dir, tag+".srs")
+		if _, err := os.Stat(bak); err == nil {
+			_ = os.Rename(bak, target)
+		}
+	}
+}
+
+func cleanupRuleBackups(tags []string) {
+	dir := "/var/lib/armwall/rules"
+	for _, tag := range tags {
+		_ = os.Remove(filepath.Join(dir, tag+".srs.bak"))
+	}
 }
 
 var updateRuleFn = updateRule
@@ -832,16 +864,20 @@ func applyScheduledRuleUpdatesLocked() (int, error) {
 		return 0, updateErr
 	}
 	if err := writeConfig(s); err != nil {
+		restoreRuleBackups(updated)
 		return 0, err
 	}
 	if err := save(s); err != nil {
+		restoreRuleBackups(updated)
 		return 0, err
 	}
 	if wasRunning {
 		if err := restartProxy(); err != nil {
+			restoreRuleBackups(updated)
 			return 0, err
 		}
 	}
+	cleanupRuleBackups(updated)
 	return len(updated), updateErr
 }
 
@@ -971,6 +1007,12 @@ func persistStore(next Store, reload bool) error {
 	if next.ProxyPort > 0 {
 		proxyPort = next.ProxyPort
 	}
+	prevJSON, _ := json.Marshal(config(previous))
+	nextJSON, _ := json.Marshal(config(next))
+	prevMAC, _ := macACLData(previous)
+	nextMAC, _ := macACLData(next)
+	configChanged := !bytes.Equal(prevJSON, nextJSON) || !bytes.Equal(prevMAC, nextMAC) || previousProxyPort != proxyPort
+
 	if err := writeConfig(next); err != nil {
 		proxyPort = previousProxyPort
 		return err
@@ -980,7 +1022,7 @@ func persistStore(next Store, reload bool) error {
 		_ = writeConfig(previous)
 		return err
 	}
-	if wasRunning {
+	if wasRunning && configChanged {
 		if err := restartProxyFn(); err != nil {
 			proxyPort = previousProxyPort
 			_ = save(previous)
@@ -1476,7 +1518,14 @@ func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 func config(s Store) map[string]any {
@@ -1723,11 +1772,12 @@ func config(s Store) map[string]any {
 	if s.DNS.Enabled {
 		inbounds = append(inbounds, map[string]any{"type": "direct", "tag": "dns-in", "listen": s.DNS.ListenAddress, "listen_port": s.DNS.ListenPort})
 	}
+	sniffConfig := map[string]any{"enabled": true, "dest_override": []string{"http", "tls"}}
 	if tproxyEnabled {
-		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": tproxyPort})
+		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": tproxyPort, "sniff": sniffConfig})
 	}
 	for _, binding := range macBindings {
-		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": binding.Tag, "listen": "0.0.0.0", "listen_port": binding.Port})
+		inbounds = append(inbounds, map[string]any{"type": "tproxy", "tag": binding.Tag, "listen": "0.0.0.0", "listen_port": binding.Port, "sniff": sniffConfig})
 	}
 	level := s.LogLevel
 	if level == "" {
@@ -1813,13 +1863,13 @@ func writeConfig(s Store) error {
 	if err := writeNaiveConfigs(s); err != nil {
 		return fmt.Errorf("write NaiveProxy configs: %w", err)
 	}
+	if err := writeAtomicFile(macACLPath, macData, 0640); err != nil {
+		return fmt.Errorf("write MAC ACL bindings: %w", err)
+	}
 	if err := os.Rename(candidate, configPath); err != nil {
 		return err
 	}
 	candidate = ""
-	if err := writeAtomicFile(macACLPath, macData, 0640); err != nil {
-		return fmt.Errorf("write MAC ACL bindings: %w", err)
-	}
 	return nil
 }
 func run(w http.ResponseWriter, name string, args ...string) {
@@ -1834,6 +1884,8 @@ func run(w http.ResponseWriter, name string, args ...string) {
 }
 
 func runCoreUpdate(w http.ResponseWriter, args ...string) {
+	coreOperationMu.Lock()
+	defer coreOperationMu.Unlock()
 	cmd := exec.Command(updateCorePath, args...)
 	mu.Lock()
 	port := proxyPort
@@ -2015,6 +2067,10 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 		start := time.Now()
 		switch method {
 		case "ping":
+			if strings.HasPrefix(host, "-") {
+				http.Error(w, "invalid host", http.StatusBadRequest)
+				return true
+			}
 			out, err := exec.Command("ping", "-c", "1", "-W", "3", host).CombinedOutput()
 			if err != nil {
 				http.Error(w, string(out), http.StatusBadGateway)
@@ -2139,6 +2195,20 @@ func recordAuthFailure(remoteAddr string) bool {
 	cutoff := now.Add(-time.Minute)
 	authFailureMu.Lock()
 	defer authFailureMu.Unlock()
+	if len(authFailures) > 100 {
+		for c, stamps := range authFailures {
+			hasRecent := false
+			for _, st := range stamps {
+				if st.After(cutoff) {
+					hasRecent = true
+					break
+				}
+			}
+			if !hasRecent {
+				delete(authFailures, c)
+			}
+		}
+	}
 	kept := authFailures[client][:0]
 	for _, stamp := range authFailures[client] {
 		if stamp.After(cutoff) {
@@ -2307,6 +2377,7 @@ func authHandler(token string, next http.HandlerFunc) http.HandlerFunc {
 			log.Printf("unauthorized API request from %s path=%s", r.RemoteAddr, r.URL.Path)
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			if limited {
+				w.Header().Set("Retry-After", "60")
 				http.Error(w, "too many authentication failures", http.StatusTooManyRequests)
 				return
 			}
@@ -2368,8 +2439,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
-	case "/api/state":
-		json.NewEncoder(w).Encode(s)
 	case "/api/node":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -2386,6 +2455,19 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		if n.ID == "" {
 			n.ID = fmt.Sprintf("node-%d", time.Now().UnixNano())
+		} else {
+			n.ID = strings.TrimSpace(n.ID)
+			lowerID := strings.ToLower(n.ID)
+			if lowerID == "direct" || lowerID == "block" || lowerID == "dns-in" || lowerID == "tproxy-in" || strings.HasPrefix(lowerID, "tproxy-mac-") {
+				http.Error(w, "reserved node id", 400)
+				return
+			}
+			for _, existing := range s.Nodes {
+				if existing.ID == n.ID {
+					http.Error(w, "duplicate node id", 400)
+					return
+				}
+			}
 		}
 		n.Enabled = true
 		n.SortOrder = len(s.Nodes)
@@ -3097,39 +3179,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(s)
-	case "/api/strategy/status":
-		if r.Method != http.MethodGet {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"groups": strategyRuntimeStatuses(s)})
-	case "/api/strategy/test":
-		if r.Method != http.MethodPost {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		var request struct{ ID string }
-		if decodeJSONBody(r, &request) != nil || request.ID == "" {
-			http.Error(w, "strategy id is required", http.StatusBadRequest)
-			return
-		}
-		var group *StrategyGroup
-		for i := range s.StrategyGroups {
-			if s.StrategyGroups[i].ID == request.ID {
-				group = &s.StrategyGroups[i]
-				break
-			}
-		}
-		if group == nil {
-			http.Error(w, "strategy not found", http.StatusNotFound)
-			return
-		}
-		delay, err := clashDelay(group.ID, group.TestURL)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"id": group.ID, "ms": delay})
 	case "/api/strategy/select":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3234,6 +3283,11 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid port", 400)
 			return
 		}
+		reservedPorts := map[int]string{8080: "web", 9090: "clash api", 11081: "tproxy", 53: "dns", 22: "ssh"}
+		if name, conflict := reservedPorts[v.ProxyPort]; conflict {
+			http.Error(w, fmt.Sprintf("port %d conflicts with %s", v.ProxyPort, name), 400)
+			return
+		}
 		s.ProxyPort = v.ProxyPort
 		if err := persistStore(s, true); err != nil {
 			http.Error(w, err.Error(), 500)
@@ -3282,36 +3336,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("inactive\n"))
-	case "/api/service/status":
-		out, _ := exec.Command("systemctl", "is-active", "armwall-sing-box.service").CombinedOutput()
-		status := strings.TrimSpace(string(out))
-		if status == "" {
-			status = "unknown"
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte(status + "\n"))
-	case "/api/logs":
-		path := filepath.Join(logDir, "sing-box.log")
-		file, err := os.Open(path)
-		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		defer file.Close()
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if r.URL.Query().Get("download") == "1" {
-			w.Header().Set("Content-Disposition", "attachment; filename=armwall.log")
-			_, _ = io.Copy(w, file)
-			return
-		}
-		if info, statErr := file.Stat(); statErr == nil && info.Size() > 256<<10 {
-			_, _ = file.Seek(-(256 << 10), io.SeekEnd)
-		}
-		_, _ = io.Copy(w, file)
 	case "/api/log/clear":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3368,20 +3392,24 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := writeConfig(s); err != nil {
+			restoreRuleBackups(updated)
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		if err := save(s); err != nil {
+			restoreRuleBackups(updated)
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		wasRunning := proxyRunningFn()
 		if wasRunning {
 			if err := restartProxy(); err != nil {
+				restoreRuleBackups(updated)
 				http.Error(w, err.Error(), 500)
 				return
 			}
 		}
+		cleanupRuleBackups(updated)
 		json.NewEncoder(w).Encode(map[string]any{"updated": v.Tag})
 	case "/api/rules/settings":
 		if r.Method != "POST" {
@@ -3427,26 +3455,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		json.NewEncoder(w).Encode(s)
-	case "/api/network/test":
-		targets := map[string]string{"google": "https://www.google.com/generate_204", "youtube": "https://www.youtube.com/generate_204", "github": "https://github.com/", "facebook": "https://www.facebook.com/", "baidu": "https://www.baidu.com/", "qq": "https://www.qq.com/", "bilibili": "https://www.bilibili.com/", "microsoft": "https://www.microsoft.com/"}
-		name := r.URL.Query().Get("target")
-		target, ok := targets[name]
-		if !ok {
-			http.Error(w, "invalid target", 400)
-			return
-		}
-		transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", proxyPort)})}
-		client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
-		start := time.Now()
-		resp, err := client.Get(target)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		resp.Body.Close()
-		json.NewEncoder(w).Encode(map[string]any{"target": name, "status": resp.StatusCode, "ms": time.Since(start).Milliseconds()})
-	case "/api/gateway/status":
-		run(w, gatewayPath, "status")
 	case "/api/gateway/enable":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3487,59 +3495,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write(out)
-	case "/api/node/test":
-		if r.Method != "POST" {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		var v struct{ ID string }
-		if err := decodeOptionalJSONBody(r, &v); err != nil {
-			http.Error(w, "invalid json", 400)
-			return
-		}
-		if v.ID == "" {
-			v.ID = r.URL.Query().Get("id")
-		}
-		var host, tag string
-		var port int
-		for _, n := range s.Nodes {
-			if n.ID == v.ID {
-				host, tag, port = n.Server, n.ID, n.Port
-				break
-			}
-		}
-		if host == "" {
-			http.Error(w, "node not found", 404)
-			return
-		}
-		method := r.URL.Query().Get("method")
-		start := time.Now()
-		switch method {
-		case "ping":
-			out, err := exec.Command("ping", "-c", "1", "-W", "3", host).CombinedOutput()
-			if err != nil {
-				http.Error(w, string(out), http.StatusBadGateway)
-				return
-			}
-			json.NewEncoder(w).Encode(map[string]any{"method": "ping", "ms": time.Since(start).Milliseconds()})
-		case "tcp":
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			conn.Close()
-			json.NewEncoder(w).Encode(map[string]any{"method": "tcp", "ms": time.Since(start).Milliseconds()})
-		case "urltest":
-			delay, err := clashDelay(tag, "https://www.google.com/generate_204")
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			json.NewEncoder(w).Encode(map[string]any{"method": "urltest", "ms": delay, "delay": delay})
-		default:
-			http.Error(w, "invalid method", 400)
-		}
 	case "/api/node/import":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3568,24 +3523,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
-	case "/api/core/update":
-		if r.Method != "POST" {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		var v struct{ Core, Action string }
-		if decodeJSONBody(r, &v) != nil || (v.Core != "sing-box" && v.Core != "naive") {
-			http.Error(w, "invalid core", 400)
-			return
-		}
-		if v.Action != "version" && v.Action != "latest" {
-			http.Error(w, "invalid action", 400)
-			return
-		}
-		args := []string{v.Core, v.Action}
-		runCoreUpdate(w, args...)
-	case "/api/core/upload":
-		handleCoreUpload(w, r)
 	case "/api/config/export":
 		if r.Method != http.MethodGet {
 			http.Error(w, "method", http.StatusMethodNotAllowed)

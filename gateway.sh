@@ -14,7 +14,6 @@ safe_iface(){
   [ "${#1}" -le 32 ]
 }
 detect(){
-  [ -c /dev/net/tun ] || die "/dev/net/tun is unavailable"
   command -v nft >/dev/null || die "nftables is required"
   command -v ip >/dev/null || die "iproute2 is required"
   command -v sysctl >/dev/null || die "procps is required"

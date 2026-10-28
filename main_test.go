@@ -1057,3 +1057,71 @@ func TestACLAndDNSAPI(t *testing.T) {
 		t.Fatalf("unexpected ACL/DNS state: %+v", got)
 	}
 }
+
+func TestTProxyInboundsHaveSniffing(t *testing.T) {
+	tproxyEnabled = true
+	defer func() { tproxyEnabled = false }()
+	s := Store{
+		Mode:      "bypass_cn",
+		ProxyPort: 11080,
+		Nodes: []Node{
+			{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true},
+		},
+		ACLRules: []ACLRule{
+			{ID: "a1", Name: "mac-rule", Enabled: true, SourceMACs: []string{"00:11:22:33:44:55"}, Outbound: "direct"},
+		},
+	}
+	c := config(s)
+	inbounds := c["inbounds"].([]any)
+	var foundTproxy, foundMAC bool
+	for _, raw := range inbounds {
+		inbound := raw.(map[string]any)
+		if inbound["tag"] == "tproxy-in" {
+			foundTproxy = true
+			sniff, ok := inbound["sniff"].(map[string]any)
+			if !ok || sniff["enabled"] != true {
+				t.Fatalf("tproxy-in missing sniff: %+v", inbound)
+			}
+		}
+		if inbound["tag"] == "acl-mac-1" {
+			foundMAC = true
+			sniff, ok := inbound["sniff"].(map[string]any)
+			if !ok || sniff["enabled"] != true {
+				t.Fatalf("acl-mac-1 missing sniff: %+v", inbound)
+			}
+		}
+	}
+	if !foundTproxy || !foundMAC {
+		t.Fatalf("missing expected inbounds: foundTproxy=%v foundMAC=%v", foundTproxy, foundMAC)
+	}
+}
+
+func TestNodeAPIValidatesReservedAndDuplicateIDs(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "existing-id", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
+	recorder := callAPI(t, "/api/node", `{"id":"direct","name":"fake-direct","type":"anytls","server":"example.com","port":443,"password":"pass","tls":true}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for reserved id, got %d", recorder.Code)
+	}
+	recorder = callAPI(t, "/api/node", `{"id":"existing-id","name":"duplicate","type":"anytls","server":"example.com","port":443,"password":"pass","tls":true}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for duplicate id, got %d", recorder.Code)
+	}
+}
+
+func TestSettingsAPIRejectsConflictingPorts(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080})
+	for _, port := range []int{8080, 9090, 11081, 53, 22} {
+		recorder := callAPI(t, "/api/settings", fmt.Sprintf(`{"proxyPort":%d}`, port))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for conflicting port %d, got %d", port, recorder.Code)
+		}
+	}
+}
+
+func TestNodeTestRejectsFlagInjection(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "bad", Type: "anytls", Server: "-c 2", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
+	recorder := callAPI(t, "/api/node/test?id=n1&method=ping", "")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for flag-injected host, got %d", recorder.Code)
+	}
+}
