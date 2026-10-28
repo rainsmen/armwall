@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -469,7 +470,7 @@ func updateSubscriptionsWithForceLocked(force bool) error {
 		sub.LastUpdated = now
 	}
 	if len(s.Subscriptions) == 0 {
-		return fmt.Errorf("no subscriptions configured")
+		return errNoSubscriptions
 	}
 	if len(fetchedBySub) == 0 {
 		if len(errors) > 0 {
@@ -522,6 +523,7 @@ var tproxyPort = 11081
 var naiveProxyPort = 12000
 var clashAPISecret string
 var clashSecretMu sync.Mutex
+var errNoSubscriptions = errors.New("no subscriptions configured")
 
 const (
 	maxAPIJSONBodySize       = 1 << 20
@@ -2131,7 +2133,7 @@ func restartProxy() error {
 		return fmt.Errorf("sing-box restart failed: %s", strings.TrimSpace(string(out)))
 	}
 	address := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 80; i++ {
 		conn, dialErr := net.DialTimeout("tcp", address, 150*time.Millisecond)
 		if dialErr == nil {
 			conn.Close()
@@ -3461,12 +3463,22 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var v struct{ LAN, WAN string }
-		if decodeJSONBody(r, &v) != nil || !safeIface(v.LAN) || !safeIface(v.WAN) {
+		if err := decodeOptionalJSONBody(r, &v); err != nil {
+			http.Error(w, "invalid json", 400)
+			return
+		}
+		if (v.LAN != "" && !safeIface(v.LAN)) || (v.WAN != "" && !safeIface(v.WAN)) {
 			http.Error(w, "invalid interface", 400)
 			return
 		}
 		cmd := exec.Command(gatewayPath, "enable")
-		cmd.Env = append(os.Environ(), "ARMWALL_LAN_IF="+v.LAN, "ARMWALL_WAN_IF="+v.WAN)
+		cmd.Env = os.Environ()
+		if v.LAN != "" {
+			cmd.Env = append(cmd.Env, "ARMWALL_LAN_IF="+v.LAN)
+		}
+		if v.WAN != "" {
+			cmd.Env = append(cmd.Env, "ARMWALL_WAN_IF="+v.WAN)
+		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			http.Error(w, string(out), 500)
@@ -3789,6 +3801,10 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--update-subscriptions" {
 		if err := updateSubscriptions(); err != nil {
+			if errors.Is(err, errNoSubscriptions) {
+				log.Print("no subscriptions configured")
+				return
+			}
 			log.Fatal(err)
 		}
 		log.Print("subscriptions updated")

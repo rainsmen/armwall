@@ -11,18 +11,21 @@ STATE_FILE=${ARMWALL_GATEWAY_STATE:-/var/lib/armwall/gateway.state}
 die(){ echo "armwall-gateway: $*" >&2; exit 1; }
 safe_iface(){
   case "$1" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac
-  [ "${#1}" -le 32 ]
+  [ "${#1}" -le 32 ] || return 1
+  ip link show dev "$1" >/dev/null 2>&1
 }
 detect(){
   command -v nft >/dev/null || die "nftables is required"
   command -v ip >/dev/null || die "iproute2 is required"
   command -v sysctl >/dev/null || die "procps is required"
-  [ -n "$LAN_IF" ] || LAN_IF=$(ip -o -4 route show scope link | awk 'NR==1{print $5}')
-  [ -n "$WAN_IF" ] || WAN_IF=$(ip -o route show default | awk 'NR==1{print $5}')
+  [ -n "$WAN_IF" ] || WAN_IF=$(ip -o -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+  [ -n "$LAN_IF" ] || LAN_IF=$(ip -o -4 route show scope link 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {dev=$(i+1); if(dev !~ /^(tailscale|docker|veth|tun|wg|dummy|lo)/) {print dev; exit}}}')
+  [ -n "$LAN_IF" ] || LAN_IF="$WAN_IF"
   [ -n "$LAN_IF" ] || die "cannot detect LAN interface; set ARMWALL_LAN_IF"
+  [ -n "$WAN_IF" ] || WAN_IF="$LAN_IF"
   [ -n "$WAN_IF" ] || die "cannot detect WAN interface; set ARMWALL_WAN_IF"
-  safe_iface "$LAN_IF" || die "invalid LAN interface"
-  safe_iface "$WAN_IF" || die "invalid WAN interface"
+  safe_iface "$LAN_IF" || die "invalid LAN interface: $LAN_IF"
+  safe_iface "$WAN_IF" || die "invalid WAN interface: $WAN_IF"
 }
 load_state(){
   [ -r "$STATE_FILE" ] || return 1
