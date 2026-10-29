@@ -2,6 +2,31 @@
 
 All notable changes to ArmWall will be documented in this file.
 
+## [0.4.0] - 2026-10-29
+
+### Added
+- **Offline Rule Assets & Bootstrap**: Bundled precompiled official SRS rule sets (`geoip-cn.srs`, `geosite-ads.srs`, `geosite-cn.srs`, `geosite-proxy.srs`) into releases and `/usr/share/armwall/rules/`, supporting zero-network initial bootstrap (`--bootstrap-rules`).
+- **Monotonic Revision Tracking**: Added `Revision int64` counter to `Store` and SQLite `settings` table, incrementing on every transaction commit, combined with `time.RFC3339Nano` timestamp precision to eliminate subscription update concurrency races.
+- **Transport Normalization**: Added `normalizeTransport` handling `tcp`/`none` and `h2 -> http` mapping, preventing airport subscription parameter mismatches with sing-box.
+- **Rule Update Optimization**: Added `bytes.Equal` content comparison during rule updates to skip redundant disk writes and core restarts when rule contents are identical; enhanced atomic rollback with `.absent` tracking.
+- **Concurrency & Resource Safety**:
+  - Wrapped global `proxyPort` in `sync.RWMutex` with safe accessors.
+  - Added port reservation table in `assignNaivePorts` excluding SSH (22), DNS (53), Web (8080), Clash API (9090), Proxy, TProxy, and MAC ports.
+  - Extended frontend batch test timeout to 180s and enhanced backend cancellation handling (`r.Context().Done()`).
+- **Packaging & CI Gateways**:
+  - Added `binutils` (`readelf`) to `install.sh` prerequisites.
+  - Multi-script syntax verification in CI and Makefile (`for script in ...; do sh -n "$script"; done`).
+  - Strict Go formatting check (`test -z "$(gofmt -l *.go)"`) and toolchain pinning to Go 1.26.10.
+
+### Fixed
+- **Frontend Subscription Creation**: Fixed `POST /api/subscription` payload deserialization 400 error by adding JSON struct tags for frontend attributes (`id`, `enabled`, `update_hours`, `last_updated`).
+- **sing-box Protocol Sniffing Order**: Placed `action: sniff` at index 0 of route rules ahead of DNS hijack rules, ensuring proper TProxy protocol sniffing.
+- **CSP Compliance**: Removed inline styles from `web/index.html` and migrated cursor styles to `web/styles.css`, achieving 100% CSP strict compliance.
+- **Gateway Fault Tolerance**: Added automatic fallback to dynamic interface detection (`detect`) in `gateway.sh load_state` when saved network interface names become invalid.
+- **Dead Code Cleanup**: Removed unused legacy functions (`updateSubscriptionsWithForceLocked`).
+- **Repository Governance**: Purged precompiled binaries from Git tracking and updated `.gitignore`.
+- **Documentation Consolidation**: Unified all historical audit reports and improvement plans into `docs/CONSOLIDATED-IMPROVEMENT-PLAN-2026-10-29.md`.
+
 ## [0.3.2] - 2026-10-28
 
 ### Added
