@@ -475,6 +475,10 @@ td .row-actions {
   font-variant-numeric: tabular-nums;
   color: #2867b8;
 }
+th.delay {
+  cursor: pointer;
+  user-select: none;
+}
 .empty {
   text-align: center;
   padding: 32px;

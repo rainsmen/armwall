@@ -7,6 +7,7 @@ const strategyRuntime = new Map();
 let selectedCore = "sing-box";
 let toastTimer;
 let refreshTimer;
+let refreshInProgress = false;
 
 const sites = [
   ["google", "Google", "https://www.google.com/favicon.ico", "G"],
@@ -42,9 +43,30 @@ async function request(path, options = {}, text = false, retry = true) {
   const controller = new AbortController();
   const timeoutMs = options.timeoutMs || 30000;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  let response;
   try {
-    response = await fetch(path, { ...options, headers, signal: controller.signal });
+    const response = await fetch(path, { ...options, headers, signal: controller.signal });
+    if (response.status === 401 && retry) {
+      token = window.prompt("请输入 ArmWall 管理 Token") || "";
+      if (token) {
+        sessionStorage.armwallToken = token;
+        localStorage.armwallToken = token;
+      } else {
+        sessionStorage.removeItem("armwallToken");
+        localStorage.removeItem("armwallToken");
+      }
+      return request(path, options, text, false);
+    }
+    if (response.status === 429) {
+      throw new Error("请求过于频繁，请稍候再试 (HTTP 429)");
+    }
+    if (!response.ok) {
+      const message =
+        (await response.text()).trim() || `请求失败 (${response.status})`;
+      throw new Error(message);
+    }
+    if (text) return await response.text();
+    const type = response.headers.get("content-type") || "";
+    return type.includes("application/json") ? await response.json() : await response.text();
   } catch (err) {
     if (err.name === "AbortError") {
       throw new Error("请求超时，请检查网络或稍后重试");
@@ -53,28 +75,6 @@ async function request(path, options = {}, text = false, retry = true) {
   } finally {
     clearTimeout(timeoutId);
   }
-  if (response.status === 401 && retry) {
-    token = window.prompt("请输入 ArmWall 管理 Token") || "";
-    if (token) {
-      sessionStorage.armwallToken = token;
-      localStorage.armwallToken = token;
-    } else {
-      sessionStorage.removeItem("armwallToken");
-      localStorage.removeItem("armwallToken");
-    }
-    return request(path, options, text, false);
-  }
-  if (response.status === 429) {
-    throw new Error("请求过于频繁，请稍候再试 (HTTP 429)");
-  }
-  if (!response.ok) {
-    const message =
-      (await response.text()).trim() || `请求失败 (${response.status})`;
-    throw new Error(message);
-  }
-  if (text) return response.text();
-  const type = response.headers.get("content-type") || "";
-  return type.includes("application/json") ? response.json() : response.text();
 }
 
 function escapeHTML(value) {
@@ -600,13 +600,15 @@ async function saveSubscription(event) {
   const id = $("subscriptionId").value;
   const existing = appState.subscriptions.find((sub) => sub.id === id);
   const payload = {
-    id,
+    id: id || undefined,
     name: $("subscriptionName").value.trim(),
     url: $("subscriptionURL").value.trim(),
-    update_hours: Number($("subscriptionHours").value),
+    update_hours: Number($("subscriptionHours").value) || 6,
     enabled: $("subscriptionEnabled").checked,
-    last_updated: existing?.last_updated,
   };
+  if (id && existing?.last_updated) {
+    payload.last_updated = existing.last_updated;
+  }
   try {
     await request(id ? "/api/subscription/edit" : "/api/subscription", {
       method: "POST",
@@ -799,7 +801,7 @@ async function batchTestNodes(method, button) {
     const data = await request("/api/node/batch-test", {
       method: "POST",
       body: { ids, method },
-      timeoutMs: 60000,
+      timeoutMs: 180000,
     });
     if (data && data.results) {
       let okCount = 0;
@@ -882,11 +884,19 @@ function activeViewID() {
 
 function startAutoRefresh() {
   clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => {
-    if (document.hidden) return;
-    void refreshServiceStatus(false);
-    if ((appState.strategy_groups || []).length) void loadStrategyStatus();
-    if (activeViewID() === "logs") void refreshLogs();
+  refreshTimer = setInterval(async () => {
+    if (document.hidden || refreshInProgress) return;
+    refreshInProgress = true;
+    try {
+      const tasks = [refreshServiceStatus(false)];
+      if ((appState.strategy_groups || []).length) tasks.push(loadStrategyStatus());
+      if (activeViewID() === "logs") tasks.push(refreshLogs());
+      await Promise.all(tasks);
+    } catch (error) {
+      toast(error.message || "后台刷新失败", true);
+    } finally {
+      refreshInProgress = false;
+    }
   }, 15000);
 }
 
@@ -974,7 +984,7 @@ async function uploadCore(file) {
   $("coreVersion").textContent = "上传并校验中";
   const output = await request(
     "/api/core/upload",
-    { method: "POST", body: form },
+    { method: "POST", body: form, timeoutMs: 180000 },
     true,
   );
   $("coreVersion").textContent = output.trim() || "更新完成";
@@ -1071,12 +1081,13 @@ async function handleAction(button) {
       await request("/api/subscription/update-one", {
         method: "POST",
         body: { id },
+        timeoutMs: 180000,
       });
       toast("订阅已更新");
       await loadState(false);
     } else if (action === "update-all-subscriptions") {
       button.disabled = true;
-      await request("/api/subscription/update", { method: "POST" });
+      await request("/api/subscription/update", { method: "POST", timeoutMs: 180000 });
       toast("全部订阅已更新");
       await loadState(false);
     } else if (action === "delete-subscription") {
@@ -1204,7 +1215,7 @@ async function handleAction(button) {
       await renderRules();
     } else if (action === "update-rule") {
       button.disabled = true;
-      await request("/api/rules/update", { method: "POST", body: { tag } });
+      await request("/api/rules/update", { method: "POST", body: { tag }, timeoutMs: 180000 });
       toast("规则已更新");
       await renderRules();
     } else if (action === "select-core") selectCore(core);
@@ -1221,7 +1232,7 @@ async function handleAction(button) {
       $("coreVersion").textContent = (
         await request(
           "/api/core/update",
-          { method: "POST", body: { core: selectedCore, action: "latest" } },
+          { method: "POST", body: { core: selectedCore, action: "latest" }, timeoutMs: 180000 },
           true,
         )
       ).trim();
@@ -1285,6 +1296,7 @@ async function handleAction(button) {
       URL.revokeObjectURL(url);
     } else if (action === "reset-token") {
       token = "";
+      sessionStorage.removeItem("armwallToken");
       localStorage.removeItem("armwallToken");
       toast("本地 Token 已清除");
     }
