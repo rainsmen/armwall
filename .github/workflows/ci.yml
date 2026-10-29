@@ -12,7 +12,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.10"
 
       - uses: actions/setup-node@v4
         with:
@@ -20,6 +20,9 @@ jobs:
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Go format
+        run: test -z "$(gofmt -l *.go)"
 
       - name: Go test
         run: go test ./...
@@ -30,14 +33,32 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
+      - name: Cross-compile release targets
+        run: |
+          set -eu
+          out=$(mktemp -d)
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 go build -trimpath -o "$out/armv6" .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -o "$out/armv7" .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o "$out/arm64" .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$out/amd64" .
+
       - name: ShellCheck
-        run: shellcheck gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh
+        run: shellcheck gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh tests/update-core-metadata-test.sh tests/gateway-test.sh
 
       - name: Shell syntax
-        run: sh -n gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh
+        run: |
+          for f in gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh tests/update-core-metadata-test.sh tests/gateway-test.sh; do
+            sh -n "$f"
+          done
 
       - name: Installer tests
         run: sh tests/one-click-install-test.sh
+
+      - name: Core updater metadata tests
+        run: sh tests/update-core-metadata-test.sh
+
+      - name: Gateway tests
+        run: sh tests/gateway-test.sh
 
       - name: JS syntax
         run: node --check web/app.js

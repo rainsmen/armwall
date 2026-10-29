@@ -5,7 +5,7 @@ LDFLAGS = -s -w -X main.version=$(VERSION)
 RELEASE_SUPPORT_FILES = install.sh gateway.sh update-core.sh naive-supervisor.sh uninstall.sh \
 	armwall.service armwall-sing-box.service armwall-naive.service armwall-gateway.service \
 	armwall-subscription-update.service armwall-subscription-update.timer \
-	armwall-rule-update.service armwall-rule-update.timer armwall.logrotate
+	armwall-rule-update.service armwall-rule-update.timer armwall.logrotate rules
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall .
@@ -15,8 +15,10 @@ test:
 	$(GO) vet ./...
 	$(GO) test ./...
 	node --check web/app.js
-	sh -n gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh
+	for script in gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh; do sh -n "$$script"; done
 	sh tests/one-click-install-test.sh
+	sh tests/update-core-metadata-test.sh
+	sh tests/gateway-test.sh
 
 release:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall-linux-armv6 .
