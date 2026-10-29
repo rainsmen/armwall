@@ -7,7 +7,7 @@ Wants=network-online.target armwall-sing-box.service
 Type=oneshot
 ExecStart=/usr/local/bin/armwall-gateway restore
 ExecReload=/usr/local/bin/armwall-gateway reload
-ExecStop=/usr/local/bin/armwall-gateway disable
+ExecStop=/usr/local/bin/armwall-gateway suspend
 RemainAfterExit=yes
 
 [Install]

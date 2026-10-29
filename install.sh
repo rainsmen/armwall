@@ -6,13 +6,13 @@ REQUESTED_WEB_ACCESS=${ARMWALL_WEB_ACCESS:-}
 REQUESTED_WEB_LISTEN=${ARMWALL_LISTEN:-}
 REQUESTED_WEB_ALLOWED_CIDRS=${ARMWALL_WEB_ALLOWED_CIDRS:-}
 missing=
-for command in curl file tar xz nft ip ping sysctl python3 logrotate; do
+for command in curl file tar xz nft ip ping sysctl python3 logrotate readelf; do
   command -v "$command" >/dev/null 2>&1 || missing="$missing $command"
 done
 if [ -n "$missing" ]; then
   command -v apt-get >/dev/null 2>&1 || { echo "missing commands:$missing" >&2; exit 1; }
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl file xz-utils nftables iproute2 iputils-ping procps python3 logrotate
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl file xz-utils nftables iproute2 iputils-ping procps python3 logrotate binutils
 fi
 case "$(uname -m)" in
   armv6*) ARMWALL_ARCH=armv6;;
@@ -161,7 +161,6 @@ systemctl enable armwall.service
 systemctl enable armwall-subscription-update.timer
 systemctl enable armwall-rule-update.timer
 systemctl enable armwall-naive.service
-systemctl start armwall-rule-update.service || true
 systemctl restart armwall.service
 systemctl restart armwall-subscription-update.timer
 systemctl restart armwall-rule-update.timer
@@ -169,6 +168,23 @@ systemctl restart armwall-naive.service
 if command -v sing-box >/dev/null 2>&1; then
   systemctl enable armwall-sing-box.service
   systemctl restart armwall-sing-box.service
+fi
+mkdir -p /usr/share/armwall/rules /var/lib/armwall/rules
+if [ -d "$SRC_DIR/rules" ]; then
+  cp "$SRC_DIR"/rules/*.srs /usr/share/armwall/rules/ 2>/dev/null || true
+  for r in "$SRC_DIR"/rules/*.srs; do
+    [ -f "$r" ] || continue
+    fname=$(basename "$r")
+    if [ ! -f "/var/lib/armwall/rules/$fname" ]; then
+      cp "$r" "/var/lib/armwall/rules/$fname"
+    fi
+  done
+  chmod 0640 /var/lib/armwall/rules/*.srs 2>/dev/null || true
+fi
+ARMWALL_RULE_BOOTSTRAP_FAILED=0
+if ! /usr/local/bin/armwall --bootstrap-rules; then
+  echo "rule bootstrap failed; ArmWall is installed but required rule sets were not refreshed" >&2
+  ARMWALL_RULE_BOOTSTRAP_FAILED=1
 fi
 if [ -z "$ARMWALL_CHECK_WEB_ACCESS" ]; then
   case "$ARMWALL_CHECK_LISTEN" in
@@ -194,3 +210,6 @@ else
   '
 fi
 echo "Management token: $ARMWALL_ADMIN_TOKEN"
+if [ "$ARMWALL_RULE_BOOTSTRAP_FAILED" -ne 0 ]; then
+  exit 1
+fi

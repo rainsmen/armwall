@@ -8,9 +8,15 @@ BACKUP_DIR=${ARMWALL_BACKUP_DIR:-/var/lib/armwall/backups}
 CONFIG=${ARMWALL_CONFIG:-/etc/armwall/sing-box.json}
 LAST_BACKUP=
 PROXY_PORT=${ARMWALL_PROXY_PORT:-}
+LOCK_FILE=${ARMWALL_UPDATE_LOCK:-/var/lock/armwall-update-core.lock}
 
 die(){ echo "armwall-update-core: $*" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v flock >/dev/null 2>&1 || die "flock is required"
+command -v readelf >/dev/null 2>&1 || die "readelf is required"
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -n 9 || die "another core update is already running"
 fetch_file(){
   url=$1; destination=$2
   if [ -n "$PROXY_PORT" ]; then
@@ -30,6 +36,14 @@ install_binary(){
   src=$1; name=$2
   [ -f "$src" ] || die "file not found: $src"
   file "$src" | grep -q ELF || die "uploaded file is not an ELF executable"
+  expected_machine=
+  case "$(arch)" in
+    amd64) expected_machine='Advanced Micro Devices X86-64|x86-64' ;;
+    arm64) expected_machine='AArch64' ;;
+    armv7|armv6) expected_machine='ARM' ;;
+  esac
+  machine=$(readelf -h "$src" 2>/dev/null | awk -F: '/^[[:space:]]*Machine:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
+  printf '%s\n' "$machine" | grep -Eq "$expected_machine" || die "ELF architecture mismatch: $machine"
   mkdir -p "$BIN_DIR" "$BACKUP_DIR"
   stamp=$(date +%Y%m%d%H%M%S)
   if [ -x "$BIN_DIR/$name" ]; then
@@ -67,28 +81,86 @@ restart_sing_box(){
   if ! systemctl restart armwall-sing-box.service; then
     if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP" ]; then
       install -m 0755 "$LAST_BACKUP" "$BIN_DIR/sing-box"
-      systemctl restart armwall-sing-box.service 2>/dev/null || true
+      systemctl restart armwall-sing-box.service 2>/dev/null || die "sing-box restart failed after binary restore"
+    else
+      die "sing-box restart failed and no previous binary is available"
     fi
     die "sing-box restart failed; the previous binary was restored"
   fi
+}
+restart_naive(){
+  systemctl is-active --quiet armwall-naive.service || return 0
+  if ! systemctl restart armwall-naive.service; then
+    if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP" ]; then
+      install -m 0755 "$LAST_BACKUP" "$BIN_DIR/naive"
+      systemctl restart armwall-naive.service 2>/dev/null || die "NaiveProxy restart failed after binary restore"
+    else
+      die "NaiveProxy restart failed and no previous binary is available"
+    fi
+    die "NaiveProxy restart failed; the previous binary was restored"
+  fi
+}
+extract_binary(){
+  archive=$1; expected_name=$2; destination=$3
+  python3 - "$archive" "$expected_name" "$destination" <<'PY'
+import os, posixpath, shutil, sys, tarfile
+
+archive, expected, destination = sys.argv[1:]
+matches = []
+with tarfile.open(archive, "r:*") as bundle:
+    for member in bundle.getmembers():
+        name = member.name
+        normalized = posixpath.normpath(name)
+        if name.startswith("/") or normalized == ".." or normalized.startswith("../") or "/../" in name:
+            raise SystemExit("archive contains an unsafe path")
+        if member.issym() or member.islnk() or member.isdev():
+            raise SystemExit("archive contains a link or device entry")
+        if member.isfile() and posixpath.basename(normalized) == expected:
+            matches.append(member)
+    if len(matches) != 1:
+        raise SystemExit("archive must contain exactly one expected executable")
+    source = bundle.extractfile(matches[0])
+    if source is None:
+        raise SystemExit("cannot read executable from archive")
+    with source, open(destination, "wb") as output:
+        shutil.copyfileobj(source, output)
+os.chmod(destination, 0o700)
+PY
 }
 latest_sing_box(){
   a=$(arch); [ "$a" != armv6 ] || die "official sing-box releases do not provide armv6 builds; use manual"
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   fetch_file https://api.github.com/repos/SagerNet/sing-box/releases/latest "$tmp/release.json"
-  version=$(python3 - "$tmp/release.json" <<'PY'
+  python3 - "$tmp/release.json" "$a" "$tmp/meta" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    tag = json.load(fh).get("tag_name", "")
-print(tag[1:] if tag.startswith("v") else tag)
+    data = json.load(fh)
+tag = data.get("tag_name", "")
+version = tag[1:] if tag.startswith("v") else tag
+arch = sys.argv[2]
+target_name = f"sing-box-{version}-linux-{arch}-glibc.tar.gz"
+digest = ""
+url = ""
+for asset in data.get("assets", []):
+    if asset.get("name") == target_name:
+        url = asset.get("browser_download_url", "")
+        digest = asset.get("digest", "")
+        break
+if not version or not url or not digest:
+    raise SystemExit("release metadata missing version, asset URL, or digest")
+with open(sys.argv[3], "w", encoding="utf-8") as out:
+    out.write("\t".join((version, url, digest)) + "\n")
 PY
-)
-  [ -n "$version" ] || die "cannot determine latest sing-box version"
-  url="https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-$a-glibc.tar.gz"
+  IFS="$(printf '\t')" read -r version url expected_digest < "$tmp/meta" || die "cannot read release metadata"
+  printf '%s\n' "$version" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z._+-]*$' || die "invalid release version"
+  printf '%s\n' "$url" | grep -Eq '^https://(github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com)/[^[:space:]]+$' || die "invalid release URL"
+  printf '%s\n' "$expected_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || die "invalid release digest"
   fetch_file "$url" "$tmp/core.tgz"
-  tar -tzf "$tmp/core.tgz" >/dev/null || die "invalid archive"
-  tar -xzf "$tmp/core.tgz" -C "$tmp"
-  install_binary "$(find "$tmp" -type f -name sing-box | head -1)" sing-box
+  expected_hash="${expected_digest#sha256:}"
+  actual_hash=$(sha256sum "$tmp/core.tgz" | awk '{print $1}')
+  [ "$expected_hash" = "$actual_hash" ] || die "SHA256 mismatch: expected $expected_hash, got $actual_hash"
+  extract_binary "$tmp/core.tgz" sing-box "$tmp/sing-box"
+  install_binary "$tmp/sing-box" sing-box
   restart_sing_box
   sing-box version
 }
@@ -101,25 +173,40 @@ latest_naive(){
   esac
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   fetch_file https://api.github.com/repos/klzgrad/naiveproxy/releases/latest "$tmp/release.json"
-  tag=$(python3 - "$tmp/release.json" <<'PY'
+  python3 - "$tmp/release.json" "$a" "$tmp/meta" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    print(json.load(fh).get("tag_name", ""))
+    data = json.load(fh)
+tag = data.get("tag_name", "")
+arch = sys.argv[2]
+url = ""
+digest = ""
+for asset in data.get("assets", []):
+    name = asset.get("name", "")
+    if name.endswith(f"-linux-{arch}.tar.xz") or name.endswith(f"-linux-{arch}.tar.gz"):
+        url = asset.get("browser_download_url", "")
+        digest = asset.get("digest", "")
+        break
+if not tag or not url or not digest:
+    raise SystemExit("release metadata missing tag, asset URL, or digest")
+with open(sys.argv[3], "w", encoding="utf-8") as out:
+    out.write("\t".join((tag, url, digest)) + "\n")
 PY
-)
-  [ -n "$tag" ] || die "cannot determine latest NaiveProxy version"
-  url="https://github.com/klzgrad/naiveproxy/releases/download/$tag/naiveproxy-$tag-linux-$a.tar.xz"
-  fetch_file "$url" "$tmp/core.tar.xz"
-  tar -tJf "$tmp/core.tar.xz" >/dev/null || die "invalid archive"
-  tar -xJf "$tmp/core.tar.xz" -C "$tmp"
-  binary=$(find "$tmp" -type f -name naive | head -1)
-  [ -n "$binary" ] || die "NaiveProxy binary is missing from the archive"
-  install_binary "$binary" naive
+  IFS="$(printf '\t')" read -r tag url expected_digest < "$tmp/meta" || die "cannot read release metadata"
+  printf '%s\n' "$tag" | grep -Eq '^[v0-9A-Za-z][0-9A-Za-z._+-]*$' || die "invalid release tag"
+  printf '%s\n' "$url" | grep -Eq '^https://(github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com)/[^[:space:]]+$' || die "invalid release URL"
+  printf '%s\n' "$expected_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || die "invalid release digest"
+  case "$url" in
+    *.tar.gz) archive="$tmp/core.tar.gz"; fetch_file "$url" "$archive"; expected_format=gzip ;;
+    *.tar.xz) archive="$tmp/core.tar.xz"; fetch_file "$url" "$archive"; expected_format=xz ;;
+    *) die "unsupported NaiveProxy archive format" ;;
+  esac
+  expected_hash="${expected_digest#sha256:}"
+  actual_hash=$(sha256sum "$archive" | awk '{print $1}')
+  [ "$expected_hash" = "$actual_hash" ] || die "SHA256 mismatch: expected $expected_hash, got $actual_hash"
+  extract_binary "$archive" naive "$tmp/naive"
+  install_binary "$tmp/naive" naive
   naive --version 2>&1 | head -1
-}
-restart_naive(){
-  systemctl is-active --quiet armwall-naive.service || return 0
-  systemctl restart armwall-naive.service
 }
 case "$CORE:$ACTION" in
   sing-box:version) sing-box version;;
