@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,16 +73,16 @@ func closeDB() {
 	}
 }
 
-func loadJSON() Store {
+func loadJSON() (Store, error) {
 	b, err := os.ReadFile(dataPath)
 	if err != nil {
-		return Store{Mode: "bypass_cn"}
+		return Store{}, err
 	}
 	var s Store
-	if json.Unmarshal(b, &s) != nil {
-		return Store{Mode: "bypass_cn"}
+	if err := json.Unmarshal(b, &s); err != nil {
+		return Store{}, fmt.Errorf("decode legacy JSON store: %w", err)
 	}
-	return s
+	return s, nil
 }
 func saveJSON(s Store) error {
 	if err := os.MkdirAll(filepath.Dir(dataPath), 0750); err != nil {
@@ -108,6 +109,10 @@ func loadDB() (Store, error) {
 			return s, err
 		}
 		switch k {
+		case "revision":
+			s.Revision, _ = strconv.ParseInt(v, 10, 64)
+		case "schema_version":
+			s.SchemaVersion, _ = strconv.Atoi(v)
 		case "mode":
 			s.Mode = v
 		case "proxy_port":
@@ -177,7 +182,7 @@ func loadDB() (Store, error) {
 		}
 		sub.Enabled = enabled != 0
 		if stamp.Valid {
-			sub.LastUpdated, _ = time.Parse(time.RFC3339, stamp.String)
+			sub.LastUpdated, _ = time.Parse(time.RFC3339Nano, stamp.String)
 		}
 		s.Subscriptions = append(s.Subscriptions, sub)
 		s.SubscriptionURLs = append(s.SubscriptionURLs, sub.URL)
@@ -200,8 +205,9 @@ func loadDB() (Store, error) {
 			ns.Close()
 			return s, err
 		}
-		if json.Unmarshal([]byte(payload), &n) != nil {
-			continue
+		if err := json.Unmarshal([]byte(payload), &n); err != nil {
+			log.Printf("corrupted node payload refused (id=%s): %v", n.ID, err)
+			return s, fmt.Errorf("corrupted node payload %s: %w", n.ID, err)
 		}
 		n.SubscriptionID = subID
 		n.Group = group
@@ -235,7 +241,8 @@ func saveDB(s Store) error {
 	groups, _ := json.Marshal(s.StrategyGroups)
 	aclRules, _ := json.Marshal(s.ACLRules)
 	dnsSettings, _ := json.Marshal(s.DNS)
-	settings := map[string]string{"mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "rule_settings": string(ruleSettings), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings), "ad_block_enabled": strconv.FormatBool(boolValue(s.AdBlockEnabled, true))}
+	s.Revision++
+	settings := map[string]string{"revision": strconv.FormatInt(s.Revision, 10), "schema_version": strconv.Itoa(s.SchemaVersion), "mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "rule_settings": string(ruleSettings), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings), "ad_block_enabled": strconv.FormatBool(boolValue(s.AdBlockEnabled, true))}
 	for k, v := range settings {
 		if _, err = tx.Exec("INSERT INTO settings(key,value) VALUES(?,?)", k, v); err != nil {
 			return err
@@ -249,7 +256,7 @@ func saveDB(s Store) error {
 		if sub.Enabled {
 			enabled = 1
 		}
-		if _, err = tx.Exec("INSERT INTO subscriptions(id,name,url,update_hours,enabled,last_updated) VALUES(?,?,?,?,?,?)", sub.ID, sub.Name, sub.URL, sub.UpdateHours, enabled, sub.LastUpdated.Format(time.RFC3339)); err != nil {
+		if _, err = tx.Exec("INSERT INTO subscriptions(id,name,url,update_hours,enabled,last_updated) VALUES(?,?,?,?,?,?)", sub.ID, sub.Name, sub.URL, sub.UpdateHours, enabled, sub.LastUpdated.Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 	}
@@ -257,7 +264,10 @@ func saveDB(s Store) error {
 		return err
 	}
 	for i, n := range s.Nodes {
-		payload, _ := json.Marshal(n)
+		payload, err := json.Marshal(n)
+		if err != nil {
+			return fmt.Errorf("marshal node %s: %w", n.ID, err)
+		}
 		enabled := 0
 		if n.Enabled {
 			enabled = 1
@@ -267,21 +277,4 @@ func saveDB(s Store) error {
 		}
 	}
 	return tx.Commit()
-}
-
-func migrateLegacy(s Store) Store {
-	if len(s.Subscriptions) == 0 {
-		for i, u := range s.SubscriptionURLs {
-			s.Subscriptions = append(s.Subscriptions, Subscription{ID: fmt.Sprintf("subsrc-%d", i+1), Name: fmt.Sprintf("订阅 %d", i+1), URL: u, UpdateHours: 6, Enabled: true})
-		}
-	}
-	for i := range s.Nodes {
-		s.Nodes[i].Enabled = true
-		if s.Nodes[i].SubscriptionID == "" && len(s.Subscriptions) > 0 && len(s.SubscriptionURLs) > 0 && len(s.Nodes[i].ID) >= 4 && s.Nodes[i].ID[:4] == "sub-" {
-			s.Nodes[i].SubscriptionID = s.Subscriptions[0].ID
-			s.Nodes[i].Group = s.Subscriptions[0].Name
-		}
-		s.Nodes[i].SortOrder = i
-	}
-	return s
 }

@@ -82,6 +82,9 @@ func validateImportedStore(s *Store) error {
 	if s.ProxyPort < 1 || s.ProxyPort > 65535 {
 		return fmt.Errorf("invalid proxy port")
 	}
+	if err := validateProxyPort(s.ProxyPort); err != nil {
+		return err
+	}
 	if s.LogLevel == "" {
 		s.LogLevel = "info"
 	}

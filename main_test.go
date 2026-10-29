@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,14 +15,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func setupAPITest(t *testing.T, initial Store) {
 	t.Helper()
-	oldDB, oldData, oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir := dbPath, dataPath, configPath, macACLPath, naiveConfigDir, logDir
-	oldRestart, oldFetch, oldReload, oldProxyRunning, oldProxyPort, oldTProxyPort, oldTProxyEnabled := restartProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, proxyPort, tproxyPort, tproxyEnabled
+	oldDB, oldData, oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir, oldRuleDataDir := dbPath, dataPath, configPath, macACLPath, naiveConfigDir, logDir, ruleDataDir
+	oldRestart, oldFetch, oldReload, oldProxyRunning, oldProxyPort, oldTProxyPort, oldTProxyEnabled := restartProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, getProxyPort(), tproxyPort, tproxyEnabled
 	oldGatewayPath, oldGatewayStatePath := gatewayPath, gatewayStatePath
 	oldBackupDir, oldCoreUploadDir, oldUpdateCorePath := backupDir, coreUploadDir, updateCorePath
 	dir := t.TempDir()
@@ -31,21 +33,68 @@ func setupAPITest(t *testing.T, initial Store) {
 	macACLPath = filepath.Join(dir, "mac-acl.tsv")
 	naiveConfigDir = filepath.Join(dir, "naive")
 	logDir = filepath.Join(dir, "logs")
+	ruleDataDir = filepath.Join(dir, "rules")
 	backupDir = filepath.Join(dir, "backups")
 	coreUploadDir = filepath.Join(dir, "uploads")
 	gatewayPath = filepath.Join(dir, "gateway")
 	gatewayStatePath = filepath.Join(dir, "gateway.state")
-	proxyPort = 11080
+	setProxyPort(11080)
 	restartProxyFn = func() error { return nil }
 	proxyRunningFn = func() bool { return true }
 	t.Cleanup(func() {
-		dbPath, dataPath, configPath, macACLPath, naiveConfigDir, logDir = oldDB, oldData, oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir
-		restartProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, proxyPort, tproxyPort, tproxyEnabled = oldRestart, oldFetch, oldReload, oldProxyRunning, oldProxyPort, oldTProxyPort, oldTProxyEnabled
+		dbPath, dataPath, configPath, macACLPath, naiveConfigDir, logDir, ruleDataDir = oldDB, oldData, oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir, oldRuleDataDir
+		restartProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, tproxyPort, tproxyEnabled = oldRestart, oldFetch, oldReload, oldProxyRunning, oldTProxyPort, oldTProxyEnabled
+		setProxyPort(oldProxyPort)
 		gatewayPath, gatewayStatePath = oldGatewayPath, oldGatewayStatePath
 		backupDir, coreUploadDir, updateCorePath = oldBackupDir, oldCoreUploadDir, oldUpdateCorePath
 	})
 	if err := save(initial); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRuleBackupRestoreHandlesExistingAndNewFiles(t *testing.T) {
+	dir := t.TempDir()
+	oldRuleDataDir := ruleDataDir
+	ruleDataDir = dir
+	t.Cleanup(func() { ruleDataDir = oldRuleDataDir })
+
+	oldPath := filepath.Join(dir, "existing.srs")
+	if err := os.WriteFile(filepath.Join(dir, "existing.srs.bak"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	newPath := filepath.Join(dir, "new.srs")
+	if err := os.WriteFile(newPath, []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath+".bak.absent", nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreRuleBackups([]string{"existing", "new"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(oldPath); err != nil || string(got) != "old" {
+		t.Fatalf("existing file restore = %q, %v", got, err)
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Fatalf("new file remains after rollback, stat error=%v", err)
+	}
+}
+
+func TestStoreRevisionIncrementsAndPersists(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080})
+	initial := load()
+	initialRev := initial.Revision
+	initial.Mode = "bypass_cn"
+	if err := save(initial); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+	updated := load()
+	if updated.Revision <= initialRev {
+		t.Fatalf("expected revision to increment, got initial=%d, updated=%d", initialRev, updated.Revision)
 	}
 }
 
@@ -357,6 +406,60 @@ func TestParseShadowsocksAndVMessShareLinks(t *testing.T) {
 	}
 }
 
+func TestNormalizeTransportAndConfigOmission(t *testing.T) {
+	if normalizeTransport("tcp") != "" || normalizeTransport("none") != "" || normalizeTransport("") != "" {
+		t.Fatal("tcp/none/empty should normalize to empty string")
+	}
+	if normalizeTransport("h2") != "http" {
+		t.Fatalf("h2 should normalize to http, got %s", normalizeTransport("h2"))
+	}
+	if normalizeTransport("ws") != "ws" || normalizeTransport("grpc") != "grpc" {
+		t.Fatal("ws and grpc should be preserved")
+	}
+
+	// VMess with "net":"tcp" should have empty Transport and no transport object in config
+	vmessJSON := `{"v":"2","ps":"VMess-TCP","add":"vm.example","port":443,"id":"11111111-1111-1111-1111-111111111111","aid":0,"scy":"auto","net":"tcp","tls":"none"}`
+	vmessLink := "vmess://" + base64.StdEncoding.EncodeToString([]byte(vmessJSON))
+	nodes := parseSubscription(vmessLink)
+	if len(nodes) != 1 {
+		t.Fatalf("failed to parse vmess link")
+	}
+	if nodes[0].Transport != "" {
+		t.Fatalf("expected empty transport for net=tcp, got %q", nodes[0].Transport)
+	}
+
+	// Trojan link with ?type=tcp
+	trojanLink := "trojan://password@tr.example:443?type=tcp&sni=tr.example#Trojan-TCP"
+	parsed := parseSubscription(trojanLink)
+	if len(parsed) != 1 {
+		t.Fatalf("failed to parse trojan link")
+	}
+	if parsed[0].Transport != "" {
+		t.Fatalf("expected empty transport for type=tcp, got %q", parsed[0].Transport)
+	}
+
+	// Trojan link with ?type=h2
+	trojanH2 := "trojan://password@tr.example:443?type=h2&sni=tr.example#Trojan-H2"
+	parsedH2 := parseSubscription(trojanH2)
+	if len(parsedH2) != 1 || parsedH2[0].Transport != "http" {
+		t.Fatalf("expected transport=http for type=h2, got %+v", parsedH2)
+	}
+
+	// Verify sing-box config generation does not render "transport" block when transport is empty or tcp
+	gen := config(Store{Mode: "global", SelectedNode: nodes[0].ID, Nodes: nodes})
+	outbounds := gen["outbounds"].([]any)
+	nodeOutbound := outbounds[2].(map[string]any)
+	if nodeOutbound["transport"] != nil {
+		t.Fatalf("config should not contain transport object for tcp, got: %+v", nodeOutbound["transport"])
+	}
+
+	// ValidateNode rejects invalid transports like "kcp"
+	invalidNode := Node{Name: "invalid", Type: "vmess", Server: "example.com", Port: 443, UUID: "11111111-1111-1111-1111-111111111111", Transport: "kcp"}
+	if err := validateNode(&invalidNode); err == nil {
+		t.Fatal("validateNode should reject unsupported transport kcp")
+	}
+}
+
 func TestRealityOutboundDefaultsToUTLS(t *testing.T) {
 	node := Node{ID: "reality", Name: "Reality", Type: "vless", Server: "example.com", Port: 443, UUID: "11111111-1111-1111-1111-111111111111", TLS: true, RealityPublicKey: "jNXHtI83KYx3XXLs6VJZMBpTqJ8xIuVKvvKDPOv-gRs", RealityShortID: "0123456789abcdef", Enabled: true}
 	generated := config(Store{Mode: "global", SelectedNode: node.ID, Nodes: []Node{node}})
@@ -444,12 +547,12 @@ func TestSQLiteRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	dbPath = filepath.Join(dir, "armwall.db")
 	dataPath = filepath.Join(dir, "store.json")
-	want := Store{Mode: "gfw", ProxyPort: 11080, SelectedNode: "n1", TCPOutbound: "g1", UDPOutbound: "same", DNS: DNSSettings{Enabled: true, RemoteServer: "https://1.1.1.1/dns-query", RemoteSNI: "cloudflare-dns.com", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true}, RuleSettings: map[string]RuleUpdateSetting{"geosite-ads": {BackupURL: "https://example.com/ads.srs", AutoUpdate: true, UpdateHours: 12, LastUpdated: time.Now().UTC().Truncate(time.Second)}}, ACLRules: []ACLRule{{ID: "a1", Name: "客户端", Enabled: true, SourceCIDRs: []string{"192.168.10.20/32"}, Network: "tcp", PortRanges: []string{"443"}, Outbound: "direct"}}, StrategyGroups: []StrategyGroup{{ID: "g1", Name: "自动选择", Type: "urltest", NodeIDs: []string{"n1"}, Selected: "n1", TestURL: "https://example.com/204", IntervalSec: 180, ToleranceMS: 50}}, Subscriptions: []Subscription{{ID: "s1", Name: "测试订阅", URL: "https://example.com/sub", UpdateHours: 6, Enabled: true}}, Nodes: []Node{{ID: "n1", Name: "节点", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true, Group: "测试订阅", SubscriptionID: "s1"}}}
+	want := Store{Mode: "gfw", ProxyPort: 11080, SelectedNode: "n1", TCPOutbound: "g1", UDPOutbound: "same", DNS: DNSSettings{Enabled: true, RemoteServer: "https://1.1.1.1/dns-query", RemoteSNI: "cloudflare-dns.com", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true}, RuleSettings: map[string]RuleUpdateSetting{"geosite-ads": {BackupURL: "https://example.com/ads.srs", AutoUpdate: true, UpdateHours: 12, LastUpdated: time.Now().UTC().Truncate(time.Second)}}, ACLRules: []ACLRule{{ID: "a1", Name: "客户端", Enabled: true, SourceCIDRs: []string{"192.168.10.20/32"}, Network: "tcp", PortRanges: []string{"443"}, Outbound: "direct"}}, StrategyGroups: []StrategyGroup{{ID: "g1", Name: "自动选择", Type: "urltest", NodeIDs: []string{"n1"}, Selected: "n1", TestURL: "https://example.com/204", IntervalSec: 180, ToleranceMS: 50}}, Subscriptions: []Subscription{{ID: "s1", Name: "测试订阅", URL: "https://example.com/sub", UpdateHours: 6, Enabled: true}}, Nodes: []Node{{ID: "n1", Name: "节点", NameOverride: "自定义", GroupOverride: "我的分组", NaivePort: 12009, Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true, Group: "测试订阅", SubscriptionID: "s1"}}}
 	if err := save(want); err != nil {
 		t.Fatal(err)
 	}
 	got := load()
-	if len(got.Nodes) != 1 || len(got.Subscriptions) != 1 || len(got.StrategyGroups) != 1 || len(got.ACLRules) != 1 || !got.DNS.Enabled || got.Nodes[0].SubscriptionID != "s1" || got.ProxyPort != 11080 || got.TCPOutbound != "g1" || !got.RuleSettings["geosite-ads"].AutoUpdate || got.RuleSettings["geosite-ads"].UpdateHours != 12 {
+	if len(got.Nodes) != 1 || len(got.Subscriptions) != 1 || len(got.StrategyGroups) != 1 || len(got.ACLRules) != 1 || !got.DNS.Enabled || got.Nodes[0].SubscriptionID != "s1" || got.Nodes[0].NameOverride != "自定义" || got.Nodes[0].GroupOverride != "我的分组" || got.Nodes[0].NaivePort != 12009 || got.ProxyPort != 11080 || got.TCPOutbound != "g1" || !got.RuleSettings["geosite-ads"].AutoUpdate || got.RuleSettings["geosite-ads"].UpdateHours != 12 {
 		t.Fatalf("unexpected round trip: %+v", got)
 	}
 }
@@ -489,10 +592,91 @@ func TestCorruptSQLiteDoesNotFallBackToJSON(t *testing.T) {
 	}
 }
 
+func TestCorruptNodePayloadRefusesLoad(t *testing.T) {
+	oldDB, oldData := dbPath, dataPath
+	t.Cleanup(func() { dbPath, dataPath = oldDB, oldData; closeDB() })
+	dir := t.TempDir()
+	dbPath = filepath.Join(dir, "armwall.db")
+	dataPath = filepath.Join(dir, "store.json")
+	if err := save(Store{Mode: "global", Nodes: []Node{{ID: "n1", Type: "anytls", Server: "example.com", Port: 443, Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE nodes SET payload = ? WHERE id = ?", "{broken", "n1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadStore(); err == nil || !strings.Contains(err.Error(), "corrupted node payload") {
+		t.Fatalf("corrupted node payload was not refused: %v", err)
+	}
+}
+
 func TestLegacyMigration(t *testing.T) {
 	s := migrateLegacy(Store{SubscriptionURLs: []string{"https://example.com/sub"}, Nodes: []Node{{ID: "sub-1", Name: "legacy"}}})
 	if len(s.Subscriptions) != 1 || s.Nodes[0].SubscriptionID == "" || !s.Nodes[0].Enabled {
 		t.Fatalf("migration failed: %+v", s)
+	}
+}
+
+func TestLegacyJSONMigrationArchivesSourceAndPersistsSchemaVersion(t *testing.T) {
+	oldDB, oldData := dbPath, dataPath
+	t.Cleanup(func() { dbPath, dataPath = oldDB, oldData; closeDB() })
+	dir := t.TempDir()
+	dbPath = filepath.Join(dir, "armwall.db")
+	dataPath = filepath.Join(dir, "store.json")
+	legacy := Store{Mode: "global", ProxyPort: 11080, StrategyGroups: []StrategyGroup{{ID: "g1", Name: "old fallback", Type: "fallback"}}}
+	if err := saveJSON(legacy); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SchemaVersion != 1 || got.StrategyGroups[0].Type != "urltest" {
+		t.Fatalf("legacy strategy migration = version %d type %q", got.SchemaVersion, got.StrategyGroups[0].Type)
+	}
+	if _, err := os.Stat(dataPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy credential file was not archived, stat error=%v", err)
+	}
+	if _, err := os.Stat(dataPath + ".migrated"); err != nil {
+		t.Fatalf("legacy archive missing: %v", err)
+	}
+	got, err = loadStore()
+	if err != nil || got.SchemaVersion != 1 || got.StrategyGroups[0].Type != "urltest" {
+		t.Fatalf("migrated store did not round trip: %+v err=%v", got, err)
+	}
+}
+
+func TestLegacyJSONMigrationRefusesCorruptSourceAndArchiveCollision(t *testing.T) {
+	oldDB, oldData := dbPath, dataPath
+	t.Cleanup(func() { dbPath, dataPath = oldDB, oldData; closeDB() })
+	dir := t.TempDir()
+	dbPath = filepath.Join(dir, "armwall.db")
+	dataPath = filepath.Join(dir, "store.json")
+	if err := os.WriteFile(dataPath, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadStore(); err == nil {
+		t.Fatal("expected corrupt legacy JSON to be rejected")
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("corrupt migration created a database: %v", err)
+	}
+	if err := os.WriteFile(dataPath, []byte(`{"mode":"global"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	archivePath := dataPath + ".migrated"
+	if err := os.WriteFile(archivePath, []byte("previous archive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadStore(); err == nil {
+		t.Fatal("expected existing migration archive to block overwrite")
+	}
+	archive, err := os.ReadFile(archivePath)
+	if err != nil || string(archive) != "previous archive" {
+		t.Fatalf("existing migration archive changed: %q, %v", archive, err)
 	}
 }
 
@@ -515,6 +699,18 @@ func TestConfigRoutingModes(t *testing.T) {
 	route = config(s)["route"].(map[string]any)
 	if route["final"] != "n1" {
 		t.Fatalf("global final=%v", route["final"])
+	}
+}
+
+func BenchmarkConfigGeneration(b *testing.B) {
+	nodes := make([]Node, 0, 200)
+	for i := 0; i < 200; i++ {
+		nodes = append(nodes, Node{ID: fmt.Sprintf("n-%d", i), Name: fmt.Sprintf("node-%d", i), Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true})
+	}
+	s := Store{Mode: "global", ProxyPort: 11080, Nodes: nodes, DNS: DNSSettings{Enabled: true, ListenAddress: "192.168.10.1", ListenPort: 5353, RemoteServer: "https://1.1.1.1/dns-query", DirectServer: "udp://223.5.5.5"}}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = config(s)
 	}
 }
 
@@ -592,6 +788,30 @@ func TestAPIRejectsMalformedJSON(t *testing.T) {
 	recorder := callAPI(t, "/api/node", strings.Repeat(" ", maxAPIJSONBodySize+1))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("oversized status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestAddSubscriptionAcceptsFrontendPayload(t *testing.T) {
+	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080})
+	fetchSubscriptionFn = func(_ context.Context, rawURL string) ([]Node, error) {
+		return []Node{{ID: "n1", Name: "subnode", Type: "anytls", Server: "node.example.com", Port: 443, Password: "secret", TLS: true, Enabled: true}}, nil
+	}
+	// Exact payload shape produced by web/app.js saveSubscription
+	payload := `{"id":"","name":"我的订阅","url":"https://airport.example/sub","update_hours":8,"enabled":true,"last_updated":""}`
+	recorder := callAPI(t, "/api/subscription", payload)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST /api/subscription status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	got := load()
+	if len(got.Subscriptions) != 1 {
+		t.Fatalf("expected 1 subscription, got: %+v", got.Subscriptions)
+	}
+	sub := got.Subscriptions[0]
+	if sub.Name != "我的订阅" || sub.URL != "https://airport.example/sub" || sub.UpdateHours != 8 || !sub.Enabled {
+		t.Fatalf("unexpected subscription: %+v", sub)
+	}
+	if len(got.Nodes) != 1 || got.Nodes[0].SubscriptionID != sub.ID {
+		t.Fatalf("unexpected nodes: %+v", got.Nodes)
 	}
 }
 
@@ -731,6 +951,98 @@ func TestReconcileSubscriptionNodesPreservesIdentityAndEnabledState(t *testing.T
 	}
 }
 
+func TestReconcileSubscriptionPreservesUserNameAndGroupOverrides(t *testing.T) {
+	sub := Subscription{ID: "subscription-1", Name: "Feed Name"}
+	existing := []Node{{ID: "node-1", Name: "My Name", NameOverride: "My Name", Type: "anytls", Server: "node.example", Port: 443, SubscriptionID: sub.ID, Group: "My Group", GroupOverride: "My Group", Enabled: true, NaivePort: 12005}}
+	fetched := []Node{{Name: "Feed Node", Type: "anytls", Server: "node.example", Port: 443, Enabled: true}}
+	got := reconcileSubscriptionNodes(existing, fetched, sub)[0]
+	if got.ID != "node-1" || got.Name != "My Name" || got.Group != "My Group" || got.NaivePort != 12005 {
+		t.Fatalf("user overrides or runtime port were lost: %+v", got)
+	}
+}
+
+func TestSubscriptionNodeEditRecordsUserOverrides(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Subscriptions: []Subscription{{ID: "sub-1", Name: "Feed"}}, Nodes: []Node{{ID: "node-1", Name: "Feed Node", Type: "anytls", Server: "node.example", Port: 443, Password: "secret", SubscriptionID: "sub-1", Group: "Feed", Enabled: true}}})
+	recorder := callAPI(t, "/api/node/update", `{"id":"node-1","name":"Custom Node","type":"anytls","server":"node.example","port":443,"password":"******","tls":true,"group":"Custom Group"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	got := load().Nodes[0]
+	if got.NameOverride != "Custom Node" || got.GroupOverride != "Custom Group" {
+		t.Fatalf("node edit did not record overrides: %+v", got)
+	}
+}
+
+func TestNaivePortsRemainStableAcrossReorderAndAddition(t *testing.T) {
+	s := Store{Nodes: []Node{
+		{ID: "naive-a", Type: "naive", Server: "a.example", Port: 443, Enabled: true, NaivePort: 12000},
+		{ID: "naive-b", Type: "naive", Server: "b.example", Port: 443, Enabled: true, NaivePort: 12001},
+	}}
+	first := naiveBindings(s)
+	reordered := Store{Nodes: []Node{s.Nodes[1], s.Nodes[0], {ID: "naive-c", Type: "naive", Server: "c.example", Port: 443, Enabled: true}}}
+	second := naiveBindings(reordered)
+	ports := make(map[string]int)
+	for _, binding := range second {
+		ports[binding.Node.ID] = binding.Port
+	}
+	if ports["naive-a"] != first[0].Port || ports["naive-b"] != first[1].Port || ports["naive-c"] != 12002 {
+		t.Fatalf("ports changed or new port collided: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestNaivePortAllocationSkipsExistingRuntimeListeners(t *testing.T) {
+	oldNaiveProxyPort := naiveProxyPort
+	naiveProxyPort = 12000
+	t.Cleanup(func() { naiveProxyPort = oldNaiveProxyPort })
+	s := Store{ProxyPort: 12000, Nodes: []Node{{ID: "naive-a", Type: "naive", Server: "a.example", Port: 443, Enabled: true}}}
+	if err := assignNaivePorts(&s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Nodes[0].NaivePort != 12001 {
+		t.Fatalf("allocated port=%d, want next free port 12001", s.Nodes[0].NaivePort)
+	}
+}
+
+func TestValidateRuntimePortsDoesNotSilentlyRemapPersistedConflict(t *testing.T) {
+	oldTProxyPort, oldNaiveProxyPort := tproxyPort, naiveProxyPort
+	t.Cleanup(func() { tproxyPort, naiveProxyPort = oldTProxyPort, oldNaiveProxyPort })
+	tproxyPort = 11081
+	naiveProxyPort = 12000
+	s := Store{ProxyPort: 12000, Nodes: []Node{{ID: "naive-a", Type: "naive", Server: "a.example", Port: 443, Enabled: true, NaivePort: 12000}}}
+	if err := validateRuntimePorts(s); err == nil {
+		t.Fatal("expected persisted Naive/Proxy collision to be rejected")
+	}
+	if s.Nodes[0].NaivePort != 12000 {
+		t.Fatalf("persisted port was silently remapped: %d", s.Nodes[0].NaivePort)
+	}
+}
+
+func TestServeUntilShutdownClosesListenerGracefully(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveUntilShutdown(ctx, server, listener) }()
+	response, err := http.Get("http://" + listener.Addr().String())
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not shut down after context cancellation")
+	}
+}
+
 func TestSubscriptionRefreshContinuesAfterOneSourceFails(t *testing.T) {
 	initial := Store{
 		Mode:      "bypass_cn",
@@ -745,7 +1057,7 @@ func TestSubscriptionRefreshContinuesAfterOneSourceFails(t *testing.T) {
 		},
 	}
 	setupAPITest(t, initial)
-	fetchSubscriptionFn = func(rawURL string) ([]Node, error) {
+	fetchSubscriptionFn = func(_ context.Context, rawURL string) ([]Node, error) {
 		if strings.Contains(rawURL, "bad.example") {
 			return nil, fmt.Errorf("temporary failure")
 		}
@@ -769,6 +1081,22 @@ func TestSubscriptionRefreshContinuesAfterOneSourceFails(t *testing.T) {
 	}
 	if subscriptions["good"].LastUpdated.IsZero() || !subscriptions["bad"].LastUpdated.IsZero() {
 		t.Fatalf("unexpected subscription timestamps: %+v", got.Subscriptions)
+	}
+}
+
+func TestCanceledSingleSubscriptionFetchDoesNotCommit(t *testing.T) {
+	initial := Store{Mode: "global", ProxyPort: 11080, Subscriptions: []Subscription{{ID: "s1", Name: "source", URL: "https://source.example/sub", UpdateHours: 6, Enabled: true}}}
+	setupAPITest(t, initial)
+	fetchSubscriptionFn = func(ctx context.Context, _ string) ([]Node, error) {
+		return []Node{{Name: "new", Type: "anytls", Server: "new.example", Port: 443, Password: "secret", Enabled: true}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/subscription/update-one", strings.NewReader(`{"id":"s1"}`)).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	api(recorder, req)
+	if recorder.Code != 499 || len(load().Nodes) != 0 {
+		t.Fatalf("canceled fetch committed: status=%d nodes=%+v", recorder.Code, load().Nodes)
 	}
 }
 
@@ -948,7 +1276,8 @@ func TestConfigurationWhileStoppedDoesNotStartProxy(t *testing.T) {
 		return nil
 	}
 	recorder := callAPI(t, "/api/settings", `{"proxyPort":12080}`)
-	if recorder.Code != http.StatusOK || restarts != 0 || load().ProxyPort != 12080 {
+	generated, readErr := os.ReadFile(configPath)
+	if recorder.Code != http.StatusOK || readErr != nil || restarts != 0 || load().ProxyPort != 12080 || !bytes.Contains(generated, []byte(`"listen_port": 12080`)) {
 		t.Fatalf("status=%d restarts=%d stored=%d body=%s", recorder.Code, restarts, load().ProxyPort, recorder.Body.String())
 	}
 }
@@ -1044,6 +1373,35 @@ func TestWriteConfigCreatesMACACLBindings(t *testing.T) {
 	}
 }
 
+func TestWriteConfigRestoresNaiveFilesWhenMACCommitFails(t *testing.T) {
+	dir := t.TempDir()
+	oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir := configPath, macACLPath, naiveConfigDir, logDir
+	configPath = filepath.Join(dir, "sing-box.json")
+	macACLPath = filepath.Join(dir, "mac-acl")
+	naiveConfigDir = filepath.Join(dir, "naive")
+	logDir = filepath.Join(dir, "logs")
+	t.Cleanup(func() {
+		configPath, macACLPath, naiveConfigDir, logDir = oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir
+	})
+	if err := os.MkdirAll(naiveConfigDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(naiveConfigDir, "old.json"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(macACLPath, 0750); err != nil {
+		t.Fatal(err)
+	}
+	s := Store{Mode: "global", Nodes: []Node{{ID: "n1", Type: "naive", Server: "example.com", Port: 443, Enabled: true, Transport: "https"}}}
+	if err := writeConfig(s); err == nil {
+		t.Fatal("expected MAC ACL target failure")
+	}
+	data, err := os.ReadFile(filepath.Join(naiveConfigDir, "old.json"))
+	if err != nil || string(data) != "old" {
+		t.Fatalf("previous Naive config was not restored: data=%q err=%v", data, err)
+	}
+}
+
 func TestACLAndDNSAPI(t *testing.T) {
 	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
 	recorder := callAPI(t, "/api/acl", `{"name":"客户端","enabled":true,"source_cidrs":["192.168.10.20"],"source_macs":["00:11:22:33:44:55"],"network":"tcp","port_ranges":["443"],"outbound":"direct"}`)
@@ -1072,6 +1430,10 @@ func TestRouteRulesHaveSniffing(t *testing.T) {
 		ACLRules: []ACLRule{
 			{ID: "a1", Name: "mac-rule", Enabled: true, SourceMACs: []string{"00:11:22:33:44:55"}, Outbound: "direct"},
 		},
+		DNS: DNSSettings{
+			Enabled: true,
+			Hijack:  true,
+		},
 	}
 	c := config(s)
 	route, ok := c["route"].(map[string]any)
@@ -1082,16 +1444,27 @@ func TestRouteRulesHaveSniffing(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing rules in route: %+v", route)
 	}
-	var foundSniff bool
-	for _, raw := range rules {
+	sniffIdx := -1
+	dnsProtoIdx := -1
+	for idx, raw := range rules {
 		rule, ok := raw.(map[string]any)
-		if ok && rule["action"] == "sniff" {
-			foundSniff = true
-			break
+		if ok {
+			if rule["action"] == "sniff" {
+				sniffIdx = idx
+			}
+			if rule["protocol"] == "dns" {
+				dnsProtoIdx = idx
+			}
 		}
 	}
-	if !foundSniff {
+	if sniffIdx == -1 {
 		t.Fatalf("missing sniff rule in route: %+v", rules)
+	}
+	if dnsProtoIdx == -1 {
+		t.Fatalf("missing protocol:dns rule in route: %+v", rules)
+	}
+	if sniffIdx > dnsProtoIdx {
+		t.Fatalf("action:sniff (idx=%d) must come before protocol:dns (idx=%d) for TProxy packet classification", sniffIdx, dnsProtoIdx)
 	}
 }
 
@@ -1114,6 +1487,77 @@ func TestSettingsAPIRejectsConflictingPorts(t *testing.T) {
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 for conflicting port %d, got %d", port, recorder.Code)
 		}
+	}
+}
+
+func TestSubscriptionScheduleDoesNotRewriteSystemdTimer(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, UpdateHours: 6})
+	recorder := callAPI(t, "/api/subscription/schedule", `{"hours":12}`)
+	if recorder.Code != http.StatusOK || load().UpdateHours != 6 || !strings.Contains(recorder.Body.String(), `"schedule":"per-subscription"`) {
+		t.Fatalf("schedule update status=%d store=%+v body=%s", recorder.Code, load(), recorder.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dataPath), "armwall-subscription-update.timer.d")); !os.IsNotExist(err) {
+		t.Fatalf("schedule API created a timer override, stat error=%v", err)
+	}
+}
+
+func TestBootstrapRuleUpdatesIgnoreAutoUpdateOptOut(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, RuleSettings: map[string]RuleUpdateSetting{}})
+	oldUpdateRule := updateRuleFn
+	t.Cleanup(func() { updateRuleFn = oldUpdateRule })
+	calls := 0
+	updateRuleFn = func(_, _ string) error { calls++; return nil }
+	if count, err := applyScheduledRuleUpdates(); err != nil || count != 0 || calls != 0 {
+		t.Fatalf("scheduled updates should respect opt-out: count=%d calls=%d err=%v", count, calls, err)
+	}
+	count, err := applyRuleUpdates(true)
+	if err != nil || count != len(ruleURLs) || calls != len(ruleURLs) {
+		t.Fatalf("bootstrap should force all rules: count=%d calls=%d err=%v", count, calls, err)
+	}
+}
+
+func TestValidateRuntimePortsRejectsGeneratedListenerConflicts(t *testing.T) {
+	oldTProxyPort, oldNaiveProxyPort := tproxyPort, naiveProxyPort
+	t.Cleanup(func() { tproxyPort, naiveProxyPort = oldTProxyPort, oldNaiveProxyPort })
+
+	tproxyPort = 12000
+	naiveProxyPort = 13000
+	if err := validateRuntimePorts(Store{ProxyPort: 12000}); err == nil {
+		t.Fatal("expected proxy/TProxy conflict")
+	}
+
+	tproxyPort = 12000
+	naiveProxyPort = 12001
+	s := Store{
+		ProxyPort: 11080,
+		ACLRules:  []ACLRule{{Enabled: true, SourceMACs: []string{"00:11:22:33:44:55"}}},
+		Nodes:     []Node{{Type: "naive", Enabled: true, Server: "example.com", Port: 443, NaivePort: 12001}},
+	}
+	if err := validateRuntimePorts(s); err == nil {
+		t.Fatal("expected NaiveProxy/MAC ACL derived port conflict")
+	}
+}
+
+func TestValidateRuntimePortsCoversWebDNSAndClash(t *testing.T) {
+	oldAccess, oldListen := os.Getenv("ARMWALL_WEB_ACCESS"), os.Getenv("ARMWALL_LISTEN")
+	t.Cleanup(func() {
+		os.Setenv("ARMWALL_WEB_ACCESS", oldAccess)
+		os.Setenv("ARMWALL_LISTEN", oldListen)
+	})
+	os.Setenv("ARMWALL_WEB_ACCESS", "custom")
+	os.Setenv("ARMWALL_LISTEN", "127.0.0.1:9090")
+	if err := validateRuntimePorts(Store{ProxyPort: 11080}); err == nil {
+		t.Fatal("expected Web/Clash conflict")
+	}
+	os.Setenv("ARMWALL_LISTEN", "127.0.0.1:18080")
+	if err := validateRuntimePorts(Store{ProxyPort: 11080, DNS: DNSSettings{Enabled: true, ListenAddress: "127.0.0.1", ListenPort: 11080}}); err == nil {
+		t.Fatal("expected DNS/Mixed conflict")
+	}
+}
+
+func TestValidateSRSRejectsInvalidMagic(t *testing.T) {
+	if err := validateSRS([]byte("not-a-valid-rule-set")); err == nil {
+		t.Fatal("expected invalid SRS magic to be rejected")
 	}
 }
 
@@ -1201,4 +1645,99 @@ func TestBatchNodeTestAndCredentialMasking(t *testing.T) {
 	if saved.Nodes[0].Password != "supersecretpassword" || saved.Nodes[0].Name != "Renamed Node" {
 		t.Fatalf("expected preserved password, got: %+v", saved.Nodes[0])
 	}
+}
+
+func TestUpdateSubscriptionsCLIEntrypointDoesNotDeadlock(t *testing.T) {
+	initial := Store{
+		Mode: "whitelist",
+		Subscriptions: []Subscription{
+			{
+				ID:          "sub-1",
+				Name:        "Sub 1",
+				URL:         "https://example.com/sub.txt",
+				UpdateHours: 1,
+				Enabled:     true,
+				LastUpdated: time.Now().Add(-2 * time.Hour), // Due for update
+			},
+		},
+	}
+	setupAPITest(t, initial)
+
+	fetchSubscriptionFn = func(_ context.Context, rawURL string) ([]Node, error) {
+		return []Node{{
+			ID:       "fetched-node-1",
+			Name:     "Fetched Node 1",
+			Type:     "shadowsocks",
+			Server:   "1.2.3.4",
+			Port:     8388,
+			Password: "pass",
+			Method:   "aes-128-gcm",
+			Enabled:  true,
+		}}, nil
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- updateSubscriptions()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("updateSubscriptions returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("updateSubscriptions deadlocked on store file lock!")
+	}
+
+	updated := load()
+	if len(updated.Nodes) != 1 || updated.Nodes[0].Name != "Fetched Node 1" {
+		t.Fatalf("expected updated nodes, got: %+v", updated.Nodes)
+	}
+}
+
+func TestProxyPortConcurrentAccess(t *testing.T) {
+	oldPort := getProxyPort()
+	defer setProxyPort(oldPort)
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					p := getProxyPort()
+					if p <= 0 {
+						t.Errorf("invalid port read: %d", p)
+					}
+					_ = config(Store{Mode: "global", ProxyPort: p})
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					setProxyPort(1080 + (id % 100))
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
 }

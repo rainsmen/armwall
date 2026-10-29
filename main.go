@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -65,6 +66,9 @@ type Node struct {
 	SubscriptionID   string `json:"subscription_id"`
 	Enabled          bool   `json:"enabled"`
 	SortOrder        int    `json:"sort_order"`
+	NameOverride     string `json:"name_override,omitempty"`
+	GroupOverride    string `json:"group_override,omitempty"`
+	NaivePort        int    `json:"naive_port,omitempty"`
 }
 
 type StrategyGroup struct {
@@ -125,6 +129,8 @@ type RuleUpdateSetting struct {
 }
 
 type Store struct {
+	Revision         int64                        `json:"revision,omitempty"`
+	SchemaVersion    int                          `json:"schema_version,omitempty"`
 	Nodes            []Node                       `json:"nodes"`
 	SubscriptionURLs []string                     `json:"subscription_urls"`
 	Mode             string                       `json:"mode"`
@@ -169,6 +175,18 @@ func anyInt(value any) int {
 	}
 }
 
+func normalizeTransport(t string) string {
+	raw := strings.ToLower(strings.TrimSpace(t))
+	switch raw {
+	case "", "tcp", "none":
+		return ""
+	case "h2":
+		return "http"
+	default:
+		return raw
+	}
+}
+
 func parseVMessLink(line string) (Node, bool) {
 	decoded, ok := decodeBase64(strings.TrimPrefix(line, "vmess://"))
 	if !ok {
@@ -192,7 +210,7 @@ func parseVMessLink(line string) (Node, bool) {
 		AlterID:     anyInt(value.Aid),
 		TLS:         value.TLS != "" && !strings.EqualFold(value.TLS, "none"),
 		ServerName:  value.SNI,
-		Transport:   value.Net,
+		Transport:   normalizeTransport(value.Net),
 		Host:        value.Host,
 		Path:        value.Path,
 		ServiceName: value.Path,
@@ -320,7 +338,7 @@ func parseSubscription(raw string) []Node {
 		n.ServerName = u.Query().Get("sni")
 		n.Insecure = u.Query().Get("insecure") == "1"
 		if transport := u.Query().Get("type"); transport != "" {
-			n.Transport = transport
+			n.Transport = normalizeTransport(transport)
 		}
 		n.Host = u.Query().Get("host")
 		n.Path = u.Query().Get("path")
@@ -352,13 +370,13 @@ func parseSubscription(raw string) []Node {
 	return out
 }
 
-func fetchSubscription(rawURL string) ([]Node, error) {
+func fetchSubscription(ctx context.Context, rawURL string) ([]Node, error) {
 	if !httpsURL(rawURL) {
 		return nil, fmt.Errorf("subscription must use https")
 	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		body, err := downloadResource(rawURL, 4<<20, 20*time.Second)
+		body, err := downloadResourceContext(ctx, rawURL, 4<<20, 20*time.Second)
 		if err != nil {
 			lastErr = err
 		} else if nodes := parseSubscription(string(body)); len(nodes) > 0 {
@@ -367,24 +385,33 @@ func fetchSubscription(rawURL string) ([]Node, error) {
 			lastErr = fmt.Errorf("no supported nodes")
 		}
 		if attempt < 2 {
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			timer := time.NewTimer(time.Duration(attempt+1) * 2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	return nil, lastErr
 }
 
-var fetchSubscriptionFn = fetchSubscription
+var fetchSubscriptionFn = func(ctx context.Context, rawURL string) ([]Node, error) {
+	return fetchSubscription(ctx, rawURL)
+}
 
 func updateSubscriptions() error {
-	return withStoreFileLock(func() error {
-		return updateSubscriptionsWithForceLocked(false)
-	})
+	return updateSubscriptionsWithForceContext(context.Background(), false)
 }
 
 func subscriptionNodeKey(node Node) string {
 	node.ID = ""
 	node.Name = ""
 	node.Group = ""
+	node.NameOverride = ""
+	node.GroupOverride = ""
+	node.NaivePort = 0
 	node.SubscriptionID = ""
 	node.Enabled = false
 	node.SortOrder = 0
@@ -412,6 +439,15 @@ func reconcileSubscriptionNodes(existing, fetched []Node, sub Subscription) []No
 			fetched[i].ID = matches[0].ID
 			fetched[i].Enabled = matches[0].Enabled
 			fetched[i].SortOrder = matches[0].SortOrder
+			fetched[i].NameOverride = matches[0].NameOverride
+			fetched[i].GroupOverride = matches[0].GroupOverride
+			fetched[i].NaivePort = matches[0].NaivePort
+			if fetched[i].NameOverride != "" {
+				fetched[i].Name = fetched[i].NameOverride
+			}
+			if fetched[i].GroupOverride != "" {
+				fetched[i].Group = fetched[i].GroupOverride
+			}
 			previous[key] = matches[1:]
 			continue
 		}
@@ -437,6 +473,10 @@ func subscriptionDue(sub Subscription, now time.Time) bool {
 }
 
 func updateSubscriptionsWithForce(force bool) error {
+	return updateSubscriptionsWithForceContext(context.Background(), force)
+}
+
+func updateSubscriptionsWithForceContext(ctx context.Context, force bool) error {
 	s, err := loadStore()
 	if err != nil {
 		return err
@@ -446,7 +486,11 @@ func updateSubscriptionsWithForce(force bool) error {
 	}
 	now := time.Now()
 	var subsToFetch []Subscription
+	baselineUpdated := make(map[string]time.Time)
+	baselineEnabled := make(map[string]bool)
 	for _, sub := range s.Subscriptions {
+		baselineUpdated[sub.ID] = sub.LastUpdated
+		baselineEnabled[sub.ID] = sub.Enabled
 		if !sub.Enabled {
 			continue
 		}
@@ -460,6 +504,7 @@ func updateSubscriptionsWithForce(force bool) error {
 
 	type fetchRes struct {
 		subID string
+		url   string
 		nodes []Node
 		err   error
 	}
@@ -469,13 +514,16 @@ func updateSubscriptionsWithForce(force bool) error {
 		wg.Add(1)
 		go func(idx int, targetSub Subscription) {
 			defer wg.Done()
-			nodes, fetchErr := fetchSubscriptionFn(targetSub.URL)
-			results[idx] = fetchRes{subID: targetSub.ID, nodes: nodes, err: fetchErr}
+			nodes, fetchErr := fetchSubscriptionFn(ctx, targetSub.URL)
+			results[idx] = fetchRes{subID: targetSub.ID, url: targetSub.URL, nodes: nodes, err: fetchErr}
 		}(i, sub)
 	}
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-	return withStoreFileLock(func() error {
+	return withStoreFileLockContext(ctx, func() error {
 		cur, loadErr := loadStore()
 		if loadErr != nil {
 			return loadErr
@@ -490,6 +538,13 @@ func updateSubscriptionsWithForce(force bool) error {
 					sub = item
 					break
 				}
+			}
+			if sub.URL != res.url {
+				continue
+			}
+			if !sub.LastUpdated.Equal(baselineUpdated[res.subID]) || sub.Enabled != baselineEnabled[res.subID] {
+				// A newer refresh or a user edit won the race while this fetch ran.
+				continue
 			}
 			if res.err != nil {
 				name := sub.Name
@@ -538,26 +593,14 @@ func updateSubscriptionsWithForce(force bool) error {
 		for _, sub := range cur.Subscriptions {
 			cur.SubscriptionURLs = append(cur.SubscriptionURLs, sub.URL)
 		}
-		if err := writeConfig(cur); err != nil {
+		if err := persistStore(cur, wasRunning); err != nil {
 			return err
-		}
-		if err := save(cur); err != nil {
-			return err
-		}
-		if wasRunning {
-			if err := restartProxyFn(); err != nil {
-				return err
-			}
 		}
 		if len(errs) > 0 {
 			return fmt.Errorf("%s", strings.Join(errs, "; "))
 		}
 		return nil
 	})
-}
-
-func updateSubscriptionsWithForceLocked(force bool) error {
-	return updateSubscriptionsWithForce(force)
 }
 
 var mu sync.Mutex
@@ -568,7 +611,22 @@ var naiveConfigDir = "/etc/armwall/naive"
 var logDir = "/var/log/armwall"
 var gatewayPath = "/usr/local/bin/armwall-gateway"
 var gatewayStatePath = "/var/lib/armwall/gateway.state"
+var ruleDataDir = "/var/lib/armwall/rules"
 var proxyPort = 1080
+var proxyPortMu sync.RWMutex
+
+func getProxyPort() int {
+	proxyPortMu.RLock()
+	defer proxyPortMu.RUnlock()
+	return proxyPort
+}
+
+func setProxyPort(p int) {
+	proxyPortMu.Lock()
+	defer proxyPortMu.Unlock()
+	proxyPort = p
+}
+
 var tproxyEnabled bool
 var tproxyPort = 11081
 var naiveProxyPort = 12000
@@ -631,6 +689,26 @@ func lockStoreFile() (func(), error) {
 	return unlock, nil
 }
 
+func lockStoreFileShared() (func(), error) {
+	path := storeLockFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	unlock := func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}
+	return unlock, nil
+}
+
 func withStoreFileLock(fn func() error) error {
 	unlock, err := lockStoreFile()
 	if err != nil {
@@ -638,6 +716,35 @@ func withStoreFileLock(fn func() error) error {
 	}
 	defer unlock()
 	return fn()
+}
+
+func withStoreFileLockContext(ctx context.Context, fn func() error) error {
+	path := storeLockFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	for {
+		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			return fn()
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			return err
+		}
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func clashSecretFile() string {
@@ -718,7 +825,7 @@ func httpsURL(raw string) bool {
 
 func outboundHTTPClients(timeout time.Duration) []*http.Client {
 	clients := make([]*http.Client, 0, 2)
-	address := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	address := fmt.Sprintf("127.0.0.1:%d", getProxyPort())
 	if conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond); err == nil {
 		_ = conn.Close()
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -731,12 +838,20 @@ func outboundHTTPClients(timeout time.Duration) []*http.Client {
 }
 
 func downloadResource(raw string, limit int64, timeout time.Duration) ([]byte, error) {
+	return downloadResourceContext(context.Background(), raw, limit, timeout)
+}
+
+func downloadResourceContext(ctx context.Context, raw string, limit int64, timeout time.Duration) ([]byte, error) {
 	if !httpsURL(raw) {
 		return nil, fmt.Errorf("download URL must use https")
 	}
 	var lastErr error
 	for _, client := range outboundHTTPClients(timeout) {
-		resp, err := client.Get(raw)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
@@ -760,6 +875,9 @@ func downloadResource(raw string, limit int64, timeout time.Duration) ([]byte, e
 	if lastErr == nil {
 		lastErr = fmt.Errorf("download failed")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return nil, lastErr
 }
 
@@ -776,6 +894,30 @@ func updateRule(tag, backup string) error {
 	if backup != "" {
 		urls = append(urls, backup)
 	}
+	target := filepath.Join(ruleDataDir, tag+".srs")
+	useLocalAsset := false
+	current, currentErr := os.ReadFile(target)
+	if os.IsNotExist(currentErr) {
+		useLocalAsset = true
+	} else if currentErr != nil {
+		return fmt.Errorf("read existing rule: %w", currentErr)
+	} else if validateSRS(current) != nil {
+		useLocalAsset = true
+	}
+	if useLocalAsset {
+		if body, asset, assetErr := bundledRule(tag); assetErr == nil {
+			if len(current) > 0 && bytes.Equal(current, body) {
+				return nil
+			}
+			if err := os.MkdirAll(ruleDataDir, 0750); err != nil {
+				return err
+			}
+			if err := writeAtomicFile(target, body, 0640); err != nil {
+				return fmt.Errorf("install local rule asset %s: %w", asset, err)
+			}
+			return nil
+		}
+	}
 	var last error
 	for _, raw := range urls {
 		body, err := downloadResource(raw, 32<<20, 30*time.Second)
@@ -786,45 +928,239 @@ func updateRule(tag, backup string) error {
 			last = fmt.Errorf("%s: %w", raw, err)
 			continue
 		}
-		checkLen := len(body)
-		if checkLen > 512 {
-			checkLen = 512
-		}
-		prefix := strings.TrimSpace(string(body[:min(len(body), 64)]))
-		if strings.HasPrefix(prefix, "<") || bytes.Contains(body[:checkLen], []byte("<!DOCTYPE html")) || bytes.Contains(body[:checkLen], []byte("<html")) {
-			last = fmt.Errorf("%s: downloaded rule returned html error page", raw)
+		if err := validateSRS(body); err != nil {
+			last = fmt.Errorf("%s: %w", raw, err)
 			continue
 		}
-		dir := "/var/lib/armwall/rules"
+		dir := ruleDataDir
 		if err = os.MkdirAll(dir, 0750); err != nil {
 			return err
 		}
 		target := filepath.Join(dir, tag+".srs")
 		bak := filepath.Join(dir, tag+".srs.bak")
+		absent := bak + ".absent"
 		if prev, readErr := os.ReadFile(target); readErr == nil {
-			_ = os.WriteFile(bak, prev, 0640)
+			if bytes.Equal(prev, body) {
+				// Rule content unchanged, avoid redundant disk write and service restart
+				return nil
+			}
+			if err = os.WriteFile(bak, prev, 0640); err != nil {
+				return fmt.Errorf("backup existing rule: %w", err)
+			}
+			_ = os.Remove(absent)
+		} else if !os.IsNotExist(readErr) {
+			return fmt.Errorf("read existing rule: %w", readErr)
+		} else {
+			if err = os.WriteFile(absent, nil, 0600); err != nil {
+				return fmt.Errorf("record absent rule: %w", err)
+			}
 		}
 		return writeAtomicFile(target, body, 0640)
 	}
 	return last
 }
 
-func restoreRuleBackups(tags []string) {
-	dir := "/var/lib/armwall/rules"
+func bundledRule(tag string) ([]byte, string, error) {
+	assetDir := strings.TrimSpace(os.Getenv("ARMWALL_RULE_ASSET_DIR"))
+	if assetDir == "" {
+		assetDir = "/usr/share/armwall/rules"
+	}
+	asset := filepath.Join(assetDir, tag+".srs")
+	body, err := os.ReadFile(asset)
+	if err != nil {
+		return nil, asset, err
+	}
+	if err := validateSRS(body); err != nil {
+		return nil, asset, err
+	}
+	return body, asset, nil
+}
+
+func validateSRS(body []byte) error {
+	if len(body) < 4 {
+		return fmt.Errorf("SRS rule is too short")
+	}
+	if !bytes.Equal(body[:3], []byte("SRS")) {
+		return fmt.Errorf("invalid SRS magic")
+	}
+	checker, err := exec.LookPath("sing-box")
+	if err != nil {
+		return fmt.Errorf("sing-box rule-set validator is unavailable")
+	}
+	input, err := os.CreateTemp("", "armwall-rule-*.srs")
+	if err != nil {
+		return err
+	}
+	inputPath := input.Name()
+	defer os.Remove(inputPath)
+	if _, err := input.Write(body); err != nil {
+		input.Close()
+		return err
+	}
+	if err := input.Close(); err != nil {
+		return err
+	}
+	output, err := os.CreateTemp("", "armwall-rule-*.json")
+	if err != nil {
+		return err
+	}
+	outputPath := output.Name()
+	if err := output.Close(); err != nil {
+		os.Remove(outputPath)
+		return err
+	}
+	defer os.Remove(outputPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, checker, "rule-set", "decompile", "--output", outputPath, inputPath)
+	if result, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("SRS validation timed out")
+		}
+		return fmt.Errorf("sing-box rejected SRS: %s", strings.TrimSpace(string(result)))
+	}
+	decoded, err := os.ReadFile(outputPath)
+	if err != nil {
+		return fmt.Errorf("read decompiled SRS: %w", err)
+	}
+	var source struct {
+		Version int               `json:"version"`
+		Rules   []json.RawMessage `json:"rules"`
+	}
+	if err := json.Unmarshal(decoded, &source); err != nil || source.Version < 1 || source.Rules == nil {
+		return fmt.Errorf("sing-box produced an invalid rule-set source")
+	}
+	return nil
+}
+
+func bootstrapRules() (int, error) {
+	count := 0
+	var updateErr error
+	err := withRuleUpdateLock(func() error {
+		s, err := loadStore()
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		for tag, setting := range s.RuleSettings {
+			if _, ok := ruleURLs[tag]; !ok {
+				continue
+			}
+			path := filepath.Join(ruleDataDir, tag+".srs")
+			if body, readErr := os.ReadFile(path); readErr == nil && validateSRS(body) == nil {
+				setting.LastUpdated = now
+				s.RuleSettings[tag] = setting
+			}
+		}
+		for tag := range ruleURLs {
+			path := filepath.Join(ruleDataDir, tag+".srs")
+			body, readErr := os.ReadFile(path)
+			if readErr == nil && validateSRS(body) == nil {
+				continue
+			}
+			setting := s.RuleSettings[tag]
+			if err := updateRuleFn(tag, setting.BackupURL); err != nil {
+				updateErr = errors.Join(updateErr, fmt.Errorf("%s: %w", tag, err))
+				continue
+			}
+			setting.LastUpdated = now
+			s.RuleSettings[tag] = setting
+			count++
+		}
+		if count == 0 && updateErr != nil {
+			return updateErr
+		}
+		if count == 0 {
+			return nil
+		}
+		if err := withStoreFileLock(func() error {
+			current, err := loadStore()
+			if err != nil {
+				return err
+			}
+			for tag, setting := range s.RuleSettings {
+				if setting.LastUpdated.Equal(now) {
+					current.RuleSettings[tag] = setting
+				}
+			}
+			return persistStore(current, proxyRunningFn())
+		}); err != nil {
+			updateErr = errors.Join(updateErr, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return count, err
+	}
+	return count, updateErr
+}
+
+func ruleLockFile() string {
+	if path := os.Getenv("ARMWALL_RULE_LOCK"); path != "" {
+		return path
+	}
+	return filepath.Join(filepath.Dir(dataPath), "armwall-rules.lock")
+}
+
+func withRuleUpdateLock(fn func() error) error {
+	path := ruleLockFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+func restoreRuleBackups(tags []string) error {
+	dir := ruleDataDir
+	var errs []string
 	for _, tag := range tags {
 		bak := filepath.Join(dir, tag+".srs.bak")
 		target := filepath.Join(dir, tag+".srs")
 		if _, err := os.Stat(bak); err == nil {
-			_ = os.Rename(bak, target)
+			if err := os.Rename(bak, target); err != nil {
+				errs = append(errs, tag+": "+err.Error())
+			}
+		} else if os.IsNotExist(err) {
+			if _, markerErr := os.Stat(bak + ".absent"); markerErr == nil {
+				if removeErr := os.Remove(target); removeErr != nil && !os.IsNotExist(removeErr) {
+					errs = append(errs, tag+": "+removeErr.Error())
+				}
+			} else if !os.IsNotExist(markerErr) {
+				errs = append(errs, tag+": "+markerErr.Error())
+			}
+		} else if !os.IsNotExist(err) {
+			errs = append(errs, tag+": "+err.Error())
 		}
 	}
+	if len(errs) > 0 {
+		return fmt.Errorf("restore rule backups: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
-func cleanupRuleBackups(tags []string) {
-	dir := "/var/lib/armwall/rules"
+func cleanupRuleBackups(tags []string) error {
+	dir := ruleDataDir
+	var errs []string
 	for _, tag := range tags {
-		_ = os.Remove(filepath.Join(dir, tag+".srs.bak"))
+		for _, suffix := range []string{".srs.bak", ".srs.bak.absent"} {
+			if err := os.Remove(filepath.Join(dir, tag+suffix)); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, tag+": "+err.Error())
+			}
+		}
 	}
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup rule backups: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 var updateRuleFn = updateRule
@@ -896,42 +1232,52 @@ func updateConfiguredRules(s *Store, force bool, onlyTag string, now time.Time) 
 	return updated, nil
 }
 
-func applyScheduledRuleUpdates() (int, error) {
-	var count int
-	err := withStoreFileLock(func() error {
-		updated, updateErr := applyScheduledRuleUpdatesLocked()
-		count = updated
-		return updateErr
+func applyRuleUpdates(force bool) (int, error) {
+	count := 0
+	var updateErr error
+	err := withRuleUpdateLock(func() error {
+		s, err := loadStore()
+		if err != nil {
+			return err
+		}
+		updated, batchErr := updateConfiguredRules(&s, force, "", time.Now())
+		updateErr = batchErr
+		if len(updated) == 0 {
+			return batchErr
+		}
+		commitErr := withStoreFileLock(func() error {
+			current, loadErr := loadStore()
+			if loadErr != nil {
+				return loadErr
+			}
+			normalizeRuleSettings(&current)
+			for _, tag := range updated {
+				setting := current.RuleSettings[tag]
+				setting.LastUpdated = s.RuleSettings[tag].LastUpdated
+				current.RuleSettings[tag] = setting
+			}
+			return persistStore(current, proxyRunningFn())
+		})
+		if commitErr != nil {
+			if restoreErr := restoreRuleBackups(updated); restoreErr != nil {
+				return fmt.Errorf("%v; %w", commitErr, restoreErr)
+			}
+			return commitErr
+		}
+		if cleanupErr := cleanupRuleBackups(updated); cleanupErr != nil {
+			return cleanupErr
+		}
+		count = len(updated)
+		return nil
 	})
-	return count, err
-}
-
-func applyScheduledRuleUpdatesLocked() (int, error) {
-	s, err := loadStore()
 	if err != nil {
 		return 0, err
 	}
-	wasRunning := proxyRunningFn()
-	updated, updateErr := updateConfiguredRules(&s, false, "", time.Now())
-	if len(updated) == 0 {
-		return 0, updateErr
-	}
-	if err := writeConfig(s); err != nil {
-		restoreRuleBackups(updated)
-		return 0, err
-	}
-	if err := save(s); err != nil {
-		restoreRuleBackups(updated)
-		return 0, err
-	}
-	if wasRunning {
-		if err := restartProxy(); err != nil {
-			restoreRuleBackups(updated)
-			return 0, err
-		}
-	}
-	cleanupRuleBackups(updated)
-	return len(updated), updateErr
+	return count, updateErr
+}
+
+func applyScheduledRuleUpdates() (int, error) {
+	return applyRuleUpdates(false)
 }
 
 func loadStore() (Store, error) {
@@ -946,10 +1292,26 @@ func loadStore() (Store, error) {
 		return Store{}, err
 	}
 	if _, err := os.Stat(dataPath); err == nil {
-		legacy := migrateLegacy(loadJSON())
+		legacy, err := loadJSON()
+		if err != nil {
+			return Store{}, err
+		}
+		archivePath := dataPath + ".migrated"
+		if _, err := os.Lstat(archivePath); err == nil {
+			return Store{}, fmt.Errorf("legacy migration archive already exists: %s", archivePath)
+		} else if !os.IsNotExist(err) {
+			return Store{}, err
+		}
+		legacy = migrateLegacy(legacy)
 		normalizeStore(&legacy)
 		if err := saveDB(legacy); err != nil {
 			return Store{}, fmt.Errorf("migrate legacy JSON store: %w", err)
+		}
+		if err := os.Link(dataPath, archivePath); err != nil {
+			return Store{}, fmt.Errorf("archive legacy JSON store: %w", err)
+		}
+		if err := os.Remove(dataPath); err != nil {
+			return Store{}, fmt.Errorf("remove migrated legacy JSON store: %w", err)
 		}
 		return legacy, nil
 	} else if !os.IsNotExist(err) {
@@ -975,114 +1337,79 @@ func save(s Store) error {
 	return saveDB(s)
 }
 
-func normalizeStore(s *Store) {
-	normalizeRuleSettings(s)
-	ensureDefaultBool(&s.AdBlockEnabled, true)
-	s.SubscriptionURLs = s.SubscriptionURLs[:0]
-	for _, sub := range s.Subscriptions {
-		s.SubscriptionURLs = append(s.SubscriptionURLs, sub.URL)
-	}
-	selectedOK := false
-	existingNodes := make(map[string]bool, len(s.Nodes))
-	for i := range s.Nodes {
-		s.Nodes[i].SortOrder = i
-		existingNodes[s.Nodes[i].ID] = true
-		if s.Nodes[i].ID == s.SelectedNode && s.Nodes[i].Enabled {
-			selectedOK = true
-		}
-	}
-	existingOutbounds := map[string]bool{"direct": true}
-	for id := range existingNodes {
-		existingOutbounds[id] = true
-	}
-	for i := range s.StrategyGroups {
-		group := &s.StrategyGroups[i]
-		if group.Type == "fallback" {
-			group.Type = "urltest"
-		}
-		kept := group.NodeIDs[:0]
-		seen := map[string]bool{}
-		for _, id := range group.NodeIDs {
-			if existingNodes[id] && !seen[id] {
-				kept = append(kept, id)
-				seen[id] = true
-			}
-		}
-		group.NodeIDs = kept
-		if !seen[group.Selected] {
-			group.Selected = ""
-			if len(group.NodeIDs) > 0 {
-				group.Selected = group.NodeIDs[0]
-			}
-		}
-		existingOutbounds[group.ID] = true
-	}
-	if !existingOutbounds[s.TCPOutbound] {
-		s.TCPOutbound = ""
-	}
-	if s.UDPOutbound != "same" && !existingOutbounds[s.UDPOutbound] {
-		s.UDPOutbound = ""
-	}
-	for i := range s.ACLRules {
-		if !existingOutbounds[s.ACLRules[i].Outbound] && s.ACLRules[i].Outbound != "block" {
-			s.ACLRules[i].Enabled = false
-		}
-	}
-	if selectedOK {
-		return
-	}
-	s.SelectedNode = ""
-	for _, node := range s.Nodes {
-		if node.Enabled {
-			s.SelectedNode = node.ID
-			break
-		}
-	}
-}
-
 func persistStore(next Store, reload bool) error {
 	previous, err := loadStore()
 	if err != nil {
 		return err
 	}
 	wasRunning := proxyRunningFn()
-	previousProxyPort := proxyPort
+	previousProxyPort := getProxyPort()
 	normalizeStore(&next)
-	if !reload {
-		return save(next)
+	if next.ProxyPort <= 0 {
+		next.ProxyPort = previousProxyPort
 	}
 	if next.ProxyPort > 0 {
-		proxyPort = next.ProxyPort
+		setProxyPort(next.ProxyPort)
+	}
+	if err := validateRuntimePorts(next); err != nil {
+		setProxyPort(previousProxyPort)
+		return err
 	}
 	prevJSON, _ := json.Marshal(config(previous))
 	nextJSON, _ := json.Marshal(config(next))
 	prevMAC, _ := macACLData(previous)
 	nextMAC, _ := macACLData(next)
-	configChanged := !bytes.Equal(prevJSON, nextJSON) || !bytes.Equal(prevMAC, nextMAC) || previousProxyPort != proxyPort
+	prevRules, _ := json.Marshal(previous.RuleSettings)
+	nextRules, _ := json.Marshal(next.RuleSettings)
+	configChanged := !bytes.Equal(prevJSON, nextJSON) || !bytes.Equal(prevMAC, nextMAC) || !bytes.Equal(prevRules, nextRules) || previousProxyPort != getProxyPort()
 
 	if err := writeConfig(next); err != nil {
-		proxyPort = previousProxyPort
+		setProxyPort(previousProxyPort)
 		return err
 	}
 	if err := save(next); err != nil {
-		proxyPort = previousProxyPort
-		_ = writeConfig(previous)
+		setProxyPort(previousProxyPort)
+		if rErr := writeConfig(previous); rErr != nil {
+			return fmt.Errorf("save store: %w (restore config failed: %v)", err, rErr)
+		}
 		return err
 	}
-	if wasRunning && configChanged {
+	if wasRunning && reload && configChanged {
 		if err := restartProxyFn(); err != nil {
-			proxyPort = previousProxyPort
-			_ = save(previous)
-			_ = writeConfig(previous)
-			_ = restartProxyFn()
+			setProxyPort(previousProxyPort)
+			var rErrs []string
+			if rErr := save(previous); rErr != nil {
+				rErrs = append(rErrs, "restore db: "+rErr.Error())
+			}
+			if rErr := writeConfig(previous); rErr != nil {
+				rErrs = append(rErrs, "restore config: "+rErr.Error())
+			}
+			if rErr := restartProxyFn(); rErr != nil {
+				rErrs = append(rErrs, "restart proxy: "+rErr.Error())
+			}
+			if len(rErrs) > 0 {
+				return fmt.Errorf("%w (rollback failed: %s)", err, strings.Join(rErrs, "; "))
+			}
 			return err
 		}
 		if err := reloadGatewayFn(); err != nil {
-			proxyPort = previousProxyPort
-			_ = save(previous)
-			_ = writeConfig(previous)
-			_ = restartProxyFn()
-			_ = reloadGatewayFn()
+			setProxyPort(previousProxyPort)
+			var rErrs []string
+			if rErr := save(previous); rErr != nil {
+				rErrs = append(rErrs, "restore db: "+rErr.Error())
+			}
+			if rErr := writeConfig(previous); rErr != nil {
+				rErrs = append(rErrs, "restore config: "+rErr.Error())
+			}
+			if rErr := restartProxyFn(); rErr != nil {
+				rErrs = append(rErrs, "restart proxy: "+rErr.Error())
+			}
+			if rErr := reloadGatewayFn(); rErr != nil {
+				rErrs = append(rErrs, "reload gateway: "+rErr.Error())
+			}
+			if len(rErrs) > 0 {
+				return fmt.Errorf("%w (rollback failed: %s)", err, strings.Join(rErrs, "; "))
+			}
 			return err
 		}
 	}
@@ -1170,6 +1497,14 @@ func validateNode(n *Node) error {
 		}
 		if n.Transport != "https" && n.Transport != "quic" {
 			return fmt.Errorf("NaiveProxy transport must be https or quic")
+		}
+	} else {
+		n.Transport = normalizeTransport(n.Transport)
+		if n.Transport != "" {
+			validTransports := map[string]bool{"http": true, "ws": true, "quic": true, "grpc": true, "httpupgrade": true}
+			if !validTransports[n.Transport] {
+				return fmt.Errorf("unsupported transport: %s", n.Transport)
+			}
 		}
 	}
 	if n.RealityPublicKey != "" {
@@ -1468,12 +1803,13 @@ func macACLBindings(s Store) []macACLBinding {
 }
 
 func naiveBindings(s Store) []naiveBinding {
+	assignNaivePorts(&s)
 	bindings := make([]naiveBinding, 0)
 	for _, node := range s.Nodes {
 		if !node.Enabled || node.Type != "naive" {
 			continue
 		}
-		port := naiveProxyPort + len(bindings)
+		port := node.NaivePort
 		transport := node.Transport
 		if transport != "quic" {
 			transport = "https"
@@ -1491,7 +1827,60 @@ func naiveBindings(s Store) []naiveBinding {
 	return bindings
 }
 
+func assignNaivePorts(s *Store) error {
+	used := make(map[int]bool)
+	used[22] = true           // SSH
+	used[53] = true           // DNS
+	used[clashAPIPort] = true // Clash API
+	if webPort, err := webPortFromAddress(); err == nil && webPort > 0 {
+		used[webPort] = true
+	}
+	if s.DNS.Enabled && s.DNS.ListenPort > 0 {
+		used[s.DNS.ListenPort] = true
+	}
+	proxy := s.ProxyPort
+	if proxy <= 0 {
+		proxy = getProxyPort()
+	}
+	if proxy > 0 {
+		used[proxy] = true
+	}
+	if tproxyPort > 0 {
+		used[tproxyPort] = true
+	}
+	for _, binding := range macACLBindings(*s) {
+		used[binding.Port] = true
+	}
+	for i := range s.Nodes {
+		n := &s.Nodes[i]
+		if n.Type != "naive" || n.NaivePort == 0 {
+			continue
+		}
+		used[n.NaivePort] = true
+	}
+	for i := range s.Nodes {
+		n := &s.Nodes[i]
+		if n.Type != "naive" || n.NaivePort != 0 {
+			continue
+		}
+		for port := naiveProxyPort; port <= 65535; port++ {
+			if !used[port] && validateListenerPort(port, "NaiveProxy") == nil {
+				n.NaivePort = port
+				used[port] = true
+				break
+			}
+		}
+		if n.NaivePort == 0 {
+			return fmt.Errorf("no available NaiveProxy port")
+		}
+	}
+	return nil
+}
+
 func writeNaiveConfigs(s Store) error {
+	if err := assignNaivePorts(&s); err != nil {
+		return err
+	}
 	parent := filepath.Dir(naiveConfigDir)
 	if err := os.MkdirAll(parent, 0750); err != nil {
 		return err
@@ -1518,6 +1907,74 @@ func writeNaiveConfigs(s Store) error {
 	}
 	_ = os.RemoveAll(previous)
 	return nil
+}
+
+type configResourceBackup struct {
+	path    string
+	backup  string
+	existed bool
+	isDir   bool
+}
+
+func copyConfigResource(src, dst string, info os.FileInfo) error {
+	if info.IsDir() {
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			childInfo, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if err := copyConfigResource(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name()), childInfo); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0750); err != nil {
+		return err
+	}
+	if err := os.WriteFile(dst, data, info.Mode().Perm()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func snapshotConfigResource(path, dir string) (configResourceBackup, error) {
+	backup := configResourceBackup{path: path, backup: filepath.Join(dir, filepath.Base(path))}
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return backup, nil
+	}
+	if err != nil {
+		return backup, err
+	}
+	backup.existed = true
+	backup.isDir = info.IsDir()
+	return backup, copyConfigResource(path, backup.backup, info)
+}
+
+func restoreConfigResource(backup configResourceBackup) error {
+	if err := os.RemoveAll(backup.path); err != nil {
+		return err
+	}
+	if !backup.existed {
+		return nil
+	}
+	info, err := os.Stat(backup.backup)
+	if err != nil {
+		return err
+	}
+	return copyConfigResource(backup.backup, backup.path, info)
 }
 
 func macACLData(s Store) ([]byte, error) {
@@ -1635,7 +2092,7 @@ func config(s Store) map[string]any {
 		if n.Flow != "" {
 			o["flow"] = n.Flow
 		}
-		if n.Transport != "" {
+		if n.Transport != "" && n.Transport != "tcp" && n.Transport != "none" {
 			tr := map[string]any{"type": n.Transport}
 			if n.Transport == "grpc" {
 				serviceName := n.ServiceName
@@ -1754,10 +2211,10 @@ func config(s Store) map[string]any {
 	if s.DNS.Enabled {
 		rules = append(rules, map[string]any{"inbound": []string{"dns-in"}, "action": "hijack-dns"})
 	}
+	rules = append(rules, map[string]any{"action": "sniff"})
 	if s.DNS.Enabled && s.DNS.Hijack {
 		rules = append(rules, map[string]any{"protocol": "dns", "action": "hijack-dns"})
 	}
-	rules = append(rules, map[string]any{"action": "sniff"})
 	for _, acl := range s.ACLRules {
 		if !acl.Enabled {
 			continue
@@ -1814,7 +2271,7 @@ func config(s Store) map[string]any {
 	if s.Mode != "gfw" {
 		final = tcpOutbound
 	}
-	listenPort := proxyPort
+	listenPort := getProxyPort()
 	if s.ProxyPort > 0 {
 		listenPort = s.ProxyPort
 	}
@@ -1836,7 +2293,7 @@ func config(s Store) map[string]any {
 	if level == "" {
 		level = "info"
 	}
-	clashAPI := map[string]any{"external_controller": "127.0.0.1:9090"}
+	clashAPI := map[string]any{"external_controller": fmt.Sprintf("127.0.0.1:%d", clashAPIPort)}
 	if secret := currentClashAPISecret(); secret != "" {
 		clashAPI["secret"] = secret
 	}
@@ -1864,6 +2321,9 @@ func config(s Store) map[string]any {
 	return result
 }
 func writeConfig(s Store) error {
+	if err := validateRuntimePorts(s); err != nil {
+		return err
+	}
 	if err := validateDNSSettings(&s.DNS); err != nil {
 		return err
 	}
@@ -1880,6 +2340,31 @@ func writeConfig(s Store) error {
 	}
 	if err := os.MkdirAll(logDir, 0750); err != nil {
 		return err
+	}
+	backupDir, err := os.MkdirTemp("", "armwall-config-backup-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(backupDir)
+	backups := make([]configResourceBackup, 0, 3)
+	for _, path := range []string{naiveConfigDir, macACLPath, configPath} {
+		backup, backupErr := snapshotConfigResource(path, backupDir)
+		if backupErr != nil {
+			return backupErr
+		}
+		backups = append(backups, backup)
+	}
+	restoreAll := func(cause error) error {
+		var restoreErrs []string
+		for _, backup := range backups {
+			if restoreErr := restoreConfigResource(backup); restoreErr != nil {
+				restoreErrs = append(restoreErrs, backup.path+": "+restoreErr.Error())
+			}
+		}
+		if len(restoreErrs) > 0 {
+			return fmt.Errorf("%w (resource restore failed: %s)", cause, strings.Join(restoreErrs, "; "))
+		}
+		return cause
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(configPath), "."+filepath.Base(configPath)+".candidate-*")
 	if err != nil {
@@ -1914,13 +2399,13 @@ func writeConfig(s Store) error {
 		}
 	}
 	if err := writeNaiveConfigs(s); err != nil {
-		return fmt.Errorf("write NaiveProxy configs: %w", err)
+		return restoreAll(fmt.Errorf("write NaiveProxy configs: %w", err))
 	}
 	if err := writeAtomicFile(macACLPath, macData, 0640); err != nil {
-		return fmt.Errorf("write MAC ACL bindings: %w", err)
+		return restoreAll(fmt.Errorf("write MAC ACL bindings: %w", err))
 	}
 	if err := os.Rename(candidate, configPath); err != nil {
-		return err
+		return restoreAll(err)
 	}
 	candidate = ""
 	return nil
@@ -1948,9 +2433,7 @@ func runCoreUpdate(w http.ResponseWriter, args ...string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, updateCorePath, args...)
-	mu.Lock()
-	port := proxyPort
-	mu.Unlock()
+	port := getProxyPort()
 	cmd.Env = append(os.Environ(), fmt.Sprintf("ARMWALL_PROXY_PORT=%d", port))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1962,7 +2445,7 @@ func runCoreUpdate(w http.ResponseWriter, args ...string) {
 }
 
 func loadAPIStoreSnapshot() (Store, error) {
-	unlock, err := lockStoreFile()
+	unlock, err := lockStoreFileShared()
 	if err != nil {
 		return Store{}, err
 	}
@@ -2147,9 +2630,7 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			http.Error(w, "invalid target", http.StatusBadRequest)
 			return true
 		}
-		mu.Lock()
-		port := proxyPort
-		mu.Unlock()
+		port := getProxyPort()
 		transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
 		client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
 		start := time.Now()
@@ -2255,7 +2736,7 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 		results := make(map[string]testResult)
 		var resultsMu sync.Mutex
 
-		concurrency := 10
+		concurrency := 20
 		if len(nodesToTest) < concurrency {
 			concurrency = len(nodesToTest)
 		}
@@ -2274,6 +2755,11 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			go func() {
 				defer wg.Done()
 				for n := range ch {
+					select {
+					case <-r.Context().Done():
+						return
+					default:
+					}
 					ms, testErr := runSingleNodeTest(n, method, req.URL)
 					resultsMu.Lock()
 					if testErr != nil {
@@ -2298,7 +2784,7 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
 			return true
 		}
-		if err := updateSubscriptionsWithForce(true); err != nil {
+		if err := updateSubscriptionsWithForceContext(r.Context(), true); err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return true
 		}
@@ -2330,7 +2816,9 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			http.Error(w, "subscription not found", 404)
 			return true
 		}
-		nodes, err := fetchSubscriptionFn(sub.URL)
+		targetURL := sub.URL
+		fetchStart := time.Now()
+		nodes, err := fetchSubscriptionFn(r.Context(), targetURL)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return true
@@ -2340,7 +2828,12 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		mu.Lock()
-		persistErr := withStoreFileLock(func() error {
+		if err := r.Context().Err(); err != nil {
+			mu.Unlock()
+			http.Error(w, err.Error(), 499)
+			return true
+		}
+		persistErr := withStoreFileLockContext(r.Context(), func() error {
 			current, loadErr := loadStore()
 			if loadErr != nil {
 				return loadErr
@@ -2354,6 +2847,12 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			}
 			if curSub == nil {
 				return fmt.Errorf("subscription not found")
+			}
+			if curSub.URL != targetURL {
+				return fmt.Errorf("subscription URL changed during fetch")
+			}
+			if !curSub.LastUpdated.IsZero() && curSub.LastUpdated.After(fetchStart) {
+				return fmt.Errorf("subscription was updated by another request")
 			}
 			nodes = reconcileSubscriptionNodes(current.Nodes, nodes, *curSub)
 			newNodes := make([]Node, 0, len(current.Nodes))
@@ -2381,6 +2880,140 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		json.NewEncoder(w).Encode(map[string]any{"updated": v.ID, "nodes": len(nodes)})
+		return true
+	case "/api/subscription":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		var v struct {
+			ID          string `json:"id"`
+			URL         string `json:"url"`
+			Name        string `json:"name"`
+			UpdateHours int    `json:"update_hours"`
+			Enabled     *bool  `json:"enabled"`
+			LastUpdated any    `json:"last_updated"`
+		}
+		if decodeJSONBody(r, &v) != nil || !strings.HasPrefix(strings.TrimSpace(v.URL), "https://") {
+			http.Error(w, "invalid url", 400)
+			return true
+		}
+		v.URL = strings.TrimSpace(v.URL)
+		nodes, err := fetchSubscriptionFn(r.Context(), v.URL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return true
+		}
+		if len(nodes) == 0 {
+			http.Error(w, "subscription contains no supported nodes", http.StatusUnprocessableEntity)
+			return true
+		}
+		mu.Lock()
+		if err := r.Context().Err(); err != nil {
+			mu.Unlock()
+			http.Error(w, err.Error(), 499)
+			return true
+		}
+		persistErr := withStoreFileLockContext(r.Context(), func() error {
+			s, loadErr := loadStore()
+			if loadErr != nil {
+				return loadErr
+			}
+			var sub *Subscription
+			for i := range s.Subscriptions {
+				if s.Subscriptions[i].URL == v.URL {
+					sub = &s.Subscriptions[i]
+					break
+				}
+			}
+			if sub == nil {
+				name := strings.TrimSpace(v.Name)
+				if name == "" {
+					name = fmt.Sprintf("订阅 %d", len(s.Subscriptions)+1)
+				}
+				hours := v.UpdateHours
+				if hours < 1 || hours > 168 {
+					hours = 6
+				}
+				subEnabled := true
+				if v.Enabled != nil {
+					subEnabled = *v.Enabled
+				}
+				s.Subscriptions = append(s.Subscriptions, Subscription{ID: fmt.Sprintf("subsrc-%d", time.Now().UnixNano()), Name: name, URL: v.URL, UpdateHours: hours, Enabled: subEnabled})
+				sub = &s.Subscriptions[len(s.Subscriptions)-1]
+			}
+			nodes = reconcileSubscriptionNodes(s.Nodes, nodes, *sub)
+			sub.LastUpdated = time.Now()
+			kept := make([]Node, 0, len(s.Nodes))
+			for _, n := range s.Nodes {
+				if n.SubscriptionID != sub.ID {
+					kept = append(kept, n)
+				}
+			}
+			s.Nodes = append(kept, nodes...)
+			return persistStore(s, true)
+		})
+		mu.Unlock()
+		if persistErr != nil {
+			http.Error(w, persistErr.Error(), 500)
+			return true
+		}
+		json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
+		return true
+	case "/api/rules/update":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		var v struct{ Tag string }
+		if err := decodeOptionalJSONBody(r, &v); err != nil {
+			http.Error(w, "invalid json", 400)
+			return true
+		}
+		if v.Tag == "" {
+			http.Error(w, "rule tag is required", 400)
+			return true
+		}
+		persistErr := withRuleUpdateLock(func() error {
+			s, err := loadAPIStoreSnapshot()
+			if err != nil {
+				return err
+			}
+			normalizeRuleSettings(&s)
+			setting := s.RuleSettings[v.Tag]
+			if err := updateRuleFn(v.Tag, setting.BackupURL); err != nil {
+				return fmt.Errorf("download rule: %w", err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			commitErr := withStoreFileLock(func() error {
+				current, loadErr := loadStore()
+				if loadErr != nil {
+					return loadErr
+				}
+				normalizeRuleSettings(&current)
+				st := current.RuleSettings[v.Tag]
+				st.LastUpdated = time.Now()
+				current.RuleSettings[v.Tag] = st
+				return persistStore(current, proxyRunningFn())
+			})
+			if commitErr != nil {
+				if restoreErr := restoreRuleBackups([]string{v.Tag}); restoreErr != nil {
+					return fmt.Errorf("%v; %w", commitErr, restoreErr)
+				}
+				return commitErr
+			}
+			return cleanupRuleBackups([]string{v.Tag})
+		})
+		if persistErr != nil {
+			status := http.StatusInternalServerError
+			if strings.HasPrefix(persistErr.Error(), "download rule:") {
+				status = http.StatusBadGateway
+			}
+			http.Error(w, persistErr.Error(), status)
+			return true
+		}
+		json.NewEncoder(w).Encode(map[string]any{"updated": v.Tag})
 		return true
 	case "/api/core/update":
 		if r.Method != http.MethodPost {
@@ -2416,7 +3049,7 @@ func restartProxy() error {
 	if err != nil {
 		return fmt.Errorf("sing-box restart failed: %s", strings.TrimSpace(string(out)))
 	}
-	address := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	address := fmt.Sprintf("127.0.0.1:%d", getProxyPort())
 	for i := 0; i < 80; i++ {
 		conn, dialErr := net.DialTimeout("tcp", address, 150*time.Millisecond)
 		if dialErr == nil {
@@ -2425,7 +3058,7 @@ func restartProxy() error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("sing-box restarted but proxy port %d is not ready", proxyPort)
+	return fmt.Errorf("sing-box restarted but proxy port %d is not ready", getProxyPort())
 }
 
 var restartProxyFn = restartProxy
@@ -2814,6 +3447,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "node not found", 404)
 			return
 		}
+		previous := s.Nodes[index]
 		if n.Password == "******" {
 			n.Password = s.Nodes[index].Password
 		}
@@ -2823,11 +3457,24 @@ func api(w http.ResponseWriter, r *http.Request) {
 		if n.ObfsPassword == "******" {
 			n.ObfsPassword = s.Nodes[index].ObfsPassword
 		}
-		n.SubscriptionID = s.Nodes[index].SubscriptionID
+		n.SubscriptionID = previous.SubscriptionID
 		if strings.TrimSpace(n.Group) == "" {
-			n.Group = s.Nodes[index].Group
+			n.Group = previous.Group
 		}
-		n.SortOrder = s.Nodes[index].SortOrder
+		if n.SubscriptionID != "" {
+			if n.Name != previous.Name {
+				n.NameOverride = n.Name
+			} else {
+				n.NameOverride = previous.NameOverride
+			}
+			if n.Group != previous.Group {
+				n.GroupOverride = n.Group
+			} else {
+				n.GroupOverride = previous.GroupOverride
+			}
+		}
+		n.SortOrder = previous.SortOrder
+		n.NaivePort = previous.NaivePort
 		if err := validateNode(&n); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
@@ -3021,61 +3668,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(s)
-	case "/api/subscription":
-		if r.Method != "POST" {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		var v struct {
-			URL, Name   string
-			UpdateHours int
-		}
-		if decodeJSONBody(r, &v) != nil || !strings.HasPrefix(v.URL, "https://") {
-			http.Error(w, "invalid url", 400)
-			return
-		}
-		nodes, err := fetchSubscriptionFn(v.URL)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		if len(nodes) == 0 {
-			http.Error(w, "subscription contains no supported nodes", http.StatusUnprocessableEntity)
-			return
-		}
-		var sub *Subscription
-		for i := range s.Subscriptions {
-			if s.Subscriptions[i].URL == v.URL {
-				sub = &s.Subscriptions[i]
-				break
-			}
-		}
-		if sub == nil {
-			name := strings.TrimSpace(v.Name)
-			if name == "" {
-				name = fmt.Sprintf("订阅 %d", len(s.Subscriptions)+1)
-			}
-			hours := v.UpdateHours
-			if hours < 1 || hours > 168 {
-				hours = 6
-			}
-			s.Subscriptions = append(s.Subscriptions, Subscription{ID: fmt.Sprintf("subsrc-%d", time.Now().UnixNano()), Name: name, URL: v.URL, UpdateHours: hours, Enabled: true})
-			sub = &s.Subscriptions[len(s.Subscriptions)-1]
-		}
-		nodes = reconcileSubscriptionNodes(s.Nodes, nodes, *sub)
-		sub.LastUpdated = time.Now()
-		kept := make([]Node, 0, len(s.Nodes))
-		for _, n := range s.Nodes {
-			if n.SubscriptionID != sub.ID {
-				kept = append(kept, n)
-			}
-		}
-		s.Nodes = append(kept, nodes...)
-		if err := persistStore(s, true); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
 	case "/api/subscription/clear":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3125,7 +3717,7 @@ func api(w http.ResponseWriter, r *http.Request) {
 				}
 				s.Subscriptions[i] = v
 				for j := range s.Nodes {
-					if s.Nodes[j].SubscriptionID == v.ID && s.Nodes[j].Group == oldName {
+					if s.Nodes[j].SubscriptionID == v.ID && s.Nodes[j].Group == oldName && s.Nodes[j].GroupOverride == "" {
 						s.Nodes[j].Group = v.Name
 					}
 				}
@@ -3216,24 +3808,8 @@ func api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "hours must be 1-168", 400)
 			return
 		}
-		s.UpdateHours = v.Hours
-		if err := save(s); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		dir := "/etc/systemd/system/armwall-subscription-update.timer.d"
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		override := fmt.Sprintf("[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=%dh\n", v.Hours)
-		if err := os.WriteFile(filepath.Join(dir, "interval.conf"), []byte(override), 0644); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		exec.Command("systemctl", "daemon-reload").Run()
-		exec.Command("systemctl", "restart", "armwall-subscription-update.timer").Run()
-		json.NewEncoder(w).Encode(s)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"accepted": true, "schedule": "per-subscription", "hours": v.Hours})
 	case "/api/acl":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3609,49 +4185,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(s)
 	case "/api/rules":
 		json.NewEncoder(w).Encode(map[string]any{"rules": ruleURLs, "settings": s.RuleSettings, "backups": s.RuleBackups, "update_hours": s.RuleUpdateHours, "ad_block_enabled": boolValue(s.AdBlockEnabled, true)})
-	case "/api/rules/update":
-		if r.Method != "POST" {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		var v struct{ Tag string }
-		if err := decodeOptionalJSONBody(r, &v); err != nil {
-			http.Error(w, "invalid json", 400)
-			return
-		}
-		if v.Tag == "" {
-			http.Error(w, "rule tag is required", 400)
-			return
-		}
-		updated, err := updateConfiguredRules(&s, true, v.Tag, time.Now())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		if len(updated) != 1 {
-			http.Error(w, "rule was not updated", 500)
-			return
-		}
-		if err := writeConfig(s); err != nil {
-			restoreRuleBackups(updated)
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if err := save(s); err != nil {
-			restoreRuleBackups(updated)
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		wasRunning := proxyRunningFn()
-		if wasRunning {
-			if err := restartProxy(); err != nil {
-				restoreRuleBackups(updated)
-				http.Error(w, err.Error(), 500)
-				return
-			}
-		}
-		cleanupRuleBackups(updated)
-		json.NewEncoder(w).Encode(map[string]any{"updated": v.Tag})
 	case "/api/rules/settings":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -3963,10 +4496,34 @@ func newHTTPServer(config webAccessConfig, token string, staticFS fs.FS) (*http.
 		Handler:           securityHeaderMiddleware(webAccessMiddleware(config, mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      180 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}, nil
+}
+
+func serveUntilShutdown(ctx context.Context, server *http.Server, listener net.Listener) error {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+			return err
+		}
+		err := <-serveErr
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
 }
 
 //go:embed web/index.html web/styles.css web/app.js
@@ -3985,13 +4542,13 @@ func main() {
 	}
 	if v := os.Getenv("ARMWALL_PROXY_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
-			proxyPort = p
+			setProxyPort(p)
 		}
 	}
 	if stored, err := loadStore(); err != nil {
 		log.Fatal(err)
 	} else if stored.ProxyPort > 0 && stored.ProxyPort < 65536 {
-		proxyPort = stored.ProxyPort
+		setProxyPort(stored.ProxyPort)
 	}
 	if os.Getenv("ARMWALL_TPROXY") == "1" {
 		tproxyEnabled = true
@@ -4012,6 +4569,13 @@ func main() {
 			log.Fatal(err)
 		}
 		if _, err := loadWebAccessConfig(); err != nil {
+			log.Fatal(err)
+		}
+		stored, err := loadStore()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := validateRuntimePorts(stored); err != nil {
 			log.Fatal(err)
 		}
 		log.Print("configuration ok")
@@ -4059,6 +4623,14 @@ func main() {
 		log.Printf("rules updated: %d", updated)
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "--bootstrap-rules" {
+		updated, err := bootstrapRules()
+		if err != nil {
+			log.Fatalf("bootstrap rules failed after %d updates: %v", updated, err)
+		}
+		log.Printf("bootstrap rules updated: %d", updated)
+		return
+	}
 	staticFS, err := fs.Sub(webFiles, "web")
 	if err != nil {
 		log.Fatal(err)
@@ -4080,5 +4652,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Fatal(server.Serve(listener))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := serveUntilShutdown(ctx, server, listener); err != nil {
+		log.Fatal(err)
+	}
+	closeDB()
 }
