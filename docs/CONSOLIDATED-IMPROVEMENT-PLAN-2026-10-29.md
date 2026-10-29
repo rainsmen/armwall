@@ -354,6 +354,13 @@ flowchart TD
    - 远端调用 `/api/mode` 写入更新，使用 Python 3 sqlite3 查询数据库 `settings` 表：`revision` 字段确凿由 1 递增至 2，`schema_version` 为 2，验证了单调自增版本持久化的正确性；
    - 部署离线规则包至 `/usr/share/armwall/rules/` 与 `/var/lib/armwall/rules/`，核验 4 份官方 precompiled `.srs` 规则全量就位，文件权限均为 0640；
    - 触发 `--update-subscriptions` 单独调用，在 4 秒内顺利完成全流程，规则更新 `bytes.Equal` 跳过冗余重写，无死锁、无异常重启。
+6. **最新 Release v0.4.0 发布与一键安装脚本真机全链路实测**：
+   - 发布正式 Release `v0.4.0`，包含四架构二进制、内置离线规则的安装支持包及更新后的一键安装脚本；
+   - 在远端真机（`192.168.10.233`）执行生产一键安装命令：
+     ```bash
+     curl -fsSL https://github.com/rainsmen/armwall/releases/latest/download/one-click-install.sh | sh
+     ```
+   - 实测输出：成功自动解析最新 `v0.4.0`，下载 `armwall-linux-arm64` 与 `armwall-install-files.tar.gz`，通过 `SHA256SUMS` 校验，自动解压并完成全新部署，核心服务自启正常，版本确认为 `armwall 0.4.0`。
 
 ---
 
