@@ -197,8 +197,8 @@ PY
   printf '%s\n' "$url" | grep -Eq '^https://(github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com)/[^[:space:]]+$' || die "invalid release URL"
   printf '%s\n' "$expected_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || die "invalid release digest"
   case "$url" in
-    *.tar.gz) archive="$tmp/core.tar.gz"; fetch_file "$url" "$archive"; expected_format=gzip ;;
-    *.tar.xz) archive="$tmp/core.tar.xz"; fetch_file "$url" "$archive"; expected_format=xz ;;
+    *.tar.gz) archive="$tmp/core.tar.gz"; fetch_file "$url" "$archive" ;;
+    *.tar.xz) archive="$tmp/core.tar.xz"; fetch_file "$url" "$archive" ;;
     *) die "unsupported NaiveProxy archive format" ;;
   esac
   expected_hash="${expected_digest#sha256:}"

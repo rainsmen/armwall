@@ -89,7 +89,6 @@ EOF
   fi
   rm -f "$tmp_rules"
   rule_added=0
-  route_added=0
   if ! ip rule show | grep -F "fwmark $MARK lookup 233" >/dev/null 2>&1; then
     if ip rule add fwmark "$MARK" table 233; then rule_added=1; else
       restore_network_table "$old_table" "$had_table"
@@ -98,7 +97,7 @@ EOF
     fi
   fi
   if ! ip route show table 233 | grep -F "local default dev lo" >/dev/null 2>&1; then
-    if ip route add local 0.0.0.0/0 dev lo table 233; then route_added=1; else
+    if ! ip route add local 0.0.0.0/0 dev lo table 233; then
       [ "$rule_added" -eq 0 ] || ip rule del fwmark "$MARK" table 233 2>/dev/null || true
       restore_network_table "$old_table" "$had_table"
       echo "armwall-gateway: failed to add policy route; previous network state restored" >&2

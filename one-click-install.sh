@@ -71,7 +71,7 @@ verify_release_asset() {
   asset_name=$1
   asset_path=$2
   expected=$(awk -v name="$asset_name" '
-    $2 == name && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ { hash = $1; count++ }
+    ($2 == name || $2 == "*" name) && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ { hash = $1; count++ }
     END { if (count != 1) exit 1; print hash }
   ' "$ARMWALL_CHECKSUMS") || {
     echo "release checksum is missing or ambiguous for $asset_name" >&2
@@ -127,6 +127,10 @@ install_source() {
   fi
   tar -xzf "$ARMWALL_ARCHIVE" -C "$ARMWALL_SOURCE_DIR" --strip-components=1
   ARMWALL_INSTALL_BINARY="$ARMWALL_SOURCE_DIR/armwall-linux-$ARMWALL_ARCH"
+  if [ ! -f "$ARMWALL_INSTALL_BINARY" ] && command -v go >/dev/null 2>&1; then
+    echo "Building ArmWall binary from source..."
+    (cd "$ARMWALL_SOURCE_DIR" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$ARMWALL_REF" -o "$ARMWALL_INSTALL_BINARY" .)
+  fi
 }
 
 if [ "$ARMWALL_INSTALL_CHANNEL" = release ]; then
