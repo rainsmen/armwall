@@ -14,7 +14,7 @@ test:
 	test -z "$$($(GOFMT) -l *.go)"
 	$(GO) vet ./...
 	$(GO) test ./...
-	node --check web/app.js
+	for script in web/js/*.js; do node --check "$$script"; done
 	for script in gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh; do sh -n "$$script"; done
 	sh tests/one-click-install-test.sh
 	sh tests/update-core-metadata-test.sh

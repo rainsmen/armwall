@@ -64,4 +64,4 @@ jobs:
         run: sh tests/naive-supervisor-test.sh
 
       - name: JS syntax
-        run: node --check web/app.js
+        run: for script in web/js/*.js; do node --check "$script"; done

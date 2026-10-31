@@ -32,6 +32,24 @@ ArmWall 是面向 Armbian/Debian 设备的局域网代理网关。它使用 sing
 
 ArmWall 本身四种架构均为静态二进制。上游 sing-box 不发布 ARMv6 官方构建，因此 ARMv6 设备需要手动上传可用核心。
 
+## 代码结构
+
+| 文件 | 内容 |
+| --- | --- |
+| `main.go` | 命令行入口与服务启动 |
+| `models.go` | `Store`、`Node` 等数据结构 |
+| `state.go` | 全局路径与端口、存储文件锁、`persistStore` 事务写入 |
+| `storage.go` / `migrations.go` | SQLite 持久化与旧版数据迁移 |
+| `config.go` / `naive.go` | sing-box 配置生成与原子写入、NaiveProxy 端口分配与配置 |
+| `subscription.go` / `rules.go` / `download.go` | 订阅解析与刷新、规则集更新与回滚、下载 |
+| `validate.go` / `ports.go` | 节点、策略组、ACL、DNS 与端口校验 |
+| `webserver.go` / `api.go` | HTTP 服务、访问控制与鉴权；API 路由表与分发 |
+| `api_*.go` | 按领域划分的 API 处理函数（节点、订阅、规则、策略、网络、系统） |
+| `management.go` / `strategy_runtime.go` / `clash.go` / `runtime.go` | 备份与核心上传、策略运行状态、Clash API、systemd 与命令调用 |
+| `web/js/*.js` | 前端脚本，按 `index.html` 中的顺序加载并共享全局作用域 |
+
+新增 API 时在 `api.go` 的 `unlockedAPIRoutes`（不持写锁，用于只读或耗时外部操作）或 `lockedAPIRoutes`（持写锁并接收已加载的 `Store`）中注册路由。`TestFrontendAPIPathsAreRouted` 会检查前端调用的每个路径都已注册。
+
 ## 构建
 
 需要 Go 1.26 或更高版本和 Node.js（用于 JavaScript 语法检查）。已用 `sing-box 1.14+` 深度验证配置生成与内核交互。
