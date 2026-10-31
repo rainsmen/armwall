@@ -19,6 +19,7 @@ test:
 	sh tests/one-click-install-test.sh
 	sh tests/update-core-metadata-test.sh
 	sh tests/gateway-test.sh
+	sh tests/naive-supervisor-test.sh
 
 release:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o armwall-linux-armv6 .

@@ -43,11 +43,11 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$out/amd64" .
 
       - name: ShellCheck
-        run: shellcheck gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh tests/update-core-metadata-test.sh tests/gateway-test.sh
+        run: shellcheck gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh tests/update-core-metadata-test.sh tests/gateway-test.sh tests/naive-supervisor-test.sh
 
       - name: Shell syntax
         run: |
-          for f in gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh tests/update-core-metadata-test.sh tests/gateway-test.sh; do
+          for f in gateway.sh install.sh one-click-install.sh update-core.sh naive-supervisor.sh uninstall.sh tests/one-click-install-test.sh tests/update-core-metadata-test.sh tests/gateway-test.sh tests/naive-supervisor-test.sh; do
             sh -n "$f"
           done
 
@@ -59,6 +59,9 @@ jobs:
 
       - name: Gateway tests
         run: sh tests/gateway-test.sh
+
+      - name: Naive supervisor tests
+        run: sh tests/naive-supervisor-test.sh
 
       - name: JS syntax
         run: node --check web/app.js

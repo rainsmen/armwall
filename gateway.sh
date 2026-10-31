@@ -55,7 +55,7 @@ table inet $TABLE {
     iifname "$LAN_IF" meta nfproto ipv6 fib daddr type local accept
     iifname "$LAN_IF" meta nfproto ipv6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect } accept
     iifname "$LAN_IF" meta nfproto ipv6 drop
-    iifname "$LAN_IF" meta nfproto ipv4 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
+    iifname "$LAN_IF" meta nfproto ipv4 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } return
 EOF
 
   if [ -r "$MAC_ACL_FILE" ]; then
@@ -119,9 +119,7 @@ enable_gateway(){
   detect
   mkdir -p "$(dirname "$STATE_FILE")"
   if [ ! -r "$STATE_FILE" ]; then
-    state_dir=$(dirname "$STATE_FILE")
-    nft list ruleset > "$state_dir/nft.backup" 2>/dev/null
-    sysctl -n net.ipv4.ip_forward > "$state_dir/ip-forward.before"
+    sysctl -n net.ipv4.ip_forward > "$(dirname "$STATE_FILE")/ip-forward.before"
   fi
   previous_forward=$(sysctl -n net.ipv4.ip_forward)
   sysctl -q -w net.ipv4.ip_forward=1 || die "cannot enable IPv4 forwarding"

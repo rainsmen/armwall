@@ -53,5 +53,8 @@ grep -F 'sysctl -q -w net.ipv4.ip_forward=0' "$TEST_LOG" >/dev/null
 "$ROOT/gateway.sh" enable >/dev/null
 grep -F 'meta nfproto ipv6 fib daddr type local accept' "$NFT_LOG" >/dev/null
 grep -F 'icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect } accept' "$NFT_LOG" >/dev/null
+grep -F '100.64.0.0/10' "$NFT_LOG" >/dev/null
+grep -F '169.254.0.0/16' "$NFT_LOG" >/dev/null
+[ ! -e "$TMP/state/nft.backup" ] || { echo "gateway wrote an unused nft.backup" >&2; exit 1; }
 [ -r "$ARMWALL_GATEWAY_STATE" ]
 printf 'gateway tests passed\n'
