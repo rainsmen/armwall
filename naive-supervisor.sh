@@ -130,6 +130,7 @@ health_round(){
     [ -f "$config" ] || continue
     port=$(config_port "$config")
     case "$port" in ''|*[!0-9]*) continue;; esac
+    skip_until=0
     eval "skip_until=\${skip_$port:-0}"
     [ "$now" -ge "$skip_until" ] || continue
     (
