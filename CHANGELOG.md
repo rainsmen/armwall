@@ -2,6 +2,20 @@
 
 All notable changes to ArmWall will be documented in this file.
 
+## [0.5.0] - 2026-10-31
+
+### Changed
+- **Source split by responsibility**: `main.go` (about 4,000 lines) is now an entry point plus `models.go`, `state.go`, `subscription.go`, `rules.go`, `download.go`, `validate.go`, `config.go`, `naive.go`, `clash.go`, `runtime.go`, `webserver.go` and `api_*.go`. Function bodies were moved without modification.
+- **API routing**: `/api/*` handlers are dispatched from two route tables (`unlockedAPIRoutes`, `lockedAPIRoutes`) instead of one large switch.
+- **Tests**: `main_test.go` is split into per-area test files with shared helpers in `helpers_test.go`.
+- **Web UI**: `web/app.js` is split into `web/js/{core,render,editors,operations,actions,main}.js`, loaded in order as classic scripts.
+
+### Added
+- `TestFrontendAPIPathsAreRouted` checks that every `/api/...` path used by the web UI has a backend route.
+- README section describing the code layout.
+
+No user-visible behavior changes: API responses on a test device are identical to v0.4.1.
+
 ## [0.4.1] - 2026-10-31
 
 ### Fixed

@@ -56,7 +56,7 @@ ArmWall 本身四种架构均为静态二进制。上游 sing-box 不发布 ARMv
 
 ```bash
 make test
-make release VERSION=0.4.1
+make release VERSION=0.5.0
 ```
 
 ## 安装
