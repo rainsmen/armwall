@@ -2,6 +2,20 @@
 
 All notable changes to ArmWall will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Rule updates no longer restart sing-box when content is unchanged**: `updateRule` now reports whether the file changed, and `persistStore` ignores `LastUpdated` when comparing rule settings. Previously every due rule check restarted the core and dropped LAN connections.
+- **NaiveProxy supervisor**: instances are tracked by PID files instead of `pkill -f`, which also killed unrelated processes whose command line contained the config path. SIGTERM now exits immediately (stops took the full 90 s systemd timeout before).
+- **Health check backoff**: probes run in parallel, and a port restarted by the health check is skipped with exponential backoff (300 s up to 1800 s) so nodes whose server is down are not restarted forever.
+- **Legacy web access**: a non-loopback `ARMWALL_LISTEN` without `ARMWALL_WEB_ACCESS` now allows only loopback and private IPv4 ranges instead of every address.
+- **Read-only API endpoints** (`/api/rules`, `/api/backups`, `/api/config/export`, `/api/backups/download`) no longer wait for the write lock; `/api/state` and `/api/node/get` require GET; `/api/service/status` uses a 5 s timeout.
+- **Subscriptions**: node replacement shared by all three update paths keeps nodes in place; `POST /api/subscription` rejects a stale concurrent update.
+- **Gateway**: dropped the unused `nft.backup` write; `100.64.0.0/10` and `169.254.0.0/16` bypass TProxy.
+
+### Added
+- `tests/naive-supervisor-test.sh`, run by `make test` and CI.
+
 ## [0.4.0] - 2026-10-29
 
 ### Added
