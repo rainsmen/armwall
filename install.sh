@@ -204,7 +204,7 @@ if [ "$ARMWALL_CHECK_WEB_ACCESS" = local ]; then
 else
   echo "ArmWall Web access mode: $ARMWALL_CHECK_WEB_ACCESS"
   echo "Candidate addresses (clients must match):"
-  echo "Allowed client CIDRs: ${ARMWALL_CHECK_ALLOWED_CIDRS:-unrestricted legacy access}"
+  echo "Allowed client CIDRs: ${ARMWALL_CHECK_ALLOWED_CIDRS:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
   ip -o -4 addr show up scope global 2>/dev/null | awk -v port="$ARMWALL_WEB_PORT" '
     { split($4, address, "/"); print "ArmWall available at http://" address[1] ":" port }
   '

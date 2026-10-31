@@ -464,6 +464,27 @@ func reconcileSubscriptionNodes(existing, fetched []Node, sub Subscription) []No
 	return fetched
 }
 
+// replaceSubscriptionNodes swaps a subscription's nodes for fresh ones, keeping
+// them at the position of the first old node so manual ordering survives.
+func replaceSubscriptionNodes(nodes []Node, subID string, fresh []Node) []Node {
+	result := make([]Node, 0, len(nodes)+len(fresh))
+	inserted := false
+	for _, n := range nodes {
+		if n.SubscriptionID != subID {
+			result = append(result, n)
+			continue
+		}
+		if !inserted {
+			result = append(result, fresh...)
+			inserted = true
+		}
+	}
+	if !inserted {
+		result = append(result, fresh...)
+	}
+	return result
+}
+
 func subscriptionDue(sub Subscription, now time.Time) bool {
 	hours := sub.UpdateHours
 	if hours < 1 {
@@ -569,26 +590,11 @@ func updateSubscriptionsWithForceContext(ctx context.Context, force bool) error 
 			}
 			return nil
 		}
-		newNodes := make([]Node, 0, len(cur.Nodes))
-		insertedSubs := make(map[string]bool)
-		for _, n := range cur.Nodes {
-			subNodes, isUpdated := fetchedBySub[n.SubscriptionID]
-			if !isUpdated {
-				newNodes = append(newNodes, n)
-				continue
-			}
-			if !insertedSubs[n.SubscriptionID] {
-				newNodes = append(newNodes, subNodes...)
-				insertedSubs[n.SubscriptionID] = true
-			}
-		}
 		for _, sub := range cur.Subscriptions {
-			if !insertedSubs[sub.ID] && len(fetchedBySub[sub.ID]) > 0 {
-				newNodes = append(newNodes, fetchedBySub[sub.ID]...)
-				insertedSubs[sub.ID] = true
+			if fresh, ok := fetchedBySub[sub.ID]; ok {
+				cur.Nodes = replaceSubscriptionNodes(cur.Nodes, sub.ID, fresh)
 			}
 		}
-		cur.Nodes = newNodes
 		cur.SubscriptionURLs = nil
 		for _, sub := range cur.Subscriptions {
 			cur.SubscriptionURLs = append(cur.SubscriptionURLs, sub.URL)
@@ -881,14 +887,16 @@ func downloadResourceContext(ctx context.Context, raw string, limit int64, timeo
 	return nil, lastErr
 }
 
-func updateRule(tag, backup string) error {
+// updateRule refreshes one rule set and reports whether the file on disk
+// changed. Unchanged content must not restart sing-box.
+func updateRule(tag, backup string) (bool, error) {
 	primary, ok := ruleURLs[tag]
 	if !ok {
-		return fmt.Errorf("unknown rule")
+		return false, fmt.Errorf("unknown rule")
 	}
 	backup = strings.TrimSpace(backup)
 	if backup != "" && !httpsURL(backup) {
-		return fmt.Errorf("backup rule URL must use https")
+		return false, fmt.Errorf("backup rule URL must use https")
 	}
 	urls := []string{primary}
 	if backup != "" {
@@ -900,22 +908,25 @@ func updateRule(tag, backup string) error {
 	if os.IsNotExist(currentErr) {
 		useLocalAsset = true
 	} else if currentErr != nil {
-		return fmt.Errorf("read existing rule: %w", currentErr)
+		return false, fmt.Errorf("read existing rule: %w", currentErr)
 	} else if validateSRS(current) != nil {
 		useLocalAsset = true
 	}
 	if useLocalAsset {
 		if body, asset, assetErr := bundledRule(tag); assetErr == nil {
 			if len(current) > 0 && bytes.Equal(current, body) {
-				return nil
+				return false, nil
 			}
 			if err := os.MkdirAll(ruleDataDir, 0750); err != nil {
-				return err
+				return false, err
+			}
+			if err := backupRuleFile(tag); err != nil {
+				return false, err
 			}
 			if err := writeAtomicFile(target, body, 0640); err != nil {
-				return fmt.Errorf("install local rule asset %s: %w", asset, err)
+				return false, fmt.Errorf("install local rule asset %s: %w", asset, err)
 			}
-			return nil
+			return true, nil
 		}
 	}
 	var last error
@@ -932,32 +943,45 @@ func updateRule(tag, backup string) error {
 			last = fmt.Errorf("%s: %w", raw, err)
 			continue
 		}
-		dir := ruleDataDir
-		if err = os.MkdirAll(dir, 0750); err != nil {
-			return err
+		if err = os.MkdirAll(ruleDataDir, 0750); err != nil {
+			return false, err
 		}
-		target := filepath.Join(dir, tag+".srs")
-		bak := filepath.Join(dir, tag+".srs.bak")
-		absent := bak + ".absent"
-		if prev, readErr := os.ReadFile(target); readErr == nil {
-			if bytes.Equal(prev, body) {
-				// Rule content unchanged, avoid redundant disk write and service restart
-				return nil
-			}
-			if err = os.WriteFile(bak, prev, 0640); err != nil {
-				return fmt.Errorf("backup existing rule: %w", err)
-			}
-			_ = os.Remove(absent)
-		} else if !os.IsNotExist(readErr) {
-			return fmt.Errorf("read existing rule: %w", readErr)
-		} else {
-			if err = os.WriteFile(absent, nil, 0600); err != nil {
-				return fmt.Errorf("record absent rule: %w", err)
-			}
+		if prev, readErr := os.ReadFile(target); readErr == nil && bytes.Equal(prev, body) {
+			// Rule content unchanged, avoid redundant disk write and service restart
+			return false, nil
 		}
-		return writeAtomicFile(target, body, 0640)
+		if err := backupRuleFile(tag); err != nil {
+			return false, err
+		}
+		if err := writeAtomicFile(target, body, 0640); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return last
+	return false, last
+}
+
+// backupRuleFile records the current rule file (or its absence) so that
+// restoreRuleBackups can undo a rule write when the store commit fails.
+func backupRuleFile(tag string) error {
+	target := filepath.Join(ruleDataDir, tag+".srs")
+	bak := target + ".bak"
+	absent := bak + ".absent"
+	prev, err := os.ReadFile(target)
+	if os.IsNotExist(err) {
+		if err := os.WriteFile(absent, nil, 0600); err != nil {
+			return fmt.Errorf("record absent rule: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read existing rule: %w", err)
+	}
+	if err := os.WriteFile(bak, prev, 0640); err != nil {
+		return fmt.Errorf("backup existing rule: %w", err)
+	}
+	_ = os.Remove(absent)
+	return nil
 }
 
 func bundledRule(tag string) ([]byte, string, error) {
@@ -1059,7 +1083,7 @@ func bootstrapRules() (int, error) {
 				continue
 			}
 			setting := s.RuleSettings[tag]
-			if err := updateRuleFn(tag, setting.BackupURL); err != nil {
+			if _, err := updateRuleFn(tag, setting.BackupURL); err != nil {
 				updateErr = errors.Join(updateErr, fmt.Errorf("%s: %w", tag, err))
 				continue
 			}
@@ -1083,7 +1107,7 @@ func bootstrapRules() (int, error) {
 					current.RuleSettings[tag] = setting
 				}
 			}
-			return persistStore(current, proxyRunningFn())
+			return persistStoreWithRuleChange(current, proxyRunningFn(), true)
 		}); err != nil {
 			updateErr = errors.Join(updateErr, err)
 		}
@@ -1201,14 +1225,17 @@ func ruleUpdateDue(setting RuleUpdateSetting, now time.Time) bool {
 	return setting.LastUpdated.IsZero() || now.Sub(setting.LastUpdated) >= time.Duration(hours)*time.Hour
 }
 
-func updateConfiguredRules(s *Store, force bool, onlyTag string, now time.Time) ([]string, error) {
+// updateConfiguredRules checks due rule sets. checked lists every rule whose
+// check succeeded (its LastUpdated advances); changed lists only the rules
+// whose file content was replaced and therefore need a sing-box restart.
+func updateConfiguredRules(s *Store, force bool, onlyTag string, now time.Time) (checked, changed []string, err error) {
 	normalizeRuleSettings(s)
 	if onlyTag != "" {
 		if _, ok := ruleURLs[onlyTag]; !ok {
-			return nil, fmt.Errorf("unknown rule")
+			return nil, nil, fmt.Errorf("unknown rule")
 		}
 	}
-	updated := make([]string, 0, len(ruleURLs))
+	checked = make([]string, 0, len(ruleURLs))
 	errors := make([]string, 0)
 	for tag := range ruleURLs {
 		if onlyTag != "" && tag != onlyTag {
@@ -1218,18 +1245,22 @@ func updateConfiguredRules(s *Store, force bool, onlyTag string, now time.Time) 
 		if !force && !ruleUpdateDue(setting, now) {
 			continue
 		}
-		if err := updateRuleFn(tag, setting.BackupURL); err != nil {
-			errors = append(errors, tag+": "+err.Error())
+		ruleChanged, ruleErr := updateRuleFn(tag, setting.BackupURL)
+		if ruleErr != nil {
+			errors = append(errors, tag+": "+ruleErr.Error())
 			continue
 		}
 		setting.LastUpdated = now
 		s.RuleSettings[tag] = setting
-		updated = append(updated, tag)
+		checked = append(checked, tag)
+		if ruleChanged {
+			changed = append(changed, tag)
+		}
 	}
 	if len(errors) > 0 {
-		return updated, fmt.Errorf("%s", strings.Join(errors, "; "))
+		return checked, changed, fmt.Errorf("%s", strings.Join(errors, "; "))
 	}
-	return updated, nil
+	return checked, changed, nil
 }
 
 func applyRuleUpdates(force bool) (int, error) {
@@ -1240,7 +1271,7 @@ func applyRuleUpdates(force bool) (int, error) {
 		if err != nil {
 			return err
 		}
-		updated, batchErr := updateConfiguredRules(&s, force, "", time.Now())
+		updated, changed, batchErr := updateConfiguredRules(&s, force, "", time.Now())
 		updateErr = batchErr
 		if len(updated) == 0 {
 			return batchErr
@@ -1256,7 +1287,7 @@ func applyRuleUpdates(force bool) (int, error) {
 				setting.LastUpdated = s.RuleSettings[tag].LastUpdated
 				current.RuleSettings[tag] = setting
 			}
-			return persistStore(current, proxyRunningFn())
+			return persistStoreWithRuleChange(current, proxyRunningFn(), len(changed) > 0)
 		})
 		if commitErr != nil {
 			if restoreErr := restoreRuleBackups(updated); restoreErr != nil {
@@ -1338,6 +1369,25 @@ func save(s Store) error {
 }
 
 func persistStore(next Store, reload bool) error {
+	return persistStoreWithRuleChange(next, reload, false)
+}
+
+// ruleSettingsFingerprint ignores LastUpdated: a completed check alone does not
+// change what sing-box loads.
+func ruleSettingsFingerprint(settings map[string]RuleUpdateSetting) []byte {
+	stripped := make(map[string]RuleUpdateSetting, len(settings))
+	for tag, setting := range settings {
+		setting.LastUpdated = time.Time{}
+		stripped[tag] = setting
+	}
+	data, _ := json.Marshal(stripped)
+	return data
+}
+
+// persistStoreWithRuleChange writes the store and runtime config. rulesChanged
+// reports that rule-set files were replaced on disk, which sing-box only picks
+// up after a restart.
+func persistStoreWithRuleChange(next Store, reload, rulesChanged bool) error {
 	previous, err := loadStore()
 	if err != nil {
 		return err
@@ -1359,9 +1409,9 @@ func persistStore(next Store, reload bool) error {
 	nextJSON, _ := json.Marshal(config(next))
 	prevMAC, _ := macACLData(previous)
 	nextMAC, _ := macACLData(next)
-	prevRules, _ := json.Marshal(previous.RuleSettings)
-	nextRules, _ := json.Marshal(next.RuleSettings)
-	configChanged := !bytes.Equal(prevJSON, nextJSON) || !bytes.Equal(prevMAC, nextMAC) || !bytes.Equal(prevRules, nextRules) || previousProxyPort != getProxyPort()
+	prevRules := ruleSettingsFingerprint(previous.RuleSettings)
+	nextRules := ruleSettingsFingerprint(next.RuleSettings)
+	configChanged := rulesChanged || !bytes.Equal(prevJSON, nextJSON) || !bytes.Equal(prevMAC, nextMAC) || !bytes.Equal(prevRules, nextRules) || previousProxyPort != getProxyPort()
 
 	if err := writeConfig(next); err != nil {
 		setProxyPort(previousProxyPort)
@@ -2504,6 +2554,10 @@ func runSingleNodeTest(n Node, method, customURL string) (int64, error) {
 func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 	switch r.URL.Path {
 	case "/api/state":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
 		s, err := loadAPIStoreSnapshot()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2523,6 +2577,10 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 		json.NewEncoder(w).Encode(s)
 		return true
 	case "/api/node/get":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
 		id := r.URL.Query().Get("id")
 		s, err := loadAPIStoreSnapshot()
 		if err != nil {
@@ -2587,7 +2645,7 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
 			return true
 		}
-		out, _ := exec.Command("systemctl", "is-active", "armwall-sing-box.service").CombinedOutput()
+		out, _ := runCommandTimeout(5*time.Second, "systemctl", "is-active", "armwall-sing-box.service")
 		status := strings.TrimSpace(string(out))
 		if status == "" {
 			status = "unknown"
@@ -2855,22 +2913,7 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 				return fmt.Errorf("subscription was updated by another request")
 			}
 			nodes = reconcileSubscriptionNodes(current.Nodes, nodes, *curSub)
-			newNodes := make([]Node, 0, len(current.Nodes))
-			inserted := false
-			for _, n := range current.Nodes {
-				if n.SubscriptionID == v.ID {
-					if !inserted {
-						newNodes = append(newNodes, nodes...)
-						inserted = true
-					}
-				} else {
-					newNodes = append(newNodes, n)
-				}
-			}
-			if !inserted {
-				newNodes = append(newNodes, nodes...)
-			}
-			current.Nodes = newNodes
+			current.Nodes = replaceSubscriptionNodes(current.Nodes, v.ID, nodes)
 			curSub.LastUpdated = time.Now()
 			return persistStore(current, true)
 		})
@@ -2899,6 +2942,7 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		v.URL = strings.TrimSpace(v.URL)
+		fetchStart := time.Now()
 		nodes, err := fetchSubscriptionFn(r.Context(), v.URL)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -2941,16 +2985,12 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 				}
 				s.Subscriptions = append(s.Subscriptions, Subscription{ID: fmt.Sprintf("subsrc-%d", time.Now().UnixNano()), Name: name, URL: v.URL, UpdateHours: hours, Enabled: subEnabled})
 				sub = &s.Subscriptions[len(s.Subscriptions)-1]
+			} else if !sub.LastUpdated.IsZero() && sub.LastUpdated.After(fetchStart) {
+				return fmt.Errorf("subscription was updated by another request")
 			}
 			nodes = reconcileSubscriptionNodes(s.Nodes, nodes, *sub)
 			sub.LastUpdated = time.Now()
-			kept := make([]Node, 0, len(s.Nodes))
-			for _, n := range s.Nodes {
-				if n.SubscriptionID != sub.ID {
-					kept = append(kept, n)
-				}
-			}
-			s.Nodes = append(kept, nodes...)
+			s.Nodes = replaceSubscriptionNodes(s.Nodes, sub.ID, nodes)
 			return persistStore(s, true)
 		})
 		mu.Unlock()
@@ -2981,7 +3021,8 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 			}
 			normalizeRuleSettings(&s)
 			setting := s.RuleSettings[v.Tag]
-			if err := updateRuleFn(v.Tag, setting.BackupURL); err != nil {
+			ruleChanged, err := updateRuleFn(v.Tag, setting.BackupURL)
+			if err != nil {
 				return fmt.Errorf("download rule: %w", err)
 			}
 			mu.Lock()
@@ -2995,7 +3036,7 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 				st := current.RuleSettings[v.Tag]
 				st.LastUpdated = time.Now()
 				current.RuleSettings[v.Tag] = st
-				return persistStore(current, proxyRunningFn())
+				return persistStoreWithRuleChange(current, proxyRunningFn(), ruleChanged)
 			})
 			if commitErr != nil {
 				if restoreErr := restoreRuleBackups([]string{v.Tag}); restoreErr != nil {
@@ -3033,6 +3074,69 @@ func handleUnlockedAPI(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/api/core/upload":
 		handleCoreUpload(w, r)
+		return true
+	case "/api/rules":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		s, err := loadAPIStoreSnapshot()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return true
+		}
+		normalizeRuleSettings(&s)
+		json.NewEncoder(w).Encode(map[string]any{"rules": ruleURLs, "settings": s.RuleSettings, "backups": s.RuleBackups, "update_hours": s.RuleUpdateHours, "ad_block_enabled": boolValue(s.AdBlockEnabled, true)})
+		return true
+	case "/api/config/export":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		s, err := loadAPIStoreSnapshot()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return true
+		}
+		data, err := marshalConfigArchive(s)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", "attachment; filename=armwall-config.json")
+		_, _ = w.Write(data)
+		return true
+	case "/api/backups":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		backups, err := listConfigBackups()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return true
+		}
+		json.NewEncoder(w).Encode(backups)
+		return true
+	case "/api/backups/download":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return true
+		}
+		path, err := configBackupPath(r.URL.Query().Get("name"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return true
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			http.Error(w, "backup not found", http.StatusNotFound)
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(path))
+		_, _ = w.Write(data)
 		return true
 	}
 	return false
@@ -3247,7 +3351,11 @@ func loadWebAccessConfig() (webAccessConfig, error) {
 			allowed = defaultWebAllowedPrivate
 		}
 	case "legacy":
-		allowed = "0.0.0.0/0,::/0"
+		// Older installs set only ARMWALL_LISTEN. Keep them reachable from the
+		// LAN, but never from public addresses unless explicitly configured.
+		if allowed == "" {
+			allowed = defaultWebAllowedPrivate
+		}
 	}
 	prefixes, err := parseWebAllowedCIDRs(allowed)
 	if err != nil {
@@ -3255,7 +3363,7 @@ func loadWebAccessConfig() (webAccessConfig, error) {
 	}
 	config := webAccessConfig{Mode: mode, ListenAddress: addr, AllowedPrefixes: prefixes}
 	if legacy {
-		log.Printf("warning: non-loopback ARMWALL_LISTEN without ARMWALL_WEB_ACCESS uses unrestricted legacy access")
+		log.Printf("warning: non-loopback ARMWALL_LISTEN without ARMWALL_WEB_ACCESS; allowing only %s (set ARMWALL_WEB_ACCESS to silence this)", allowed)
 	}
 	return config, nil
 }
@@ -4183,8 +4291,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(s)
-	case "/api/rules":
-		json.NewEncoder(w).Encode(map[string]any{"rules": ruleURLs, "settings": s.RuleSettings, "backups": s.RuleBackups, "update_hours": s.RuleUpdateHours, "ad_block_enabled": boolValue(s.AdBlockEnabled, true)})
 	case "/api/rules/settings":
 		if r.Method != "POST" {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -4309,19 +4415,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
-	case "/api/config/export":
-		if r.Method != http.MethodGet {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		data, err := marshalConfigArchive(s)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Disposition", "attachment; filename=armwall-config.json")
-		_, _ = w.Write(data)
 	case "/api/config/import":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -4346,17 +4439,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(imported)
-	case "/api/backups":
-		if r.Method != http.MethodGet {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		backups, err := listConfigBackups()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		json.NewEncoder(w).Encode(backups)
 	case "/api/backups/create":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -4368,24 +4450,6 @@ func api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(backup)
-	case "/api/backups/download":
-		if r.Method != http.MethodGet {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		path, err := configBackupPath(r.URL.Query().Get("name"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			http.Error(w, "backup not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(path))
-		_, _ = w.Write(data)
 	case "/api/backups/restore":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method", http.StatusMethodNotAllowed)

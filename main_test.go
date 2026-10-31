@@ -344,6 +344,13 @@ func TestWebListenNetwork(t *testing.T) {
 	}
 }
 
+func callAPIGet(t *testing.T, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	api(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+	return recorder
+}
+
 func callAPI(t *testing.T, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
@@ -1123,23 +1130,23 @@ func TestUpdateConfiguredRulesHonorsPerRuleSchedule(t *testing.T) {
 	oldUpdateRule := updateRuleFn
 	t.Cleanup(func() { updateRuleFn = oldUpdateRule })
 	calls := map[string]string{}
-	updateRuleFn = func(tag, backup string) error {
+	updateRuleFn = func(tag, backup string) (bool, error) {
 		calls[tag] = backup
-		return nil
+		return true, nil
 	}
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	s := Store{RuleSettings: map[string]RuleUpdateSetting{
 		"geosite-ads": {BackupURL: "https://backup.example/ads.srs", AutoUpdate: true, UpdateHours: 6, LastUpdated: now.Add(-6 * time.Hour)},
 		"geosite-cn":  {AutoUpdate: false, UpdateHours: 1},
 	}}
-	updated, err := updateConfiguredRules(&s, false, "", now)
+	updated, _, err := updateConfiguredRules(&s, false, "", now)
 	if err != nil || len(updated) != 1 || updated[0] != "geosite-ads" || calls["geosite-ads"] != "https://backup.example/ads.srs" {
 		t.Fatalf("unexpected scheduled update: updated=%v calls=%v err=%v", updated, calls, err)
 	}
 	if !s.RuleSettings["geosite-ads"].LastUpdated.Equal(now) {
 		t.Fatalf("last update was not recorded: %+v", s.RuleSettings["geosite-ads"])
 	}
-	updated, err = updateConfiguredRules(&s, true, "geosite-cn", now.Add(time.Minute))
+	updated, _, err = updateConfiguredRules(&s, true, "geosite-cn", now.Add(time.Minute))
 	if err != nil || len(updated) != 1 || updated[0] != "geosite-cn" || calls["geosite-cn"] != "" {
 		t.Fatalf("unexpected manual update: updated=%v calls=%v err=%v", updated, calls, err)
 	}
@@ -1506,7 +1513,7 @@ func TestBootstrapRuleUpdatesIgnoreAutoUpdateOptOut(t *testing.T) {
 	oldUpdateRule := updateRuleFn
 	t.Cleanup(func() { updateRuleFn = oldUpdateRule })
 	calls := 0
-	updateRuleFn = func(_, _ string) error { calls++; return nil }
+	updateRuleFn = func(_, _ string) (bool, error) { calls++; return true, nil }
 	if count, err := applyScheduledRuleUpdates(); err != nil || count != 0 || calls != 0 {
 		t.Fatalf("scheduled updates should respect opt-out: count=%d calls=%d err=%v", count, calls, err)
 	}
@@ -1587,7 +1594,7 @@ func TestBatchNodeTestAndCredentialMasking(t *testing.T) {
 		},
 	})
 
-	recorder := callAPI(t, "/api/state", "")
+	recorder := callAPIGet(t, "/api/state")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("state status=%d", recorder.Code)
 	}
@@ -1599,7 +1606,7 @@ func TestBatchNodeTestAndCredentialMasking(t *testing.T) {
 		t.Fatalf("expected masked password '******', got: %+v", state.Nodes)
 	}
 
-	recorder = callAPI(t, "/api/node/get?id=node-1", "")
+	recorder = callAPIGet(t, "/api/node/get?id=node-1")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("node/get status=%d", recorder.Code)
 	}
@@ -1740,4 +1747,99 @@ func TestProxyPortConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestUnchangedRuleCheckDoesNotRestartProxy(t *testing.T) {
+	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080, RuleSettings: map[string]RuleUpdateSetting{}})
+	restarts := 0
+	restartProxyFn = func() error { restarts++; return nil }
+	oldUpdateRule := updateRuleFn
+	t.Cleanup(func() { updateRuleFn = oldUpdateRule })
+	changed := false
+	updateRuleFn = func(_, _ string) (bool, error) { return changed, nil }
+
+	if count, err := applyRuleUpdates(true); err != nil || count != len(ruleURLs) {
+		t.Fatalf("unchanged check: count=%d err=%v", count, err)
+	}
+	if restarts != 0 {
+		t.Fatalf("unchanged rule content restarted sing-box %d times", restarts)
+	}
+	s, err := loadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for tag := range ruleURLs {
+		if s.RuleSettings[tag].LastUpdated.IsZero() {
+			t.Fatalf("check time for %s was not recorded", tag)
+		}
+	}
+	if recorder := callAPI(t, "/api/rules/update", `{"Tag":"geosite-cn"}`); recorder.Code != http.StatusOK || restarts != 0 {
+		t.Fatalf("unchanged API rule update: code=%d restarts=%d body=%s", recorder.Code, restarts, recorder.Body.String())
+	}
+
+	changed = true
+	if _, err := applyRuleUpdates(true); err != nil {
+		t.Fatal(err)
+	}
+	if restarts != 1 {
+		t.Fatalf("changed rule content should restart sing-box once, got %d", restarts)
+	}
+}
+
+func TestLegacyListenDefaultsToPrivateClients(t *testing.T) {
+	t.Setenv("ARMWALL_WEB_ACCESS", "")
+	t.Setenv("ARMWALL_LISTEN", "0.0.0.0:8080")
+	t.Setenv("ARMWALL_WEB_ALLOWED_CIDRS", "")
+	cfg, err := loadWebAccessConfig()
+	if err != nil || cfg.Mode != "legacy" {
+		t.Fatalf("legacy config: mode=%q err=%v", cfg.Mode, err)
+	}
+	if !webClientAllowed("192.168.10.5:5000", cfg.AllowedPrefixes) {
+		t.Fatal("legacy mode must keep LAN clients reachable")
+	}
+	if webClientAllowed("8.8.8.8:5000", cfg.AllowedPrefixes) || webClientAllowed("[2001:db8::1]:5000", cfg.AllowedPrefixes) {
+		t.Fatal("legacy mode must not allow public clients by default")
+	}
+	t.Setenv("ARMWALL_WEB_ALLOWED_CIDRS", "100.64.0.0/10")
+	cfg, err = loadWebAccessConfig()
+	if err != nil || !webClientAllowed("100.100.1.1:5000", cfg.AllowedPrefixes) || webClientAllowed("192.168.10.5:5000", cfg.AllowedPrefixes) {
+		t.Fatalf("legacy mode should honor explicit CIDRs: err=%v", err)
+	}
+}
+
+func TestReadOnlyEndpointsDoNotWaitForWriteLock(t *testing.T) {
+	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080})
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range []string{"/api/state", "/api/rules", "/api/backups", "/api/config/export"} {
+		done := make(chan int, 1)
+		go func(p string) { done <- callAPIGet(t, p).Code }(path)
+		select {
+		case code := <-done:
+			if code != http.StatusOK {
+				t.Fatalf("%s status=%d", path, code)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s blocked on the API write mutex", path)
+		}
+	}
+	if code := callAPI(t, "/api/state", "").Code; code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /api/state status=%d", code)
+	}
+}
+
+func TestReplaceSubscriptionNodesKeepsPosition(t *testing.T) {
+	nodes := []Node{{ID: "m1"}, {ID: "a1", SubscriptionID: "a"}, {ID: "a2", SubscriptionID: "a"}, {ID: "m2"}}
+	got := replaceSubscriptionNodes(nodes, "a", []Node{{ID: "a3", SubscriptionID: "a"}})
+	ids := []string{}
+	for _, n := range got {
+		ids = append(ids, n.ID)
+	}
+	if strings.Join(ids, ",") != "m1,a3,m2" {
+		t.Fatalf("replace in place = %v", ids)
+	}
+	got = replaceSubscriptionNodes(nodes, "b", []Node{{ID: "b1", SubscriptionID: "b"}})
+	if len(got) != 5 || got[4].ID != "b1" {
+		t.Fatalf("new subscription should append: %+v", got)
+	}
 }
