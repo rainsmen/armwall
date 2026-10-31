@@ -2,7 +2,7 @@
 
 All notable changes to ArmWall will be documented in this file.
 
-## [Unreleased]
+## [0.4.1] - 2026-10-31
 
 ### Fixed
 - **Rule updates no longer restart sing-box when content is unchanged**: `updateRule` now reports whether the file changed, and `persistStore` ignores `LastUpdated` when comparing rule settings. Previously every due rule check restarted the core and dropped LAN connections.
