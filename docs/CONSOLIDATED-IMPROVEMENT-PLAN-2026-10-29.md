@@ -1,9 +1,9 @@
 # ArmWall 项目全景技术评估、历史演化、问题矩阵与综合改进计划
 
-> **文档性质**：项目唯一权威综合技术文档（整合历史审计、复核评估、实施跟踪与最新复评）。  
+> **文档性质**：项目综合技术文档（整合历史审计、复核评估、实施跟踪与最新复评）。事故复盘与故障转移提案另见 [`INCIDENT-REPORT-2026-10-29.md`](INCIDENT-REPORT-2026-10-29.md) 与 [`PROPOSAL-BACKGROUND-FAILOVER.md`](PROPOSAL-BACKGROUND-FAILOVER.md)。  
 > **基准基线**：`HEAD a988f96` 及工作区最新修改状态。  
-> **更新时间**：2026-10-29（Asia/Shanghai）  
-> **文档定位**：全仓唯一保留文档。归档并收敛历史所有审计文档结论，记录已解决历史问题、辨析争议与误报项、系统化梳理当前亟待修改与持续优化的全量缺陷，并提供实施路线图与真机验证记录。
+> **更新时间**：2026-10-31（Asia/Shanghai）  
+> **文档定位**：归档并收敛历史所有审计文档结论，记录已解决历史问题、辨析争议与误报项、系统化梳理当前亟待修改与持续优化的全量缺陷，并提供实施路线图与真机验证记录。
 
 ---
 
@@ -12,10 +12,10 @@
 - [一、项目全景架构与工作原理](#一项目全景架构与工作原理)
 - [二、历史审计与演进脉络综述](#二历史审计与演进脉络综述)
 - [三、已彻底解决并验证的历史缺陷清单](#三已彻底解决并验证的历史缺陷清单)
-- [四、当前确凿存在且亟待修复的核心缺陷（P0 / P1）](#四当前确凿存在且亟待修复的核心缺陷p0--p1)
+- [四、当前核心缺陷修复实施记录（P0 / P1 全部已修复并验证）](#四当前核心缺陷修复实施记录p0--p1-全部已修复并验证)
 - [五、关于误报、定性偏颇与架构设计权衡的核验辨析](#五关于误报定性偏颇与架构设计权衡的核验辨析)
-- [六、局部缺陷与系统健壮性中长期优化清单（P2 / P3）](#六局部缺陷与系统健壮性中长期优化清单p2--p3)
-- [七、全量问题跟踪总矩阵（ISSUE-01 ~ ISSUE-28）](#七全量问题跟踪总矩阵issue-01--issue-28)
+- [六、局部缺陷与系统健壮性优化实施记录（P2 关键项全部已修复）](#六局部缺陷与系统健壮性优化实施记录p2-关键项全部已修复)
+- [七、全量问题跟踪总矩阵（ISSUE-01 ~ ISSUE-36）](#七全量问题跟踪总矩阵issue-01--issue-36)
 - [八、真机与本地自动化测试验证记录](#八真机与本地自动化测试验证记录)
 - [九、分阶段实施路线图与验收准则](#九分阶段实施路线图与验收准则)
 
@@ -127,10 +127,10 @@ flowchart TD
 
 ### 4.1 P0-1（ISSUE-23）：前端「新增订阅」必抛 400 错误 —— ✅【已修复】
 - **问题现象**：用户在 Web 控制台点击“添加订阅”并提交后，页面始终提示 `400 invalid url`，任何新增订阅操作 100% 失败。
-- **源码根因**：前端 [`web/app.js`](file:///home/rainan/projects/armbian%20passwall/web/app.js) 提交的 JSON 载荷包含 `id`, `enabled`, `update_hours`, `last_updated`；后端 [`main.go`](file:///home/rainan/projects/armbian%20passwall/main.go) 解析结构体无 JSON tag 且开启 `DisallowUnknownFields`，反序列化报错。
+- **源码根因**：前端 [`web/app.js`](../web/app.js) 提交的 JSON 载荷包含 `id`, `enabled`, `update_hours`, `last_updated`；后端 [`main.go`](../main.go) 解析结构体无 JSON tag 且开启 `DisallowUnknownFields`，反序列化报错。
 - **修复措施**：
-  1. [`main.go#L2834-L2848`](file:///home/rainan/projects/armbian%20passwall/main.go#L2834-L2848) 结构体补全 `json:"id"`, `json:"url"`, `json:"name"`, `json:"update_hours"`, `json:"enabled"`, `json:"last_updated"` 标签；
-  2. [`web/app.js#L602-L612`](file:///home/rainan/projects/armbian%20passwall/web/app.js#L602-L612) 整理提交载荷，新增时安全忽略未初始化字段；
+  1. [`main.go#L2834-L2848`](../main.go#L2834-L2848) 结构体补全 `json:"id"`, `json:"url"`, `json:"name"`, `json:"update_hours"`, `json:"enabled"`, `json:"last_updated"` 标签；
+  2. [`web/app.js#L602-L612`](../web/app.js#L602-L612) 整理提交载荷，新增时安全忽略未初始化字段；
   3. 新增单元测试 `TestAddSubscriptionAcceptsFrontendPayload` 断言前端真实载荷解析通过；
   4. 远端 `192.168.10.233` 实测：以真实前端载荷提交 `POST /api/subscription`，成功进入 fetch 流程并返回正确的 502 网络错误（不再阻断在 400 校验阶段）。
 
@@ -138,7 +138,7 @@ flowchart TD
 - **问题现象**：机场订阅包含 `?type=tcp` 导致 sing-box 配置校验失败（sing-box 无 tcp transport）。
 - **源码根因**：URL 与 VMess 解析中原样提取并向 sing-box 配置渲染 `"transport": {"type": "tcp"}`。
 - **修复措施**：
-  1. [`main.go#L177-L186`](file:///home/rainan/projects/armbian%20passwall/main.go#L177-L186) 新增 `normalizeTransport()` 函数，将 `tcp`、`none`、空字符串归一化为空，将 `h2` 映射为 `http`；
+  1. [`main.go#L177-L186`](../main.go#L177-L186) 新增 `normalizeTransport()` 函数，将 `tcp`、`none`、空字符串归一化为空，将 `h2` 映射为 `http`；
   2. `parseVMessLink` 与 URL 解析均接入 `normalizeTransport`；
   3. `validateNode` 增加 transport 白名单校验（仅放行 `http`, `ws`, `quic`, `grpc`, `httpupgrade`）；
   4. `config()` 在 `n.Transport == ""` 或 `"tcp"` 时不渲染 `"transport"` 块；
@@ -148,7 +148,7 @@ flowchart TD
 - **问题现象**：并发读写全局变量 `proxyPort` 导致潜在数据竞争。
 - **源码根因**：写操作在 `persistStore` 内无全局互斥保护，而多个异步任务无锁并发读取。
 - **修复措施**：
-  1. [`main.go#L618-L633`](file:///home/rainan/projects/armbian%20passwall/main.go#L618-L633) 引入 `proxyPortMu sync.RWMutex`，封装 `getProxyPort()` 与 `setProxyPort()`；
+  1. [`main.go#L618-L633`](../main.go#L618-L633) 引入 `proxyPortMu sync.RWMutex`，封装 `getProxyPort()` 与 `setProxyPort()`；
   2. 全仓所有读取与写入点（`persistStore`, `downloadResource`, `config()`, `runCoreUpdate`, `runSingleNodeTest`, `waitForProxyReady`, `ports.go`）统一调用读写接口；
   3. 新增高并发竞态测试 `TestProxyPortConcurrentAccess`，经 `go test -race ./...` 严密验证无任何数据竞争。
 
@@ -162,7 +162,7 @@ flowchart TD
 ### 4.5 P1-4（ISSUE-27）：安装脚本依赖列表中遗漏 `readelf` (binutils) —— ✅【已修复】
 - **问题现象**：最小化系统上自动更新核心失败，提示缺少 `readelf`。
 - **修复措施**：
-  1. [`install.sh#L9-L15`](file:///home/rainan/projects/armbian%20passwall/install.sh#L9-L15) 将 `readelf` 纳入依赖检查，并在 `apt-get install` 列表中补充 `binutils`；
+  1. [`install.sh#L9-L15`](../install.sh#L9-L15) 将 `readelf` 纳入依赖检查，并在 `apt-get install` 列表中补充 `binutils`；
   2. 远端 `192.168.10.233` 核验确认 `/usr/bin/readelf` 正常可用。
 - **修复方案**：
   - 在 `install.sh` 的基础软件包依赖列表中补充 `binutils`。
@@ -176,7 +176,7 @@ flowchart TD
 - **问题现象**：无单调递增代次标记，毫秒级并发更新可能导致较旧任务结果覆盖较新状态。
 - **源码根因**：SQLite `settings` 表与内存 `Store` 无 Revision 标记；旧版仅记录 `time.RFC3339` 秒级时间戳。
 - **修复措施**：
-  1. [`storage.go`](file:///home/rainan/projects/armbian%20passwall/storage.go) 与 [`main.go`](file:///home/rainan/projects/armbian%20passwall/main.go) 中 `Store` 结构体引入 `Revision int64`，并在 SQLite 每次 `saveDB` 事务提交中执行原子单调自增（`s.Revision++`）；
+  1. [`storage.go`](../storage.go) 与 [`main.go`](../main.go) 中 `Store` 结构体引入 `Revision int64`，并在 SQLite 每次 `saveDB` 事务提交中执行原子单调自增（`s.Revision++`）；
   2. 时间戳序列化/反序列化精度全面升级为 `time.RFC3339Nano`；
   3. 新增单元测试 `TestStoreRevisionIncrementsAndPersists` 断言持久化与代次自增；
   4. 远端 `192.168.10.233` 真机实测：触发模式变更后，SQLite `revision` 字段确凿由 1 递增至 2。
@@ -186,7 +186,7 @@ flowchart TD
 - **源码根因**：缺乏对新下载规则与既有规则的内容等价性比对（Content Hash / Byte Check）。
 - **修复措施**：
   1. 规则下载解耦至独立逻辑，移出主互斥锁；
-  2. [`main.go`](file:///home/rainan/projects/armbian%20passwall/main.go) 在下载并校验 SRS 合法性后，增加 `bytes.Equal(prev, body)` 校验；若内容完全一致，立即返回 `nil`，跳过磁盘写入、备份和内核重启；
+  2. [`main.go`](../main.go) 在下载并校验 SRS 合法性后，增加 `bytes.Equal(prev, body)` 校验；若内容完全一致，跳过磁盘写入与备份（**更正**：此版本仍会因 `LastUpdated` 变化触发内核重启，2026-10-31 修复，见 4.10 节）；
   3. 引入 `.absent` 占位标记与 `.bak` 备份机制，确保更新失败或进程异常时可安全原子回滚；
   4. 单元测试 `TestRuleBackupRestoreHandlesExistingAndNewFiles` 覆盖备份与恢复生命周期。
 
@@ -194,10 +194,26 @@ flowchart TD
 - **问题现象**：纯局域网或首次安装且无代理环境下，系统因缺失 SRS 规则集导致 sing-box 启动失败。
 - **源码根因**：原安装脚本和二进制依赖外网在线下载规则集，缺乏离线内置资源。
 - **修复措施**：
-  1. 提取并预编译 4 个官方标准规则集（`geoip-cn.srs`, `geosite-ads.srs`, `geosite-cn.srs`, `geosite-proxy.srs`），纳入仓库 [`rules/`](file:///home/rainan/projects/armbian%20passwall/rules/) 目录；
-  2. [`Makefile`](file:///home/rainan/projects/armbian%20passwall/Makefile) 将 `rules` 打包至 `armwall-install-files.tar.gz` 发布资产；
-  3. [`install.sh`](file:///home/rainan/projects/armbian%20passwall/install.sh) 安装阶段自动部署离线规则至 `/usr/share/armwall/rules/` 并初始化 `/var/lib/armwall/rules/`；
-  4. [`main.go`](file:///home/rainan/projects/armbian%20passwall/main.go) `bundledRule` 在无外网时自动回退提取本地预置规则，实现纯离线初次引导。
+  1. 提取并预编译 4 个官方标准规则集（`geoip-cn.srs`, `geosite-ads.srs`, `geosite-cn.srs`, `geosite-proxy.srs`），纳入仓库 [`rules/`](../rules/) 目录；
+  2. [`Makefile`](../Makefile) 将 `rules` 打包至 `armwall-install-files.tar.gz` 发布资产；
+  3. [`install.sh`](../install.sh) 安装阶段自动部署离线规则至 `/usr/share/armwall/rules/` 并初始化 `/var/lib/armwall/rules/`；
+  4. [`main.go`](../main.go) `bundledRule` 在无外网时自动回退提取本地预置规则，实现纯离线初次引导。
+
+
+### 4.10 2026-10-31 复评修复
+以下问题由 2026-10-31 代码复评发现，均已修复，并在 `192.168.10.233` 真机验证：
+
+| 编号 | 问题 | 修复 | 真机验证 |
+| :--- | :--- | :--- | :--- |
+| **ISSUE-30** | 规则内容未变化也会重启 sing-box：`updateRule` 未变化时返回 `nil` 被当作已更新，`LastUpdated` 变化使 `persistStore` 判定配置变化 | `updateRule` 返回 `(changed, err)`；`persistStore` 比较规则设置时忽略 `LastUpdated`；规则文件确有变化时由调用方显式要求重启；内置规则安装路径也写入 `.bak`/`.absent` 以便回滚 | API 与 CLI 更新未变化规则，sing-box 启动时间不变；替换 `geosite-ads.srs` 后更新，重启 1 次且文件恢复为上游内容 |
+| **ISSUE-31** | `naive-supervisor.sh` 用 `pkill -f "naive $CONFIG_DIR"` 匹配命令行，误杀无关进程（真机误杀 SSH 诊断会话）；TERM trap 返回后继续主循环，`systemctl stop` 需等 90 秒超时 | 每个实例写 PID 文件，重启与关停只向这些 PID 发信号；TERM 后显式 `exit 0` | 两次 `systemctl restart armwall-naive` 耗时约 0.2 秒，无 `Failed`；命令行含配置路径的诱饵进程未被杀；5 个配置对应 5 个 naive 进程 |
+| **ISSUE-32** | 健康检查串行探测所有实例，且远端已宕机的节点每 3 个周期被重启一次、永不停止 | 并行探测；健康重启后按指数退避（默认 300 秒起，上限 1800 秒）跳过该端口，恢复后清零；休眠可被信号立即打断 | 指向不可达服务器的临时实例：重启后检查间隔 10 秒→20 秒；SIGTERM 后干净退出，无残留进程 |
+| **ISSUE-33** | 未设置 `ARMWALL_WEB_ACCESS` 但监听非回环地址的旧安装（legacy 模式）放行 `0.0.0.0/0, ::/0` | legacy 模式默认只放行回环与 RFC1918 私网，`ARMWALL_WEB_ALLOWED_CIDRS` 可覆盖 | 仅设 `ARMWALL_LISTEN=0.0.0.0:18080` 启动，日志显示私网白名单，局域网访问返回 200 |
+| **ISSUE-34** | `/api/rules`、`/api/backups`、`/api/config/export`、`/api/backups/download` 只读 GET 也持有写锁，内核重启期间（最长约 28 秒）被阻塞；`/api/state`、`/api/node/get` 不检查请求方法；`/api/service/status` 调用 `systemctl` 无超时 | 只读接口移至 `handleUnlockedAPI` 并使用共享锁快照；补充 GET 方法检查；`systemctl` 改用 5 秒超时 | 只读接口均返回 200（<20ms），`POST /api/state` 返回 405 |
+| **ISSUE-35** | 订阅节点替换逻辑在三处重复实现，`/api/subscription` 缺少并发冲突检查且会把节点移到列表末尾 | 抽取 `replaceSubscriptionNodes`，三处共用并保持原位置；`/api/subscription` 补充与 `update-one` 相同的冲突检查 | 单元测试覆盖 |
+| **ISSUE-36** | `gateway.sh` 写入从未使用的 `nft.backup`（`set -e` 下写失败会中断启用）；直连排除缺少 `100.64.0.0/10`（CGNAT）与 `169.254.0.0/16` | 删除 `nft.backup`；排除集合补充两个网段 | `nft list table inet armwall` 包含两个新网段 |
+
+新增测试：`TestUnchangedRuleCheckDoesNotRestartProxy`、`TestLegacyListenDefaultsToPrivateClients`、`TestReadOnlyEndpointsDoNotWaitForWriteLock`、`TestReplaceSubscriptionNodesKeepsPosition`，以及 `tests/naive-supervisor-test.sh`（已接入 `make test` 与 CI）。
 
 ---
 
@@ -209,7 +225,7 @@ flowchart TD
 - **报告观点**：认为订阅 URL 包含 Token，`/api/state` 接口下发未脱敏 URL 属于敏感凭据泄露。
 - **核验辨析**：
   - ArmWall 本质是为家庭/个人网络设计的轻量级网关面板，采用**单管理员（Single-Admin）认证架构**，不存在只读租户或普通用户角色；
-  - 前端管理后台的“订阅管理”模块必须能够支持管理员查看并编辑已有的订阅地址（见 [`web/app.js#L584`](file:///home/rainan/projects/armbian%20passwall/web/app.js#L584) 表单回显）；
+  - 前端管理后台的“订阅管理”模块必须能够支持管理员查看并编辑已有的订阅地址（见 [`web/app.js#L584`](../web/app.js#L584) 表单回显）；
   - 若在 `/api/state` 中强行将 URL 脱敏掩码，管理员在 Web 端将无法修改已配置的订阅；
   - 访问 `/api/state` 必须提供合法的管理员 Bearer Token，将管理员查看自己配置的数据定性为“权限提升/漏洞”不符合实际使用场景。
 
@@ -218,7 +234,7 @@ flowchart TD
 - **核验辨析**：
   - `armwall-gateway suspend` 是专门配合 systemd 服务重启设计的指令（`armwall-gateway.service` 中的 `ExecStop=... suspend`）；
   - 当网关服务进行升级、热重载或重启时，保留底层 IP 转发是为了避免局域网内其他设备在服务重启的数秒内发生断网故障；
-  - 当用户主动执行 `gateway.sh disable` 彻底停用网关时，脚本已正确执行了 `ip-forward.before` 的原始值还原（见 [`gateway.sh#L159-L163`](file:///home/rainan/projects/armbian%20passwall/gateway.sh#L159-L163)）；
+  - 当用户主动执行 `gateway.sh disable` 彻底停用网关时，脚本已正确执行了 `ip-forward.before` 的原始值还原（见 [`gateway.sh#L159-L163`](../gateway.sh#L159-L163)）；
   - 这种行为完全符合运维预期，只需在注释和文档中阐明其语义即可。
 
 ### 5.3 Token 保存在 `localStorage` ——【易用性与安全性的工程权衡】
@@ -240,35 +256,35 @@ flowchart TD
 ## 六、局部缺陷与系统健壮性优化实施记录（P2 关键项全部已修复）
 
 ### 6.1 P2-1（ISSUE-28）：sing-box 路由规则中 `action: sniff` 顺序倒置 —— ✅【已修复】
-- **依据**：[`main.go#L2190-L2200`](file:///home/rainan/projects/armbian%20passwall/main.go#L2190-L2200)。
+- **依据**：[`main.go#L2190-L2200`](../main.go#L2190-L2200)。
 - **修复**：将 `{"action": "sniff"}` 规则移动至基于协议判定（`protocol: dns`）的劫持规则之前，确保 TProxy 入站流量先行完成协议嗅探；单元测试 `TestRouteRulesHaveSniffing` 严格断言执行顺序；`192.168.10.233` 远端生成配置已确认为首条规则。
 
 ### 6.2 P2-12：内联样式违反自身设置的 CSP 策略 —— ✅【已修复】
-- **依据**：[`web/index.html#L159`](file:///home/rainan/projects/armbian%20passwall/web/index.html#L159) 与 [`web/styles.css#L474-L481`](file:///home/rainan/projects/armbian%20passwall/web/styles.css#L474-L481)。
+- **依据**：[`web/index.html#L159`](../web/index.html#L159) 与 [`web/styles.css#L474-L481`](../web/styles.css#L474-L481)。
 - **修复**：彻底移除 HTML 标签中的 `style="cursor:pointer;"` 内联样式，在 CSS 中以 `th.delay` 类选择器实现；远端测试确认 HTML 中 0 处内联 style，严格符合自身 CSP 策略。
 
 ### 6.3 P2-5 & P2-6（ISSUE-12）：Naive 端口分配忽略错误且未防止冲突 —— ✅【已修复】
-- **依据**：[`main.go#L1823-L1865`](file:///home/rainan/projects/armbian%20passwall/main.go#L1823-L1865)、[`migrations.go#L25`](file:///home/rainan/projects/armbian%20passwall/migrations.go#L25)。
+- **依据**：[`main.go#L1823-L1865`](../main.go#L1823-L1865)、[`migrations.go#L25`](../migrations.go#L25)。
 - **修复**：在分配端口前，将 SSH (22)、DNS (53/自定)、Clash API (9090)、Web (8080/自定)、Proxy 端口、TProxy 端口及已分配 MAC ACL 端口统一加入占用预留表；`writeNaiveConfigs` 捕获分配错误并在端口耗尽时拒绝写入非法配置。
 
 ### 6.4 P2-11：批量测速前后端超时时间不协同 —— ✅【已修复】
-- **依据**：[`web/app.js#L804`](file:///home/rainan/projects/armbian%20passwall/web/app.js#L804)、[`main.go#L2731-L2752`](file:///home/rainan/projects/armbian%20passwall/main.go#L2731-L2752)。
+- **依据**：[`web/app.js#L804`](../web/app.js#L804)、[`main.go#L2731-L2752`](../main.go#L2731-L2752)。
 - **修复**：前端批量测速超时延长至 180 秒（`timeoutMs: 180000`）；后端将并发上限提升至 20 并引入 `r.Context().Done()` 及时感知前端连接断开，防止无谓的网络测试。
 
 ### 6.5 P2-8：存在无限阻塞的 `syscall.Flock`
-- **依据**：[`main.go#L678`](file:///home/rainan/projects/armbian%20passwall/main.go#L678)、[`main.go#L657`](file:///home/rainan/projects/armbian%20passwall/main.go#L657)。
+- **依据**：[`main.go#L678`](../main.go#L678)、[`main.go#L657`](../main.go#L657)。
 - **分析**：基础 helper 函数保留作为底层调用，关键长耗时业务逻辑（订阅抓取、配置写入）已全面统一接入带超时 Context 的 `withStoreFileLockContext`。
 
 ### 6.6 P2-9：网卡改名后开机网关恢复逻辑缺乏容错 —— ✅【已修复】
-- **依据**：[`gateway.sh#L30-L39`](file:///home/rainan/projects/armbian%20passwall/gateway.sh#L30-L39)。
+- **依据**：[`gateway.sh#L30-L39`](../gateway.sh#L30-L39)。
 - **修复**：在 `load_state` 中当保存的网卡无效（如 USB 网卡重枚举或名称变更）时，输出告警并自动回退执行 `detect` 动态发现可用网卡，消除服务启动硬阻断。
 
 ### 6.7 P2-7：SQLite 存储采用全量清空与插入
-- **依据**：[`storage.go#L234-L276`](file:///home/rainan/projects/armbian%20passwall/storage.go#L234-L276)。
+- **依据**：[`storage.go#L234-L276`](../storage.go#L234-L276)。
 - **分析**：当前在单事务中执行原子性有保障；未来在大节点量级规划中推进差异比对增量更新（Upsert）。
 
 ### 6.8 P2-13：清理无调用死函数 —— ✅【已修复】
-- **依据**：[`main.go#L605`](file:///home/rainan/projects/armbian%20passwall/main.go#L605)。
+- **依据**：[`main.go#L605`](../main.go#L605)。
 - **修复**：彻底删除无引用的 `updateSubscriptionsWithForceLocked` 函数。
 
 ### 6.9 P2-15：CI 工具链版本统一与静态检查门禁 —— ✅【已修复】
@@ -277,9 +293,9 @@ flowchart TD
 
 ---
 
-## 七、全量问题跟踪总矩阵（ISSUE-01 ~ ISSUE-28）
+## 七、全量问题跟踪总矩阵（ISSUE-01 ~ ISSUE-36）
 
-下表整合了自项目初始审计以来的全部 28 项问题，标明其历史来源、性质、当前状态与改进要求：
+下表整合了自项目初始审计以来的全部 36 项问题，标明其历史来源、性质、当前状态与改进要求：
 
 | 统一编号 | 对应历史条目 | 问题简述 | 严重度 | 当前状态 | 现状依据与验收说明 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -311,6 +327,14 @@ flowchart TD
 | **ISSUE-26** | 最新复评 P1-4 | 工作区打包发布产物滞后过期 | **P1** | ✅ **已修复** | 重新执行 `make release` 生成同步包与校验和，解包校验比对 100% 一致。 |
 | **ISSUE-27** | 最新复评 P1-5 | `install.sh` 依赖列表遗漏 `readelf` | **P1** | ✅ **已修复** | 安装脚本依赖列表中补充 `binutils` 与 `readelf` 命令检查。 |
 | **ISSUE-28** | 最新复评 P2-1 | 路由规则中 `action: sniff` 顺序倒置 | **P2** | ✅ **已修复** | 将嗅探规则调整至协议规则之前；真机 sing-box 生成规则验证确认首位。 |
+| **ISSUE-29** | 2026-10-29 实战复盘 | 缺乏后台自动故障转移与链路熔断切流机制 | **P1** | 📋 **下版本规划** | 建立独立后台探活协程（Goroutine），主节点不可用时自动熔断并切换至设置的备用节点（详见提案文档 [`docs/PROPOSAL-BACKGROUND-FAILOVER.md`](PROPOSAL-BACKGROUND-FAILOVER.md)）。 |
+| **ISSUE-30** | 2026-10-31 复评 | 规则内容未变化仍重启 sing-box | **P1** | ✅ **已修复** | 见 4.10 节。 |
+| **ISSUE-31** | 2026-10-31 复评 | naive supervisor `pkill -f` 误杀无关进程、停止需 90 秒超时 | **P1** | ✅ **已修复** | 见 4.10 节。 |
+| **ISSUE-32** | 2026-10-31 复评 | 健康检查串行探测、宕机节点无限重启 | **P2** | ✅ **已修复** | 见 4.10 节。 |
+| **ISSUE-33** | 2026-10-31 复评 | legacy 监听模式放行任意来源 | **P1** | ✅ **已修复** | 见 4.10 节。 |
+| **ISSUE-34** | 2026-10-31 复评 | 只读接口被写锁阻塞、缺方法检查与命令超时 | **P2** | ✅ **已修复** | 见 4.10 节。 |
+| **ISSUE-35** | 2026-10-31 复评 | 订阅节点替换逻辑三处重复 | **P2** | ✅ **已修复** | 见 4.10 节。 |
+| **ISSUE-36** | 2026-10-31 复评 | 网关无用备份与直连排除网段缺失 | **P3** | ✅ **已修复** | 见 4.10 节。 |
 
 ---
 
@@ -321,7 +345,7 @@ flowchart TD
 
 | 测试类型 | 运行命令 | 实际结果 | 覆盖范围与说明 |
 | :--- | :--- | :--- | :--- |
-| **单元与回归测试** | `make test` | **PASS** | 包含全部 69 个 Go 单元测试、代码规范、Shell 语法及 JS 语法校验 |
+| **单元与回归测试** | `make test` | **PASS** | 包含全部 75 个 Go 单元测试、代码规范、Shell 语法及 JS 语法校验 |
 | **并发竞态分析** | `go test -race ./...` | **PASS** | 包含 10 读 5 写的并发高压端口测试，0 race 警告 |
 | **sing-box 真实核心** | PATH 注入真实 sing-box 运行测试 | **PASS** | `sing-box check` 与候选配置生成测试完全通过 |
 | **交叉编译构建** | `make release` | **PASS** | 四架构二进制编译完成，tarball 重新生成且与工作区完全一致 |
@@ -387,3 +411,4 @@ flowchart TD
 1. **多配置跨资源事务日志与崩溃恢复（ISSUE-05）**：建立更完善的跨进程崩溃恢复日志。
 2. **数据存储增量写入（P2-7）**：将 SQLite 全量清空写入优化为差量 Upsert，进一步降低大节点量下的写入磨损。
 3. **多架构与真实网络命名空间自动化矩阵（ISSUE-08）**：在 CI 中构建轻量 Network Namespace 仿真环境，验证 nftables 与策略路由完整生命周期。
+4. **后台自动故障转移与链路熔断机制（ISSUE-29）**：在后台建立独立的定时探活协程（Goroutine），当主选节点不可用时自动触发熔断并切换至设置的备用节点，并在主节点恢复后支持平滑回切（详见提案文档 [`docs/PROPOSAL-BACKGROUND-FAILOVER.md`](PROPOSAL-BACKGROUND-FAILOVER.md)）。
