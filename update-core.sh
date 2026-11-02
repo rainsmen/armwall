@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+export LC_ALL=C
 CORE=${1:-}
 ACTION=${2:-}
 SOURCE=${3:-}
