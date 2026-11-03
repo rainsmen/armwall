@@ -182,6 +182,10 @@ async function handleAction(button) {
           tcpOutbound: $("tcpOutbound").value,
           udpOutbound: $("udpOutbound").value,
           dns: dnsPayload(),
+          forceProxyDomains: $("forceProxyDomains")
+            .value.split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean),
         },
       });
       toast("分流、DNS 与出站策略已保存");
@@ -282,6 +286,7 @@ async function handleAction(button) {
       toast("备份已删除");
       await loadBackups();
     } else if (action === "refresh-logs") await refreshLogs();
+    else if (action === "run-diagnostics") await runDiagnostics(button);
     else if (action === "save-log-level") {
       await request("/api/log/level", {
         method: "POST",

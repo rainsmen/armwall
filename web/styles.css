@@ -812,3 +812,91 @@ th.delay {
     grid-column: 1/-1;
   }
 }
+
+
+.diag-verdict {
+  font-size: 15px;
+  font-weight: 650;
+  color: #1e2d43;
+  margin: 14px 0 0;
+}
+.diag-generated {
+  margin-top: 4px;
+}
+.diag-checks {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  border-top: 1px solid #e0e6ee;
+}
+.diag-check {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid #e0e6ee;
+}
+.diag-check .pill {
+  flex: none;
+}
+.diag-check strong {
+  font-size: 14px;
+  color: #1e2d43;
+  white-space: nowrap;
+}
+.diag-detail {
+  color: #526176;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.diag-meta {
+  margin: 16px 0 0;
+}
+.diag-meta-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) 1fr;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid #edf2f7;
+}
+.diag-meta-row dt {
+  color: #718096;
+  font-size: 13px;
+}
+.diag-meta-row dd {
+  margin: 0;
+  color: #1e2d43;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.diag-block {
+  margin-top: 18px;
+}
+.diag-block h3 {
+  font-size: 14px;
+  margin: 0 0 6px;
+  color: #1e2d43;
+}
+.diag-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.diag-list li {
+  padding: 4px 0;
+  font-size: 13px;
+  color: #1e2d43;
+  overflow-wrap: anywhere;
+}
+.diag-pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #172335;
+  color: #d8e3f3;
+  border-radius: 6px;
+  padding: 12px;
+  margin: 0;
+}

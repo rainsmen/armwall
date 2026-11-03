@@ -223,7 +223,7 @@ func TestConfigurationWhileStoppedDoesNotStartProxy(t *testing.T) {
 	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080, Nodes: []Node{{ID: "n1", Name: "node", Type: "anytls", Server: "example.com", Port: 443, Password: "secret", TLS: true, Enabled: true}}})
 	proxyRunningFn = func() bool { return false }
 	restarts := 0
-	restartProxyFn = func() error {
+	reloadProxyFn = func(bool, bool) error {
 		restarts++
 		return nil
 	}
@@ -246,8 +246,19 @@ func TestConfigACLAndDNS(t *testing.T) {
 		t.Fatalf("unexpected DNS servers: %+v", servers)
 	}
 	route := c["route"].(map[string]any)
-	if route["default_domain_resolver"] != "direct-dns" {
-		t.Fatalf("missing default domain resolver: %+v", route)
+	// Domains sing-box has to resolve itself must go through the remote
+	// resolver; the direct outbound overrides this with the domestic one.
+	if route["default_domain_resolver"] != "remote-dns" {
+		t.Fatalf("default domain resolver must use the remote resolver: %+v", route)
+	}
+	for _, raw := range c["outbounds"].([]any) {
+		outbound := raw.(map[string]any)
+		if outbound["tag"] == "direct" && outbound["domain_resolver"] != "direct-dns" {
+			t.Fatalf("direct outbound must resolve through the domestic resolver: %+v", outbound)
+		}
+		if outbound["tag"] == "n1" && outbound["domain_resolver"] != "remote-dns" {
+			t.Fatalf("proxy outbound must resolve through the remote resolver: %+v", outbound)
+		}
 	}
 	rules := route["rules"].([]any)
 	aclFound, macACLFound, hijackFound := false, false, false
@@ -401,5 +412,141 @@ func TestRouteRulesHaveSniffing(t *testing.T) {
 	}
 	if sniffIdx > dnsProtoIdx {
 		t.Fatalf("action:sniff (idx=%d) must come before protocol:dns (idx=%d) for TProxy packet classification", sniffIdx, dnsProtoIdx)
+	}
+}
+
+func TestConfigAlwaysEmitsDNSResolver(t *testing.T) {
+	s := Store{Mode: "bypass_cn", SelectedNode: "n1", Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}}
+	c := config(s)
+	dns, ok := c["dns"].(map[string]any)
+	if !ok {
+		t.Fatal("dns block must be emitted even when the DNS module is disabled")
+	}
+	if _, deprecated := dns["independent_cache"]; deprecated {
+		t.Fatal("independent_cache is deprecated in sing-box 1.14")
+	}
+	if dns["final"] != "remote-dns" || dns["strategy"] != "prefer_ipv4" {
+		t.Fatalf("unexpected dns block: %+v", dns)
+	}
+	servers := dns["servers"].([]any)
+	if len(servers) != 2 {
+		t.Fatalf("expected a remote and a direct resolver: %+v", servers)
+	}
+	remote := servers[0].(map[string]any)
+	if remote["tag"] != "remote-dns" || remote["detour"] != "n1" || remote["domain_resolver"] != "direct-dns" {
+		t.Fatalf("unexpected remote resolver: %+v", remote)
+	}
+	direct := servers[1].(map[string]any)
+	if direct["tag"] != "direct-dns" || direct["type"] != "udp" || direct["server"] != "223.5.5.5" {
+		t.Fatalf("unexpected direct resolver: %+v", direct)
+	}
+	if rules := dns["rules"].([]any); len(rules) == 0 {
+		t.Fatal("dns rules must route domestic domains to the direct resolver")
+	}
+	route := c["route"].(map[string]any)
+	if route["default_domain_resolver"] != "remote-dns" {
+		t.Fatalf("default_domain_resolver=%v", route["default_domain_resolver"])
+	}
+	tags := map[string]bool{}
+	for _, raw := range route["rule_set"].([]any) {
+		tags[raw.(map[string]any)["tag"].(string)] = true
+	}
+	if !tags["geosite-cn"] {
+		t.Fatalf("geosite-cn must be declared for the dns rules: %+v", route["rule_set"])
+	}
+	resolvers := map[string]string{}
+	for _, raw := range c["outbounds"].([]any) {
+		outbound := raw.(map[string]any)
+		if tag, isString := outbound["tag"].(string); isString {
+			resolvers[tag], _ = outbound["domain_resolver"].(string)
+		}
+	}
+	if resolvers["direct"] != "direct-dns" {
+		t.Fatalf("direct resolver=%q", resolvers["direct"])
+	}
+	if resolvers["n1"] != "remote-dns" {
+		t.Fatalf("proxy resolver=%q", resolvers["n1"])
+	}
+}
+
+func TestForceProxyRulePrecedesCNBypass(t *testing.T) {
+	s := Store{Mode: "bypass_cn", SelectedNode: "n1", ForceProxyDomains: []string{"*.Example.COM", "example.com", "example.com"}, Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}}
+	route := config(s)["route"].(map[string]any)
+	forceIndex, cnIndex, geoIndex := -1, -1, -1
+	for i, raw := range route["rules"].([]any) {
+		rule := raw.(map[string]any)
+		if suffixes, isList := rule["domain_suffix"].([]string); isList {
+			found := map[string]int{}
+			for _, suffix := range suffixes {
+				found[suffix]++
+			}
+			if found["www.gstatic.com"] > 0 && found["googleapis.com"] > 0 {
+				forceIndex = i
+				if rule["outbound"] != "n1" {
+					t.Fatalf("force proxy rule outbound=%v", rule["outbound"])
+				}
+				if found["example.com"] != 1 {
+					t.Fatalf("user domains must be lowercased and de-duplicated: %v", suffixes)
+				}
+			}
+		}
+		if ruleSets, isList := rule["rule_set"].([]string); isList && len(ruleSets) == 1 {
+			switch ruleSets[0] {
+			case "geosite-cn":
+				cnIndex = i
+			case "geoip-cn":
+				geoIndex = i
+			}
+		}
+	}
+	if forceIndex < 0 || cnIndex < 0 || geoIndex < 0 {
+		t.Fatalf("missing rules: force=%d cn=%d geo=%d (%+v)", forceIndex, cnIndex, geoIndex, route["rules"])
+	}
+	if forceIndex > cnIndex || cnIndex > geoIndex {
+		t.Fatalf("rules must be ordered force-proxy, geosite-cn, geoip-cn: %d %d %d", forceIndex, cnIndex, geoIndex)
+	}
+}
+
+func TestNaiveTCPOutboundBlocksUDP(t *testing.T) {
+	s := Store{Mode: "global", SelectedNode: "n1", Nodes: []Node{
+		{ID: "n1", Name: "naive", Type: "naive", Server: "naive.example", Port: 443, Username: "user", Password: "secret", Enabled: true},
+		{ID: "n2", Name: "hy2", Type: "hysteria2", Server: "hy2.example", Port: 8443, Password: "secret", TLS: true, Enabled: true},
+	}}
+	udpRule := func(s Store) (string, bool) {
+		route := config(s)["route"].(map[string]any)
+		rules := route["rules"].([]any)
+		udpIndex, geoIndex := -1, -1
+		for i, raw := range rules {
+			rule := raw.(map[string]any)
+			if rule["network"] == "udp" {
+				udpIndex = i
+			}
+			if ruleSets, isList := rule["rule_set"].([]string); isList && len(ruleSets) == 1 && ruleSets[0] == "geoip-cn" {
+				geoIndex = i
+			}
+		}
+		if udpIndex < 0 {
+			return "", false
+		}
+		if geoIndex >= 0 && udpIndex < geoIndex {
+			t.Fatalf("the UDP rule must follow the China rules so domestic UDP stays direct: udp=%d geoip=%d", udpIndex, geoIndex)
+		}
+		return rules[udpIndex].(map[string]any)["outbound"].(string), true
+	}
+	if target, found := udpRule(s); !found || target != "block" {
+		t.Fatalf("UDP through a naive node must be blocked, got %q (found=%v)", target, found)
+	}
+	s.UDPOutbound = "n2"
+	if target, found := udpRule(s); !found || target != "n2" {
+		t.Fatalf("an explicit UDP outbound must be kept, got %q (found=%v)", target, found)
+	}
+	s.UDPOutbound = ""
+	s.Mode = "bypass_cn"
+	if target, found := udpRule(s); !found || target != "block" {
+		t.Fatalf("bypass_cn must block naive UDP, got %q (found=%v)", target, found)
+	}
+	s.Mode = "gfw"
+	if target, found := udpRule(s); found {
+		t.Fatalf("gfw must not inject a UDP block rule, got %q", target)
 	}
 }

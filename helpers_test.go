@@ -12,7 +12,7 @@ import (
 func setupAPITest(t *testing.T, initial Store) {
 	t.Helper()
 	oldDB, oldData, oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir, oldRuleDataDir := dbPath, dataPath, configPath, macACLPath, naiveConfigDir, logDir, ruleDataDir
-	oldRestart, oldFetch, oldReload, oldProxyRunning, oldProxyPort, oldTProxyPort, oldTProxyEnabled := restartProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, getProxyPort(), tproxyPort, tproxyEnabled
+	oldRestart, oldReloadProxy, oldFetch, oldReload, oldProxyRunning, oldProxyPort, oldTProxyPort, oldTProxyEnabled := restartProxyFn, reloadProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, getProxyPort(), tproxyPort, tproxyEnabled
 	oldGatewayPath, oldGatewayStatePath := gatewayPath, gatewayStatePath
 	oldBackupDir, oldCoreUploadDir, oldUpdateCorePath := backupDir, coreUploadDir, updateCorePath
 	dir := t.TempDir()
@@ -29,10 +29,11 @@ func setupAPITest(t *testing.T, initial Store) {
 	gatewayStatePath = filepath.Join(dir, "gateway.state")
 	setProxyPort(11080)
 	restartProxyFn = func() error { return nil }
+	reloadProxyFn = func(bool, bool) error { return nil }
 	proxyRunningFn = func() bool { return true }
 	t.Cleanup(func() {
 		dbPath, dataPath, configPath, macACLPath, naiveConfigDir, logDir, ruleDataDir = oldDB, oldData, oldConfig, oldMACACL, oldNaiveConfigDir, oldLogDir, oldRuleDataDir
-		restartProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, tproxyPort, tproxyEnabled = oldRestart, oldFetch, oldReload, oldProxyRunning, oldTProxyPort, oldTProxyEnabled
+		restartProxyFn, reloadProxyFn, fetchSubscriptionFn, reloadGatewayFn, proxyRunningFn, tproxyPort, tproxyEnabled = oldRestart, oldReloadProxy, oldFetch, oldReload, oldProxyRunning, oldTProxyPort, oldTProxyEnabled
 		setProxyPort(oldProxyPort)
 		gatewayPath, gatewayStatePath = oldGatewayPath, oldGatewayStatePath
 		backupDir, coreUploadDir, updateCorePath = oldBackupDir, oldCoreUploadDir, oldUpdateCorePath

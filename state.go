@@ -249,13 +249,20 @@ func persistStoreWithRuleChange(next Store, reload, rulesChanged bool) error {
 		setProxyPort(previousProxyPort)
 		return err
 	}
-	prevJSON, _ := json.Marshal(config(previous))
-	nextJSON, _ := json.Marshal(config(next))
+	prevSingBox, prevNaive := configFingerprint(previous), naiveConfigFingerprint(previous)
+	nextSingBox, nextNaive := configFingerprint(next), naiveConfigFingerprint(next)
 	prevMAC, _ := macACLData(previous)
 	nextMAC, _ := macACLData(next)
 	prevRules := ruleSettingsFingerprint(previous.RuleSettings)
 	nextRules := ruleSettingsFingerprint(next.RuleSettings)
-	configChanged := rulesChanged || !bytes.Equal(prevJSON, nextJSON) || !bytes.Equal(prevMAC, nextMAC) || !bytes.Equal(prevRules, nextRules) || previousProxyPort != getProxyPort()
+	// The sing-box configuration is compared in canonical form so that
+	// reordering nodes in the UI does not force a restart. The naive
+	// configuration is compared separately: sing-box references the local naive
+	// bridges by port only, so a naive node's credentials can change without
+	// invalidating the sing-box configuration, and vice versa.
+	singBoxChanged := rulesChanged || !bytes.Equal(prevSingBox, nextSingBox) || !bytes.Equal(prevMAC, nextMAC) || !bytes.Equal(prevRules, nextRules) || previousProxyPort != getProxyPort()
+	naiveChanged := !bytes.Equal(prevNaive, nextNaive)
+	configChanged := singBoxChanged || naiveChanged
 
 	if err := writeConfig(next); err != nil {
 		setProxyPort(previousProxyPort)
@@ -269,7 +276,7 @@ func persistStoreWithRuleChange(next Store, reload, rulesChanged bool) error {
 		return err
 	}
 	if wasRunning && reload && configChanged {
-		if err := restartProxyFn(); err != nil {
+		if err := reloadProxyFn(singBoxChanged, naiveChanged); err != nil {
 			setProxyPort(previousProxyPort)
 			var rErrs []string
 			if rErr := save(previous); rErr != nil {
@@ -278,7 +285,7 @@ func persistStoreWithRuleChange(next Store, reload, rulesChanged bool) error {
 			if rErr := writeConfig(previous); rErr != nil {
 				rErrs = append(rErrs, "restore config: "+rErr.Error())
 			}
-			if rErr := restartProxyFn(); rErr != nil {
+			if rErr := reloadProxyFn(singBoxChanged, naiveChanged); rErr != nil {
 				rErrs = append(rErrs, "restart proxy: "+rErr.Error())
 			}
 			if len(rErrs) > 0 {
@@ -295,7 +302,7 @@ func persistStoreWithRuleChange(next Store, reload, rulesChanged bool) error {
 			if rErr := writeConfig(previous); rErr != nil {
 				rErrs = append(rErrs, "restore config: "+rErr.Error())
 			}
-			if rErr := restartProxyFn(); rErr != nil {
+			if rErr := reloadProxyFn(singBoxChanged, naiveChanged); rErr != nil {
 				rErrs = append(rErrs, "restart proxy: "+rErr.Error())
 			}
 			if rErr := reloadGatewayFn(); rErr != nil {

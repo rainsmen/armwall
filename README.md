@@ -6,7 +6,9 @@ ArmWall 是面向 Armbian/Debian 设备的局域网代理网关。它使用 sing
 
 - 手动节点、分享链接和 HTTPS 订阅导入，支持 VLESS、VMess、Trojan、Shadowsocks、Hysteria2、AnyTLS 与 NaiveProxy。
 - 自动 Transport 协议归一化（规范化 `http`、`ws`、`quic`、`grpc`、`httpupgrade`，自动剔除机场订阅中不合规的 `tcp`/`none` 并映射 `h2` 为 `http`）。
-- 绕过国内、GFW 规则和全局代理模式，TCP/UDP 可分别选择节点或策略组。
+- 绕过国内、GFW 规则和全局代理模式，TCP/UDP 可分别选择节点或策略组；可维护「额外强制代理域名」，在分流前强制走代理，内置 Google Play / Google APIs 下载域名（`googleapis.com`、`gvt1.com`、`www.gstatic.com` 等）。
+- sing-box 的 DNS 块始终生成：DNS 模块关闭时仍使用经代理的远程 DNS 与国内 DNS，并按国内域名分流，不再退化到主机的 `systemd-resolved`；每个出站带独立的 `domain_resolver`。
+- 当 UDP 出站是不支持 UDP 中继的 naive 节点时，UDP 自动改为 `block`，让 QUIC 快速失败并回落 TCP，而不是等待黑洞超时。
 - Selector、URLTest 策略组，显示实际运行成员与最近延迟。
 - 并发批量 Ping、TCP、URLTest 节点测速，支持按延迟升降序实时排序与动态分级标签。
 - sing-box 1.14+ 协议嗅探（`action: sniff`）、DNS 劫持、FakeIP、GeoSite/GeoIP 规则与广告阻止规则；规则支持逐项备用地址、自动更新间隔、内容哈希免写与广告拦截开关。
@@ -14,6 +16,8 @@ ArmWall 是面向 Armbian/Debian 设备的局域网代理网关。它使用 sing
 - 按源 IP/CIDR、MAC、协议和目标端口设置 ACL。MAC ACL 由 nftables 分流到独立 TProxy 入口。
 - sing-box、NaiveProxy 在线更新和手动上传，严格 ELF 架构检测、SHA256 校验和原子回滚。
 - SQLite WAL 事务持久化，单调递增 `Revision` 版本代次追踪与 RFC3339Nano 纳秒时间戳，杜绝并发竞争覆盖。
+- 一键连通性诊断（「系统管理」页）：实测代理端口、域名模式与 IP 模式（含 SNI）探测、UDP ASSOCIATE 往返、主机解析器，并汇总规则、出站、UDP 中继能力与最近日志中的连接/错误统计。
+- 重启按需触发：仅当 sing-box 配置变化时才重启 sing-box，仅当 NaiveProxy 配置变化时才重启 naive，节点排序等不影响生效配置的改动不再中断连接。
 - 配置导入导出、服务端备份与恢复、敏感凭据脱敏保护与严格 CSP 防护。
 
 ## 项目架构与深度文档

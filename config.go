@@ -1,13 +1,17 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"hash"
+	"log"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -189,8 +193,183 @@ func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// defaultForceProxyDomainSuffixes covers the Google Play / Google APIs
+// download and check-in hosts. Several of them (www.gstatic.com,
+// android.clients.google.com) are listed in geosite-cn, so without this
+// override a domain-based China bypass would dial them directly and black-hole
+// Google Play downloads on a censored uplink.
+var defaultForceProxyDomainSuffixes = []string{
+	"googleapis.com",
+	"clients.google.com",
+	"gvt1.com",
+	"gvt2.com",
+	"dl.google.com",
+	"www.gstatic.com",
+	"redirector.gvt1.com",
+	"redirector.c.play.google.com",
+}
+
+func forceProxyDomainSuffixes(s Store) []string {
+	suffixes := make([]string, 0, len(defaultForceProxyDomainSuffixes)+len(s.ForceProxyDomains))
+	seen := make(map[string]bool, cap(suffixes))
+	for _, value := range append(append([]string{}, defaultForceProxyDomainSuffixes...), s.ForceProxyDomains...) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		suffixes = append(suffixes, value)
+	}
+	return suffixes
+}
+
+// udpOutboundCannotRelay reports whether an outbound can never carry UDP
+// datagrams: naive nodes are exposed through a local SOCKS bridge that rejects
+// UDP ASSOCIATE, so QUIC would be black-holed instead of failing fast.
+func udpOutboundCannotRelay(s Store, tag string) bool {
+	if tag == "" || tag == "direct" || tag == "block" {
+		return false
+	}
+	for _, n := range s.Nodes {
+		if n.ID == tag {
+			return n.Enabled && n.Type == "naive"
+		}
+	}
+	for _, group := range s.StrategyGroups {
+		if group.ID != tag {
+			continue
+		}
+		for _, id := range group.NodeIDs {
+			for _, n := range s.Nodes {
+				if n.ID == id && n.Enabled && n.Type != "naive" {
+					return false
+				}
+			}
+		}
+		return len(group.NodeIDs) > 0
+	}
+	return false
+}
+
+// effectiveDNS fills the DNS settings in use when the DNS module is disabled and
+// the store still carries empty values.
+func effectiveDNS(s Store) (remote, direct, sni, strategy string) {
+	remote = strings.TrimSpace(s.DNS.RemoteServer)
+	if remote == "" {
+		remote = "https://1.1.1.1/dns-query"
+	}
+	direct = strings.TrimSpace(s.DNS.DirectServer)
+	if direct == "" {
+		direct = "udp://223.5.5.5"
+	}
+	strategy = s.DNS.Strategy
+	if strategy == "" {
+		strategy = "prefer_ipv4"
+	}
+	return remote, direct, s.DNS.RemoteSNI, strategy
+}
+
+// resolveOutbounds mirrors the outbound selection used by config(): the TCP
+// outbound falls back to the selected (or first enabled) node, and the UDP
+// outbound falls back to the TCP outbound.
+func resolveOutbounds(s Store) (tcpOutbound, udpOutbound string) {
+	proxy := "direct"
+	for _, n := range s.Nodes {
+		if n.Enabled {
+			proxy = n.ID
+			break
+		}
+	}
+	if s.SelectedNode != "" {
+		for _, n := range s.Nodes {
+			if n.ID == s.SelectedNode && n.Enabled {
+				proxy = n.ID
+				break
+			}
+		}
+	}
+	valid := map[string]bool{"direct": true}
+	for _, n := range s.Nodes {
+		if n.Enabled {
+			valid[n.ID] = true
+		}
+	}
+	for _, group := range s.StrategyGroups {
+		if group.ID == "" || group.Name == "" || (group.Type != "selector" && group.Type != "urltest") {
+			continue
+		}
+		for _, id := range group.NodeIDs {
+			if valid[id] {
+				valid[group.ID] = true
+				break
+			}
+		}
+	}
+	choose := func(value, fallback string) string {
+		if value == "" || value == "same" || !valid[value] {
+			return fallback
+		}
+		return value
+	}
+	tcpOutbound = choose(s.TCPOutbound, proxy)
+	return tcpOutbound, choose(s.UDPOutbound, tcpOutbound)
+}
+
+// sortByTag orders a generated list of tagged objects by tag. The generated
+// configuration is order-insensitive for outbounds (selector defaults and the
+// fallback node are already resolved into tag values) and for rule sets, so
+// canonical order keeps pure reordering from counting as a change.
+func sortByTag(value any) {
+	list, ok := value.([]any)
+	if !ok {
+		return
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		return taggedName(list[i]) < taggedName(list[j])
+	})
+}
+
+func taggedName(value any) string {
+	if item, ok := value.(map[string]any); ok {
+		if tag, ok := item["tag"].(string); ok {
+			return tag
+		}
+	}
+	return ""
+}
+
+func digester() hash.Hash { return sha256.New() }
+
+// configFingerprint hashes the generated sing-box configuration in canonical
+// form; it decides whether sing-box has to be restarted.
+func configFingerprint(s Store) []byte {
+	c := config(s)
+	if route, ok := c["route"].(map[string]any); ok {
+		sortByTag(route["rule_set"])
+	}
+	sortByTag(c["outbounds"])
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil
+	}
+	sum := sha256.Sum256(data)
+	return sum[:]
+}
+
+// naiveConfigFingerprint hashes the NaiveProxy client configurations, which are
+// separate files that sing-box never reads.
+func naiveConfigFingerprint(s Store) []byte {
+	bindings := naiveBindings(s)
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Node.ID < bindings[j].Node.ID })
+	hash := digester()
+	for _, binding := range bindings {
+		fmt.Fprintf(hash, "%s\n%s\n", binding.Node.ID, binding.Config)
+	}
+	return hash.Sum(nil)
+}
+
 func config(s Store) map[string]any {
-	outs := []any{map[string]any{"type": "direct", "tag": "direct"}, map[string]any{"type": "block", "tag": "block"}}
+	outs := []any{map[string]any{"type": "direct", "tag": "direct", "domain_resolver": "direct-dns"}, map[string]any{"type": "block", "tag": "block"}}
 	naivePorts := map[string]int{}
 	for _, binding := range naiveBindings(s) {
 		naivePorts[binding.Node.ID] = binding.Port
@@ -202,10 +381,10 @@ func config(s Store) map[string]any {
 		}
 		nodeTags[n.ID] = true
 		if n.Type == "naive" {
-			outs = append(outs, map[string]any{"type": "socks", "tag": n.ID, "server": "127.0.0.1", "server_port": naivePorts[n.ID]})
+			outs = append(outs, map[string]any{"type": "socks", "tag": n.ID, "server": "127.0.0.1", "server_port": naivePorts[n.ID], "domain_resolver": "remote-dns"})
 			continue
 		}
-		o := map[string]any{"type": n.Type, "tag": n.ID, "server": n.Server, "server_port": n.Port}
+		o := map[string]any{"type": n.Type, "tag": n.ID, "server": n.Server, "server_port": n.Port, "domain_resolver": "remote-dns"}
 		if n.UUID != "" {
 			o["uuid"] = n.UUID
 		}
@@ -291,7 +470,6 @@ func config(s Store) map[string]any {
 		}
 		outs = append(outs, o)
 	}
-	strategyTags := map[string]bool{}
 	for _, group := range s.StrategyGroups {
 		if group.ID == "" || group.Name == "" {
 			continue
@@ -330,38 +508,9 @@ func config(s Store) map[string]any {
 			o["tolerance"] = group.ToleranceMS
 		}
 		outs = append(outs, o)
-		strategyTags[group.ID] = true
 	}
-	proxy := "direct"
-	for _, n := range s.Nodes {
-		if n.Enabled {
-			proxy = n.ID
-			break
-		}
-	}
-	if s.SelectedNode != "" {
-		for _, n := range s.Nodes {
-			if n.ID == s.SelectedNode && n.Enabled {
-				proxy = n.ID
-				break
-			}
-		}
-	}
-	validOutbound := map[string]bool{"direct": true}
-	for tag := range nodeTags {
-		validOutbound[tag] = true
-	}
-	for tag := range strategyTags {
-		validOutbound[tag] = true
-	}
-	chooseOutbound := func(value, fallback string) string {
-		if value == "" || value == "same" || !validOutbound[value] {
-			return fallback
-		}
-		return value
-	}
-	tcpOutbound := chooseOutbound(s.TCPOutbound, proxy)
-	udpOutbound := chooseOutbound(s.UDPOutbound, tcpOutbound)
+	tcpOutbound, udpOutbound := resolveOutbounds(s)
+	proxy := tcpOutbound
 	rules := []any{}
 	if s.DNS.Enabled {
 		rules = append(rules, map[string]any{"inbound": []string{"dns-in"}, "action": "hijack-dns"})
@@ -398,34 +547,64 @@ func config(s Store) map[string]any {
 	}
 	rules = append(rules, map[string]any{"ip_is_private": true, "outbound": "direct"})
 	ruleSets := []any{}
+	ruleSetTags := map[string]bool{}
+	addRuleSet := func(tag string) {
+		if ruleSetTags[tag] {
+			return
+		}
+		ruleSetTags[tag] = true
+		ruleSets = append(ruleSets, ruleSet(tag))
+	}
 	if boolValue(s.AdBlockEnabled, true) {
 		rules = append(rules, map[string]any{"rule_set": []string{"geosite-ads"}, "outbound": "block"})
-		ruleSets = append(ruleSets, ruleSet("geosite-ads"))
+		addRuleSet("geosite-ads")
+	}
+	// Forced-proxy domains are matched against the sniffed SNI and therefore
+	// must be evaluated before the China-direct rules.
+	if suffixes := forceProxyDomainSuffixes(s); len(suffixes) > 0 {
+		rules = append(rules, map[string]any{"domain_suffix": suffixes, "outbound": tcpOutbound})
+	}
+	// naive nodes cannot relay UDP, so their UDP is blocked instead of being
+	// left to time out. The China-direct rules come first, so domestic UDP is
+	// unaffected.
+	udpTarget := udpOutbound
+	if s.Mode != "gfw" && udpOutboundCannotRelay(s, udpOutbound) {
+		udpTarget = "block"
 	}
 	final := proxy
 	switch s.Mode {
 	case "bypass_cn":
-		rules = append(rules, map[string]any{"rule_set": []string{"geosite-cn", "geoip-cn"}, "outbound": "direct"})
-		if udpOutbound != tcpOutbound {
-			rules = append(rules, map[string]any{"network": "udp", "outbound": udpOutbound})
+		// Domain rules are evaluated separately from the IP-based China rule so
+		// that a sniffed foreign domain is never pulled back to direct by a
+		// polluted Chinese IP address in geoip-cn. The UDP rule must stay after
+		// both China rules, otherwise domestic UDP would be caught by it: most
+		// upstream gateways hand over bare IP destinations, which only the
+		// IP-based rule can match.
+		rules = append(rules, map[string]any{"rule_set": []string{"geosite-cn"}, "outbound": "direct"})
+		addRuleSet("geosite-cn")
+		rules = append(rules, map[string]any{"rule_set": []string{"geoip-cn"}, "outbound": "direct"})
+		addRuleSet("geoip-cn")
+		if udpTarget != tcpOutbound {
+			rules = append(rules, map[string]any{"network": "udp", "outbound": udpTarget})
 		}
-		ruleSets = append(ruleSets, ruleSet("geosite-cn"), ruleSet("geoip-cn"))
 	case "gfw":
 		if udpOutbound != tcpOutbound {
 			rules = append(rules, map[string]any{"rule_set": []string{"geosite-proxy"}, "network": "udp", "outbound": udpOutbound}, map[string]any{"rule_set": []string{"geosite-proxy"}, "network": "tcp", "outbound": tcpOutbound})
 		} else {
 			rules = append(rules, map[string]any{"rule_set": []string{"geosite-proxy"}, "outbound": tcpOutbound})
 		}
-		ruleSets = append(ruleSets, ruleSet("geosite-proxy"))
+		addRuleSet("geosite-proxy")
 		final = "direct"
 	default:
-		if udpOutbound != tcpOutbound {
-			rules = append(rules, map[string]any{"network": "udp", "outbound": udpOutbound})
+		if udpTarget != tcpOutbound {
+			rules = append(rules, map[string]any{"network": "udp", "outbound": udpTarget})
 		}
 	}
 	if s.Mode != "gfw" {
 		final = tcpOutbound
 	}
+	// The DNS rules reference this rule set in every mode.
+	addRuleSet("geosite-cn")
 	listenPort := getProxyPort()
 	if s.ProxyPort > 0 {
 		listenPort = s.ProxyPort
@@ -453,32 +632,38 @@ func config(s Store) map[string]any {
 		clashAPI["secret"] = secret
 	}
 	result := map[string]any{"log": map[string]any{"level": level, "output": filepath.Join(logDir, "sing-box.log"), "timestamp": true}, "inbounds": inbounds, "outbounds": outs, "route": map[string]any{"auto_detect_interface": true, "rules": rules, "rule_set": ruleSets, "final": final}, "experimental": map[string]any{"clash_api": clashAPI}}
-	if s.DNS.Enabled {
-		remoteDetour := tcpOutbound
-		if remoteDetour == "direct" {
-			remoteDetour = ""
-		}
-		dnsServers := []any{dnsServerConfig("remote-dns", s.DNS.RemoteServer, s.DNS.RemoteSNI, remoteDetour), dnsServerConfig("direct-dns", s.DNS.DirectServer, "", "")}
-		dns := map[string]any{"servers": dnsServers, "rules": []any{map[string]any{"rule_set": []string{"geosite-cn"}, "action": "route", "server": "direct-dns"}}, "final": "remote-dns", "strategy": s.DNS.Strategy, "independent_cache": true}
-		if s.DNS.FakeIP {
-			dnsServers = append(dnsServers, map[string]any{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"})
-			dns["servers"] = dnsServers
-			dns["rules"] = append(dns["rules"].([]any), map[string]any{"query_type": []string{"A", "AAAA"}, "action": "route", "server": "fakeip"})
-			dns["reverse_mapping"] = true
-		}
-		result["dns"] = dns
-		route := result["route"].(map[string]any)
-		route["default_domain_resolver"] = "direct-dns"
-		if s.Mode != "bypass_cn" {
-			route["rule_set"] = append(route["rule_set"].([]any), ruleSet("geosite-cn"))
-		}
+	// The DNS block is generated even when the DNS module is disabled: without
+	// it sing-box falls back to the host resolver (systemd-resolved) for every
+	// domain it has to resolve itself, which is unreliable behind a censored
+	// uplink and was responsible for hangs of several seconds.
+	remoteServer, directServer, remoteSNI, dnsStrategy := effectiveDNS(s)
+	remoteDetour := tcpOutbound
+	if remoteDetour == "direct" {
+		remoteDetour = ""
 	}
+	remoteDNS := dnsServerConfig("remote-dns", remoteServer, remoteSNI, remoteDetour)
+	remoteDNS["domain_resolver"] = "direct-dns"
+	dnsServers := []any{remoteDNS, dnsServerConfig("direct-dns", directServer, "", "")}
+	dns := map[string]any{"servers": dnsServers, "rules": []any{map[string]any{"rule_set": []string{"geosite-cn"}, "action": "route", "server": "direct-dns"}}, "final": "remote-dns", "strategy": dnsStrategy}
+	if s.DNS.Enabled && s.DNS.FakeIP {
+		dnsServers = append(dnsServers, map[string]any{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"})
+		dns["servers"] = dnsServers
+		dns["rules"] = append(dns["rules"].([]any), map[string]any{"query_type": []string{"A", "AAAA"}, "action": "route", "server": "fakeip"})
+		dns["reverse_mapping"] = true
+	}
+	result["dns"] = dns
+	// Domains resolved by sing-box itself go through the remote resolver; the
+	// direct outbound overrides this with the domestic resolver.
+	result["route"].(map[string]any)["default_domain_resolver"] = "remote-dns"
 	return result
 }
 
 func writeConfig(s Store) error {
 	if err := validateRuntimePorts(s); err != nil {
 		return err
+	}
+	if _, udpOutbound := resolveOutbounds(s); s.Mode != "gfw" && udpOutboundCannotRelay(s, udpOutbound) {
+		log.Printf("warning: UDP outbound %q is a naive node and cannot relay UDP; UDP is blocked so clients fall back to TCP", udpOutbound)
 	}
 	if err := validateDNSSettings(&s.DNS); err != nil {
 		return err

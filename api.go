@@ -18,6 +18,7 @@ var unlockedAPIRoutes = map[string]func(http.ResponseWriter, *http.Request){
 	"/api/service/status":          apiServiceStatus,
 	"/api/logs":                    apiLogs,
 	"/api/network/test":            apiNetworkTest,
+	"/api/diagnostics":             apiDiagnostics,
 	"/api/gateway/status":          apiGatewayStatus,
 	"/api/node/test":               apiNodeTest,
 	"/api/node/batch-test":         apiNodeBatchTest,

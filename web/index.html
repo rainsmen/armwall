@@ -471,6 +471,19 @@
                 请求</label
               >
             </div>
+            <div class="form-grid">
+              <label class="span-2"
+                >额外强制代理域名<textarea
+                  id="forceProxyDomains"
+                  rows="4"
+                  placeholder="example.com&#10;sub.example.org"
+                ></textarea></label
+              >
+            </div>
+            <p class="hint">
+              每行一个域名，匹配自身及其子域名；内置的 Google Play / Google APIs
+              下载域名始终强制代理，无需填写。
+            </p>
             <div class="section-head">
               <div>
                 <h2>策略组</h2>
@@ -729,6 +742,19 @@
               </table>
             </div>
             <div id="backupEmpty" class="empty" hidden>暂无配置备份</div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <div><h2>连通性诊断</h2></div>
+              <button class="btn primary" data-action="run-diagnostics">
+                开始诊断
+              </button>
+            </div>
+            <p class="hint">
+              说明：诊断会实际通过代理发起探测，最长约 15 秒；连接统计需要日志级别为
+              info。
+            </p>
+            <div id="diagnosticsResult"></div>
           </article>
         </section>
 

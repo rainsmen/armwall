@@ -229,3 +229,143 @@ async function uploadCore(file) {
   $("coreVersion").textContent = output.trim() || "更新完成";
   toast(`${selectedCore} 已更新`);
 }
+
+async function runDiagnostics(button) {
+  const result = $("diagnosticsResult");
+  const old = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "诊断中...";
+  }
+  result.innerHTML = '<div class="empty">正在诊断，最长约 15 秒...</div>';
+  try {
+    const data = await request("/api/diagnostics", {
+      method: "GET",
+      timeoutMs: 30000,
+    });
+    result.innerHTML = renderDiagnostics(data);
+  } catch (error) {
+    result.innerHTML = "";
+    toast(error.message, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = old;
+    }
+  }
+}
+
+function renderDiagnostics(data) {
+  const info = data || {};
+  const checks = Array.isArray(info.checks) ? info.checks : [];
+  const passed = checks.filter((check) => check && check.ok).length;
+  const summary = info.summary || {};
+  const ok = summary.ok != null ? summary.ok : passed;
+  const failed =
+    summary.failed != null ? summary.failed : checks.length - passed;
+  const verdict =
+    summary.verdict ||
+    (failed > 0 ? `存在 ${failed} 项需要关注` : "所有检查均已通过");
+
+  const log = info.log || {};
+  const conn = log.connections || {};
+  const total = Number(conn.total) || 0;
+  const logEmpty = !info.log || total === 0;
+  const logNote = "日志级别可能高于 info，统计为空";
+  const connCounts = [
+    `total ${conn.total == null ? "—" : conn.total}`,
+    `ipv4 ${conn.ipv4 == null ? "—" : conn.ipv4}`,
+    `ipv6 ${conn.ipv6 == null ? "—" : conn.ipv6}`,
+    `domain ${conn.domain == null ? "—" : conn.domain}`,
+  ].join(" · ");
+
+  const outbound = info.outbound || {};
+  const outboundParts = [
+    `TCP ${outbound.tcp == null ? "—" : outbound.tcp}`,
+    `UDP ${outbound.udp == null ? "—" : outbound.udp}`,
+  ];
+  if (outbound.udp_relay) outboundParts.push("UDP 中继");
+  if (outbound.udp_blocked) outboundParts.push("UDP 已阻断");
+
+  const dns = info.dns || {};
+  const dnsParts = [dns.enabled === false ? "已停用" : "已启用"];
+  if (dns.remote) dnsParts.push(`远程 ${dns.remote}`);
+  if (dns.direct) dnsParts.push(`直连 ${dns.direct}`);
+  if (dns.strategy) dnsParts.push(`策略 ${dns.strategy}`);
+  if (dns.default_domain_resolver)
+    dnsParts.push(`解析器 ${dns.default_domain_resolver}`);
+
+  const rules = info.rules || {};
+  const ruleParts = [];
+  if (rules.force_proxy_suffixes != null)
+    ruleParts.push(`${rules.force_proxy_suffixes} 条后缀规则`);
+  if (rules.china_direct != null)
+    ruleParts.push(rules.china_direct ? "国内直连已启用" : "国内直连已停用");
+
+  const metaRows = [
+    ["连接统计", logEmpty ? logNote : connCounts],
+    ["UDP 会话", logEmpty ? logNote : String(log.udp_sessions ?? "—")],
+    ["日志错误", logEmpty ? logNote : String(log.error_count ?? "—")],
+    ["运行模式", info.mode == null ? "—" : info.mode],
+    ["TCP/UDP 出站", outboundParts.join(" · ")],
+    ["DNS", dnsParts.join(" · ")],
+    ["规则", ruleParts.length ? ruleParts.join(" · ") : "—"],
+  ];
+
+  const generated = [
+    info.generated_at ? `生成于 ${formatDate(info.generated_at)}` : "",
+    info.version ? `版本 ${info.version}` : "",
+    info.proxy_port != null ? `代理端口 ${info.proxy_port}` : "",
+    info.proxy_running == null
+      ? ""
+      : info.proxy_running
+        ? "代理运行中"
+        : "代理未运行",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const checksHTML = checks.length
+    ? checks
+        .map((check) => {
+          const okCheck = Boolean(check && check.ok);
+          return `<li class="diag-check"><span class="pill ${okCheck ? "green" : "red"}">${okCheck ? "✓" : "✗"}</span><strong>${escapeHTML(check && check.name)}</strong><span class="diag-detail">${escapeHTML(check && check.detail)}</span></li>`;
+        })
+        .join("")
+    : '<li class="diag-check"><span class="diag-detail">没有检查结果</span></li>';
+
+  const metaHTML = metaRows
+    .map(
+      ([label, value]) =>
+        `<div class="diag-meta-row"><dt>${escapeHTML(label)}</dt><dd>${escapeHTML(value)}</dd></div>`,
+    )
+    .join("");
+
+  const failures = Array.isArray(log.direct_failures)
+    ? log.direct_failures.slice(0, 5)
+    : [];
+  const failuresHTML = failures.length
+    ? `<ul class="diag-list">${failures
+        .map((item) => {
+          const destination = escapeHTML(item && item.destination);
+          const count =
+            item && item.count != null ? escapeHTML(item.count) : "—";
+          return `<li><strong>${destination}</strong><span class="muted"> × ${count}</span></li>`;
+        })
+        .join("")}</ul>`
+    : '<div class="muted">无记录</div>';
+
+  const errors = Array.isArray(log.recent_errors)
+    ? log.recent_errors.slice(0, 5)
+    : [];
+  const errorsHTML = errors.length
+    ? `<pre class="diag-pre">${escapeHTML(errors.join("\n"))}</pre>`
+    : '<div class="muted">无记录</div>';
+
+  return `<p class="diag-verdict">${escapeHTML(verdict)}（通过 ${escapeHTML(ok)} · 失败 ${escapeHTML(failed)}）</p>
+    ${generated ? `<p class="hint diag-generated">${escapeHTML(generated)}</p>` : ""}
+    <ul class="diag-checks">${checksHTML}</ul>
+    <dl class="diag-meta">${metaHTML}</dl>
+    <div class="diag-block"><h3>直连失败目标</h3>${failuresHTML}</div>
+    <div class="diag-block"><h3>最近错误</h3>${errorsHTML}</div>`;
+}

@@ -166,10 +166,11 @@ func apiRouting(w http.ResponseWriter, r *http.Request, s Store) {
 		return
 	}
 	var v struct {
-		Mode        string
-		TCPOutbound string
-		UDPOutbound string
-		DNS         *DNSSettings
+		Mode              string
+		TCPOutbound       string
+		UDPOutbound       string
+		DNS               *DNSSettings
+		ForceProxyDomains *[]string
 	}
 	if decodeJSONBody(r, &v) != nil || (v.Mode != "bypass_cn" && v.Mode != "gfw" && v.Mode != "global") {
 		http.Error(w, "invalid routing settings", 400)
@@ -192,6 +193,14 @@ func apiRouting(w http.ResponseWriter, r *http.Request, s Store) {
 			return
 		}
 		s.DNS = *v.DNS
+	}
+	if v.ForceProxyDomains != nil {
+		domains := normalizeForceProxyDomains(*v.ForceProxyDomains)
+		if err := validateForceProxyDomains(domains); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		s.ForceProxyDomains = domains
 	}
 	s.Mode = v.Mode
 	s.TCPOutbound = v.TCPOutbound
