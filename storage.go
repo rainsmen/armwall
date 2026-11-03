@@ -161,6 +161,11 @@ func loadDB() (Store, error) {
 				return s, err
 			}
 			s.AdBlockEnabled = &enabled
+		case "force_proxy_domains":
+			if err := json.Unmarshal([]byte(v), &s.ForceProxyDomains); err != nil {
+				rows.Close()
+				return s, err
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -241,8 +246,9 @@ func saveDB(s Store) error {
 	groups, _ := json.Marshal(s.StrategyGroups)
 	aclRules, _ := json.Marshal(s.ACLRules)
 	dnsSettings, _ := json.Marshal(s.DNS)
+	forceProxyDomains, _ := json.Marshal(s.ForceProxyDomains)
 	s.Revision++
-	settings := map[string]string{"revision": strconv.FormatInt(s.Revision, 10), "schema_version": strconv.Itoa(s.SchemaVersion), "mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "rule_settings": string(ruleSettings), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings), "ad_block_enabled": strconv.FormatBool(boolValue(s.AdBlockEnabled, true))}
+	settings := map[string]string{"revision": strconv.FormatInt(s.Revision, 10), "schema_version": strconv.Itoa(s.SchemaVersion), "mode": s.Mode, "proxy_port": strconv.Itoa(s.ProxyPort), "selected_node": s.SelectedNode, "update_hours": strconv.Itoa(s.UpdateHours), "log_level": s.LogLevel, "rule_update_hours": strconv.Itoa(s.RuleUpdateHours), "rule_backups": string(backups), "rule_settings": string(ruleSettings), "strategy_groups": string(groups), "tcp_outbound": s.TCPOutbound, "udp_outbound": s.UDPOutbound, "acl_rules": string(aclRules), "dns": string(dnsSettings), "ad_block_enabled": strconv.FormatBool(boolValue(s.AdBlockEnabled, true)), "force_proxy_domains": string(forceProxyDomains)}
 	for k, v := range settings {
 		if _, err = tx.Exec("INSERT INTO settings(key,value) VALUES(?,?)", k, v); err != nil {
 			return err

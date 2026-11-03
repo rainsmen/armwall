@@ -25,6 +25,7 @@ func migrateLegacy(s Store) Store {
 func normalizeStore(s *Store) {
 	normalizeRuleSettings(s)
 	ensureDefaultBool(&s.AdBlockEnabled, true)
+	s.ForceProxyDomains = normalizeForceProxyDomains(s.ForceProxyDomains)
 	if err := assignNaivePorts(s); err != nil {
 		log.Printf("assignNaivePorts warning: %v", err)
 	}

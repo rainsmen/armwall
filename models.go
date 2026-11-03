@@ -120,4 +120,8 @@ type Store struct {
 	ACLRules         []ACLRule                    `json:"acl_rules"`
 	DNS              DNSSettings                  `json:"dns"`
 	AdBlockEnabled   *bool                        `json:"ad_block_enabled,omitempty"`
+	// ForceProxyDomains lists extra domains (bare names, matched as suffixes)
+	// that must always be proxied before the China-direct rules. Built-in
+	// defaults cover the Google Play / Google APIs download hosts.
+	ForceProxyDomains []string `json:"force_proxy_domains,omitempty"`
 }

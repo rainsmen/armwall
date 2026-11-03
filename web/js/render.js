@@ -225,6 +225,9 @@ function renderRoutingSettings() {
   $("dnsDirect").value = dns.direct_server || "udp://223.5.5.5";
   $("dnsStrategy").value = dns.strategy || "prefer_ipv4";
   $("dnsHijack").checked = dns.enabled ? Boolean(dns.hijack) : true;
+  $("forceProxyDomains").value = (appState.force_proxy_domains || []).join(
+    "\n",
+  );
   updateDNSFields();
   const outboundNames = new Map([
     ["direct", "直连"],

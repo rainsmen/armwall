@@ -186,6 +186,50 @@ func splitPortMatches(values []string) ([]int, []string) {
 	return ports, ranges
 }
 
+const maxForceProxyDomains = 200
+
+// normalizeForceProxyDomains trims, lowercases and de-duplicates domain
+// entries, dropping a leading "*." so that entries are stored as bare suffixes.
+func normalizeForceProxyDomains(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, raw := range values {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		value = strings.TrimPrefix(value, "*.")
+		value = strings.TrimSuffix(value, ".")
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		cleaned = append(cleaned, value)
+	}
+	return cleaned
+}
+
+func validateForceProxyDomains(values []string) error {
+	if len(values) > maxForceProxyDomains {
+		return fmt.Errorf("too many force proxy domains (limit %d)", maxForceProxyDomains)
+	}
+	for _, value := range values {
+		if len(value) > 253 {
+			return fmt.Errorf("force proxy domain is too long: %s", value)
+		}
+		if !strings.Contains(value, ".") {
+			return fmt.Errorf("force proxy domain must be a fully qualified name: %s", value)
+		}
+		if strings.HasPrefix(value, ".") || strings.HasPrefix(value, "-") || strings.HasSuffix(value, "-") || strings.Contains(value, "..") {
+			return fmt.Errorf("invalid force proxy domain: %s", value)
+		}
+		for _, char := range value {
+			valid := char == '.' || char == '-' || char == '_' || char >= 'a' && char <= 'z' || char >= '0' && char <= '9'
+			if !valid {
+				return fmt.Errorf("invalid force proxy domain: %s", value)
+			}
+		}
+	}
+	return nil
+}
+
 func validateACLRule(rule *ACLRule, s Store) error {
 	rule.Name = strings.TrimSpace(rule.Name)
 	rule.Network = strings.ToLower(strings.TrimSpace(rule.Network))

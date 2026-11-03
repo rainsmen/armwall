@@ -44,13 +44,18 @@ func runCoreUpdate(w http.ResponseWriter, args ...string) {
 	_, _ = w.Write(out)
 }
 
-func restartProxy() error {
-	if _, err := exec.LookPath("naive"); err == nil {
-		out, restartErr := runCommandTimeout(10*time.Second, "systemctl", "restart", "armwall-naive.service")
-		if restartErr != nil {
-			return fmt.Errorf("NaiveProxy restart failed: %s", strings.TrimSpace(string(out)))
-		}
+func restartNaive() error {
+	if _, err := exec.LookPath("naive"); err != nil {
+		return nil
 	}
+	out, restartErr := runCommandTimeout(10*time.Second, "systemctl", "restart", "armwall-naive.service")
+	if restartErr != nil {
+		return fmt.Errorf("NaiveProxy restart failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func restartSingBox() error {
 	out, err := runCommandTimeout(10*time.Second, "systemctl", "restart", "armwall-sing-box.service")
 	if err != nil {
 		return fmt.Errorf("sing-box restart failed: %s", strings.TrimSpace(string(out)))
@@ -67,4 +72,39 @@ func restartProxy() error {
 	return fmt.Errorf("sing-box restarted but proxy port %d is not ready", getProxyPort())
 }
 
+// restartProxy restarts both proxy services. It is used when the caller cannot
+// tell which part changed, such as an explicit service start.
+func restartProxy() error {
+	if err := restartNaive(); err != nil {
+		return err
+	}
+	return restartSingBox()
+}
+
+// reloadProxy restarts only the parts whose configuration changed.
+//
+// sing-box reads /etc/armwall/sing-box.json once at start and offers no reload
+// interface, but that configuration only references the local naive bridges by
+// port: changing a naive node's credentials rewrites the naive configuration
+// files alone, while routing, DNS, rule or non-naive node changes leave the
+// naive configuration untouched. Restarting both on every store change dropped
+// every relayed connection for no reason.
+func reloadProxy(singBoxChanged, naiveChanged bool) error {
+	if !singBoxChanged && !naiveChanged {
+		return nil
+	}
+	if naiveChanged {
+		if err := restartNaive(); err != nil {
+			return err
+		}
+	}
+	if !singBoxChanged {
+		// sing-box reconnects to the restarted bridges lazily, per connection.
+		return nil
+	}
+	return restartSingBox()
+}
+
 var restartProxyFn = restartProxy
+
+var reloadProxyFn = reloadProxy

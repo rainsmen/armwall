@@ -2,6 +2,20 @@
 
 All notable changes to ArmWall will be documented in this file.
 
+## [0.6.0] - 2026-11-03
+
+### Added
+- **Connectivity diagnostics** (`GET /api/diagnostics`, 「系统管理」页「连通性诊断」): probes the proxy port, a domain-mode request, an IP-destination request carrying the real SNI (resolved through a DoH query sent over the proxy, so it works even when the host resolver or external UDP 53 is broken), a SOCKS5 UDP ASSOCIATE round trip, and the host resolver; then reports the routing rules in effect (forced-proxy suffixes, China-direct), the effective TCP/UDP outbounds, whether the UDP outbound can relay UDP, and a summary of the recent log tail (connections by IPv4/IPv6/domain, UDP sessions, blocked datagrams, `outbound/direct` failures, last errors).
+- **Forced-proxy domain list** (`force_proxy_domains` in the store, editable on the 「分流与 DNS」 page): domains that are always proxied before the China-direct rules. Built-in defaults cover the Google Play / Google APIs download and check-in hosts (`googleapis.com`, `clients.google.com`, `gvt1.com`, `gvt2.com`, `dl.google.com`, `www.gstatic.com`, `redirector.gvt1.com`, `redirector.c.play.google.com`). Several of these are listed in `geosite-cn`, so a domain-based China bypass used to dial them directly and black-hole Google Play updates on a censored uplink.
+
+### Changed
+- **Restarts are scoped to what actually changed**: naive is restarted only when a NaiveProxy client configuration changed, and sing-box only when the generated sing-box configuration changed (compared in canonical form, so reordering nodes no longer counts). Previously every store change restarted both services and dropped every relayed connection. Diagnostics report the effective outbounds, so a naive node that cannot relay UDP is visible instead of silently black-holing QUIC.
+- **The sing-box `dns` block is always generated**, even when the DNS module (listening `dns-in`) is disabled. It contains a remote resolver (DoH through the TCP outbound) and a domestic resolver, with domestic domains routed to the domestic one. Without it sing-box fell back to the host resolver (`systemd-resolved`) for every domain it had to resolve itself, which hung for seconds behind a censored uplink.
+- `route.default_domain_resolver` now points at the remote resolver instead of the domestic one. Domains that sing-box resolves for a proxy outbound previously went through the domestic resolver. Each outbound now also carries an explicit `domain_resolver` (`direct` → domestic, proxy nodes → remote).
+- **China bypass split into two rules** (`geosite-cn` → direct, then `geoip-cn` → direct) so a sniffed foreign domain is no longer pulled back to direct by an IP match, and a UDP rule may sit between them.
+- UDP is blocked (`{"network": "udp", "outbound": "block"}`) when the effective UDP outbound cannot relay UDP, which is always the case for naive nodes (their local SOCKS bridge rejects UDP ASSOCIATE). Clients fall back to TCP instead of waiting for a black-holed QUIC handshake; the behaviour is logged as a warning.
+- Removed `dns.independent_cache`, deprecated in sing-box 1.14 and removed in 1.16.
+
 ## [0.5.0] - 2026-10-31
 
 ### Changed

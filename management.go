@@ -92,6 +92,10 @@ func validateImportedStore(s *Store) error {
 		return fmt.Errorf("invalid log level")
 	}
 	normalizeRuleSettings(s)
+	s.ForceProxyDomains = normalizeForceProxyDomains(s.ForceProxyDomains)
+	if err := validateForceProxyDomains(s.ForceProxyDomains); err != nil {
+		return err
+	}
 	for tag, setting := range s.RuleSettings {
 		if _, ok := ruleURLs[tag]; !ok {
 			return fmt.Errorf("unknown rule setting: %s", tag)

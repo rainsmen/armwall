@@ -140,7 +140,7 @@ func TestValidateSRSRejectsInvalidMagic(t *testing.T) {
 func TestUnchangedRuleCheckDoesNotRestartProxy(t *testing.T) {
 	setupAPITest(t, Store{Mode: "bypass_cn", ProxyPort: 11080, RuleSettings: map[string]RuleUpdateSetting{}})
 	restarts := 0
-	restartProxyFn = func() error { restarts++; return nil }
+	reloadProxyFn = func(bool, bool) error { restarts++; return nil }
 	oldUpdateRule := updateRuleFn
 	t.Cleanup(func() { updateRuleFn = oldUpdateRule })
 	changed := false
