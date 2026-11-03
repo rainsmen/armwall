@@ -2,6 +2,15 @@
 
 All notable changes to ArmWall will be documented in this file.
 
+## [0.6.1] - 2026-11-03
+
+### Fixed
+- **Forced-proxy domains are now also resolved by the remote resolver.** Several of them (`www.gstatic.com`, `*.googleapis.com`) are listed in `geosite-cn`, and the domestic resolvers of a typical Chinese uplink answer them with nothing at all, so every lookup waited for its own timeout. The forced domain suffixes now precede the China rule in `dns.rules` and are routed to `remote-dns`.
+- **The DNS hijack rule no longer intercepts queries addressed to a well-known public resolver.** The rule now inverts a list of public resolvers (`8.8.8.8`, `1.1.1.1`, `223.5.5.5`, …), so plaintext DNS to some other address is still hijacked for the transparent gateway, while an upstream gateway that sends its own upstream queries through this proxy (an OpenWrt router running passwall with `dns_mode=dns2tcp`, for example) keeps its own resolver. Previously every such query was answered from here, and a name that the domestic resolver could not resolve broke for the whole LAN behind that gateway: `*.gstatic.com` stopped resolving for clients and for ArmWall's own lookups until the hijack was disabled.
+
+### Changed
+- A test assertion on the generated DNS rules is no longer index based, so adding resolver rules does not break it.
+
 ## [0.6.0] - 2026-11-03
 
 ### Added

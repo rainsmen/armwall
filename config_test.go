@@ -298,7 +298,17 @@ func TestConfigACLAndDNS(t *testing.T) {
 		t.Fatalf("missing DNS/MAC inbound: %+v", inbounds)
 	}
 	dnsRules := dns["rules"].([]any)
-	if dns["final"] != "remote-dns" || len(dnsRules) != 2 || dnsRules[1].(map[string]any)["server"] != "fakeip" {
+	fakeipRule, directRule := false, false
+	for _, raw := range dnsRules {
+		rule := raw.(map[string]any)
+		if rule["server"] == "fakeip" {
+			fakeipRule = true
+		}
+		if rule["server"] == "direct-dns" {
+			directRule = true
+		}
+	}
+	if dns["final"] != "remote-dns" || !fakeipRule || !directRule {
 		t.Fatalf("unexpected FakeIP routing: %+v", dns)
 	}
 }
@@ -548,5 +558,72 @@ func TestNaiveTCPOutboundBlocksUDP(t *testing.T) {
 	s.Mode = "gfw"
 	if target, found := udpRule(s); found {
 		t.Fatalf("gfw must not inject a UDP block rule, got %q", target)
+	}
+}
+
+func TestConfigForcedDomainsResolveRemotely(t *testing.T) {
+	s := Store{Mode: "bypass_cn", SelectedNode: "n1", DNS: DNSSettings{Enabled: true, ListenAddress: "192.168.10.1", ListenPort: 53, RemoteServer: "https://1.1.1.1/dns-query", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true}, Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}}
+	dns, ok := config(s)["dns"].(map[string]any)
+	if !ok {
+		t.Fatal("missing dns block")
+	}
+	rules := dns["rules"].([]any)
+	forceIndex, cnIndex := -1, -1
+	for i, raw := range rules {
+		rule := raw.(map[string]any)
+		if suffixes, isList := rule["domain_suffix"].([]string); isList {
+			for _, suffix := range suffixes {
+				if suffix == "www.gstatic.com" {
+					forceIndex = i
+					if rule["server"] != "remote-dns" {
+						t.Fatalf("forced proxy domains must be resolved remotely: %+v", rule)
+					}
+				}
+			}
+		}
+		if ruleSets, isList := rule["rule_set"].([]string); isList && len(ruleSets) == 1 && ruleSets[0] == "geosite-cn" {
+			cnIndex = i
+		}
+	}
+	if forceIndex < 0 || cnIndex < 0 {
+		t.Fatalf("missing dns rules: force=%d cn=%d (%+v)", forceIndex, cnIndex, rules)
+	}
+	if forceIndex > cnIndex {
+		t.Fatalf("forced proxy domains must be resolved remotely before the China rule: force=%d cn=%d", forceIndex, cnIndex)
+	}
+}
+
+func TestConfigDNSHijackSkipsPublicResolvers(t *testing.T) {
+	s := Store{Mode: "global", SelectedNode: "n1", DNS: DNSSettings{Enabled: true, ListenAddress: "192.168.10.1", ListenPort: 53, RemoteServer: "https://1.1.1.1/dns-query", DirectServer: "udp://223.5.5.5", Strategy: "prefer_ipv4", Hijack: true}, Nodes: []Node{{ID: "n1", Name: "one", Type: "anytls", Server: "one.example", Port: 443, Password: "secret", TLS: true, Enabled: true}}}
+	rules := config(s)["route"].(map[string]any)["rules"].([]any)
+	hijackIndex := -1
+	for i, raw := range rules {
+		rule := raw.(map[string]any)
+		if rule["action"] != "hijack-dns" || rule["protocol"] != "dns" {
+			continue
+		}
+		hijackIndex = i
+		if inverted, isBool := rule["invert"].(bool); !isBool || !inverted {
+			t.Fatalf("the protocol hijack rule must invert the public resolver list: %+v", rule)
+		}
+		cidrs, isList := rule["ip_cidr"].([]string)
+		if !isList {
+			t.Fatalf("the protocol hijack rule needs the resolver list: %+v", rule)
+		}
+		found := false
+		for _, cidr := range cidrs {
+			if cidr == "8.8.8.8/32" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("public resolvers must be exempt from hijacking: %+v", cidrs)
+		}
+	}
+	if hijackIndex < 0 {
+		t.Fatalf("missing protocol dns hijack rule: %+v", rules)
+	}
+	if hijackIndex < 2 {
+		t.Fatalf("the dns-in hijack rule must stay first: %d", hijackIndex)
 	}
 }

@@ -315,6 +315,22 @@ func resolveOutbounds(s Store) (tcpOutbound, udpOutbound string) {
 	return tcpOutbound, choose(s.UDPOutbound, tcpOutbound)
 }
 
+// publicResolverCIDRs lists well-known public DNS resolvers. Client queries to
+// these addresses are forwarded instead of being hijacked by the DNS module.
+var publicResolverCIDRs = []string{
+	"8.8.8.8/32", "8.8.4.4/32",
+	"1.1.1.1/32", "1.0.0.1/32",
+	"9.9.9.9/32", "149.112.112.112/32",
+	"208.67.222.222/32", "208.67.220.220/32",
+	"223.5.5.5/32", "223.6.6.6/32",
+	"119.29.29.29/32", "114.114.114.114/32", "180.76.76.76/32",
+	"101.226.4.6/32", "123.125.81.6/32",
+	"2001:4860:4860::8888/128", "2001:4860:4860::8844/128",
+	"2606:4700:4700::1111/128", "2606:4700:4700::1001/128",
+	"2620:fe::fe/128", "2620:fe::9/128",
+	"2400:3200::1/128", "2402:4e00::/128",
+}
+
 // sortByTag orders a generated list of tagged objects by tag. The generated
 // configuration is order-insensitive for outbounds (selector defaults and the
 // fallback node are already resolved into tag values) and for rule sets, so
@@ -517,7 +533,13 @@ func config(s Store) map[string]any {
 	}
 	rules = append(rules, map[string]any{"action": "sniff"})
 	if s.DNS.Enabled && s.DNS.Hijack {
-		rules = append(rules, map[string]any{"protocol": "dns", "action": "hijack-dns"})
+		// Plaintext DNS from clients is hijacked so that they cannot bypass the
+		// configured resolver, but queries addressed to a well-known public
+		// resolver are forwarded. An upstream gateway (an OpenWrt router running
+		// passwall, for instance) sends its own upstream queries through this
+		// proxy, and silently answering them from here replaces its resolver and
+		// changes the answers for every client behind it.
+		rules = append(rules, map[string]any{"protocol": "dns", "ip_cidr": publicResolverCIDRs, "invert": true, "action": "hijack-dns"})
 	}
 	for _, acl := range s.ACLRules {
 		if !acl.Enabled {
@@ -644,7 +666,17 @@ func config(s Store) map[string]any {
 	remoteDNS := dnsServerConfig("remote-dns", remoteServer, remoteSNI, remoteDetour)
 	remoteDNS["domain_resolver"] = "direct-dns"
 	dnsServers := []any{remoteDNS, dnsServerConfig("direct-dns", directServer, "", "")}
-	dns := map[string]any{"servers": dnsServers, "rules": []any{map[string]any{"rule_set": []string{"geosite-cn"}, "action": "route", "server": "direct-dns"}}, "final": "remote-dns", "strategy": dnsStrategy}
+	dnsRules := []any{}
+	if suffixes := forceProxyDomainSuffixes(s); len(suffixes) > 0 {
+		// Domains that are forced through the proxy must also be resolved by the
+		// remote resolver. Several of them are listed in geosite-cn
+		// (www.gstatic.com, *.googleapis.com), and the domestic resolvers of this
+		// uplink return nothing for them, so every lookup waited for its own
+		// timeout instead of being answered.
+		dnsRules = append(dnsRules, map[string]any{"domain_suffix": suffixes, "action": "route", "server": "remote-dns"})
+	}
+	dnsRules = append(dnsRules, map[string]any{"rule_set": []string{"geosite-cn"}, "action": "route", "server": "direct-dns"})
+	dns := map[string]any{"servers": dnsServers, "rules": dnsRules, "final": "remote-dns", "strategy": dnsStrategy}
 	if s.DNS.Enabled && s.DNS.FakeIP {
 		dnsServers = append(dnsServers, map[string]any{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"})
 		dns["servers"] = dnsServers
