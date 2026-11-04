@@ -7,6 +7,21 @@ function pruneNodeTests() {
   }
 }
 
+// selectedNodes keeps checkbox state across re-renders (search, filters,
+// tests); batch actions only apply to selected nodes that are visible (F4).
+const selectedNodes = new Set();
+
+function pruneNodeSelection() {
+  const ids = new Set((appState.nodes || []).map((node) => node.id));
+  for (const id of selectedNodes) {
+    if (!ids.has(id)) selectedNodes.delete(id);
+  }
+}
+
+// pendingStrategySelection keeps a member chosen in a selector dropdown until
+// it is switched, so status polling does not reset it (F2).
+const pendingStrategySelection = new Map();
+
 function renderState() {
   $("nodeMetric").textContent = appState.nodes.length;
   $("modeMetric").textContent = modeName(appState.mode);
@@ -51,6 +66,7 @@ function renderNodeFilters() {
   if (groups.includes(current)) select.value = current;
 }
 
+// filteredNodes returns visible nodes in stored order.
 function filteredNodes() {
   const keyword = $("nodeSearch").value.trim().toLowerCase();
   const group = $("nodeGroupFilter").value;
@@ -67,8 +83,10 @@ function filteredNodes() {
 }
 
 function renderNodes() {
-  const nodes = filteredNodes();
+  const nodes = sortedForDisplay(filteredNodes());
   const subs = subscriptionMap();
+  const sorted = Boolean(nodeSortMode);
+  const moveTitle = sorted ? ' title="按延迟显示时不能调整顺序，请先恢复保存的顺序"' : "";
   $("nodesTable").innerHTML = nodes
     .map((node) => {
       const source = subs.get(node.subscription_id);
@@ -89,20 +107,39 @@ function renderNodes() {
         node.id === appState.selected_node
           ? '<span class="pill green">当前</span>'
           : "";
+      const checked = selectedNodes.has(node.id) ? " checked" : "";
+      const handle = sorted
+        ? `<span class="drag-handle disabled"${moveTitle}>⋮⋮</span>`
+        : '<span class="drag-handle" title="按住拖动调整顺序" aria-hidden="true">⋮⋮</span>';
+      const moveDisabled = sorted ? " disabled" : "";
       return `<tr data-node-id="${escapeHTML(node.id)}">
-      <td><input class="node-check" type="checkbox" value="${escapeHTML(node.id)}" aria-label="选择 ${escapeHTML(node.name || "节点")}"></td>
+      <td class="drag-col">${handle}</td>
+      <td><input class="node-check" type="checkbox" value="${escapeHTML(node.id)}"${checked} aria-label="选择 ${escapeHTML(node.name || "节点")}"></td>
       <td><div class="node-title">${escapeHTML(node.name || "未命名")} ${selected}</div><div class="node-server">${escapeHTML(node.id)}</div></td>
       <td><span class="pill">${escapeHTML(node.type || "-")}</span></td>
       <td><div>${escapeHTML(group)}</div><div class="node-server">${escapeHTML(source?.name || "手动节点")}</div></td>
       <td><div>${escapeHTML(node.server || "-")}</div><div class="node-server">端口 ${escapeHTML(node.port || "-")}</div></td>
       <td><button class="small-btn" data-action="toggle-node" data-id="${escapeHTML(node.id)}">${node.enabled ? "已启用" : "已停用"}</button></td>
       <td class="delay">${delay}</td>
-      <td><div class="row-actions"><button class="small-btn" data-action="test-node" data-method="ping" data-id="${escapeHTML(node.id)}">Ping</button><button class="small-btn" data-action="test-node" data-method="tcp" data-id="${escapeHTML(node.id)}">TCP</button><button class="small-btn" data-action="test-node" data-method="urltest" data-id="${escapeHTML(node.id)}">URLTest</button><button class="small-btn" data-action="edit-node" data-id="${escapeHTML(node.id)}">编辑</button><button class="small-btn" data-action="copy-node" data-id="${escapeHTML(node.id)}">复制</button><button class="small-btn" data-action="move-node" data-direction="-1" data-id="${escapeHTML(node.id)}">上移</button><button class="small-btn" data-action="move-node" data-direction="1" data-id="${escapeHTML(node.id)}">下移</button><button class="small-btn danger" data-action="delete-node" data-id="${escapeHTML(node.id)}">删除</button></div></td>
+      <td><div class="row-actions"><button class="small-btn" data-action="test-node" data-method="ping" data-id="${escapeHTML(node.id)}">Ping</button><button class="small-btn" data-action="test-node" data-method="tcp" data-id="${escapeHTML(node.id)}">TCP</button><button class="small-btn" data-action="test-node" data-method="urltest" data-id="${escapeHTML(node.id)}">URLTest</button><button class="small-btn" data-action="edit-node" data-id="${escapeHTML(node.id)}">编辑</button><button class="small-btn" data-action="copy-node" data-id="${escapeHTML(node.id)}">复制</button><button class="small-btn" data-action="move-node" data-direction="-1" data-id="${escapeHTML(node.id)}"${moveDisabled}${moveTitle}>上移</button><button class="small-btn" data-action="move-node" data-direction="1" data-id="${escapeHTML(node.id)}"${moveDisabled}${moveTitle}>下移</button><button class="small-btn danger" data-action="delete-node" data-id="${escapeHTML(node.id)}">删除</button></div></td>
     </tr>`;
     })
     .join("");
   $("nodeEmpty").hidden = nodes.length > 0;
-  $("selectAllNodes").checked = false;
+  $("nodeSortButton").textContent = {
+    "": "按延迟排序",
+    asc: "延迟：低→高",
+    desc: "延迟：高→低",
+  }[nodeSortMode];
+  syncSelectAll();
+}
+
+function syncSelectAll() {
+  const boxes = [...document.querySelectorAll(".node-check")];
+  const all = $("selectAllNodes");
+  const count = boxes.filter((box) => box.checked).length;
+  all.checked = boxes.length > 0 && count === boxes.length;
+  all.indeterminate = count > 0 && count < boxes.length;
 }
 
 function renderSubscriptions() {
@@ -118,16 +155,22 @@ function renderSubscriptions() {
   $("subscriptionEmpty").hidden = subscriptions.length > 0;
 }
 
-function outboundOptionList(includeSame = false) {
-  const options = [];
-  if (includeSame) options.push(["same", "跟随 TCP"]);
-  else options.push(["", "当前运行节点"]);
-  options.push(["direct", "直连"]);
+// outboundChoices is the single source for outbound labels and options (F11).
+function outboundChoices({ block = false, allNodes = false } = {}) {
+  const options = [["direct", "直连"]];
+  if (block) options.push(["block", "阻止"]);
   for (const group of appState.strategy_groups || [])
     options.push([group.id, `策略：${group.name}`]);
-  for (const node of appState.nodes.filter((item) => item.enabled))
+  for (const node of appState.nodes.filter((item) => allNodes || item.enabled))
     options.push([node.id, `节点：${node.name || "未命名"}`]);
   return options;
+}
+
+function outboundOptionList(includeSame = false) {
+  return [
+    includeSame ? ["same", "跟随 TCP"] : ["", "当前运行节点"],
+    ...outboundChoices(),
+  ];
 }
 
 function fillOutboundSelect(select, options, selected) {
@@ -173,8 +216,11 @@ function renderStrategies() {
             { selector: "Selector", urltest: "URLTest" }[group.type] ||
             group.type;
           const runtime = strategyRuntime.get(group.id);
-          const selected = runtime?.selected || group.selected || "";
-          const currentName = names.get(selected) || selected || "-";
+          const current = runtime?.selected || group.selected || "";
+          const pending = pendingStrategySelection.get(group.id);
+          const selected =
+            pending && (group.node_ids || []).includes(pending) ? pending : current;
+          const currentName = names.get(current) || current || "-";
           const delay =
             Number(runtime?.delay_ms) > 0 ? ` · ${runtime.delay_ms}ms` : "";
           const status = runtime?.available
@@ -194,10 +240,10 @@ function renderStrategies() {
     : '<div class="empty">尚未创建策略组</div>';
 }
 
-async function loadStrategyStatus() {
+async function loadStrategyStatus(background = false) {
   if (!(appState.strategy_groups || []).length) return;
   try {
-    const data = await request("/api/strategy/status");
+    const data = await request("/api/strategy/status", { background });
     strategyRuntime.clear();
     for (const group of data.groups || []) strategyRuntime.set(group.id, group);
     renderStrategies();
@@ -229,14 +275,9 @@ function renderRoutingSettings() {
     "\n",
   );
   updateDNSFields();
-  const outboundNames = new Map([
-    ["direct", "直连"],
-    ["block", "阻止"],
-  ]);
-  for (const group of appState.strategy_groups)
-    outboundNames.set(group.id, `策略：${group.name}`);
-  for (const node of appState.nodes)
-    outboundNames.set(node.id, `节点：${node.name || "未命名"}`);
+  const outboundNames = new Map(
+    outboundChoices({ block: true, allNodes: true }),
+  );
   $("aclManager").innerHTML = appState.acl_rules.length
     ? appState.acl_rules
         .map((rule) => {

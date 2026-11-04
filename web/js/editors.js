@@ -1,9 +1,11 @@
 // ArmWall web UI: node, subscription, strategy and ACL editors.
 
+// selectedNodeIDs returns selected nodes that the current filter shows, so a
+// batch action never touches a node the user cannot see.
 function selectedNodeIDs() {
-  return [...document.querySelectorAll(".node-check:checked")].map(
-    (input) => input.value,
-  );
+  return filteredNodes()
+    .map((node) => node.id)
+    .filter((id) => selectedNodes.has(id));
 }
 
 function nodeByID(id) {
@@ -59,9 +61,14 @@ async function openNodeEditor(node = null) {
     try {
       const real = await request(`/api/node/get?id=${encodeURIComponent(node.id)}`);
       if (real && $("nodeId").value === node.id) {
-        if (real.password) $("nodePassword").value = real.password;
-        if (real.uuid) $("nodeUUID").value = real.uuid;
-        if (real.obfs_password) $("nodeObfsPassword").value = real.obfs_password;
+        // Fill only fields that still show the mask, so a value the user
+        // typed while the request was in flight is kept (F6).
+        const fill = (id, value) => {
+          if (value && $(id).value === "******") $(id).value = value;
+        };
+        fill("nodePassword", real.password);
+        fill("nodeUUID", real.uuid);
+        fill("nodeObfsPassword", real.obfs_password);
       }
     } catch (_) {}
   }
@@ -108,8 +115,11 @@ function nodePayload() {
   };
 }
 
-async function saveNode(event) {
-  event.preventDefault();
+function saveNode(event) {
+  return guardForm(event, () => saveNodeSubmit());
+}
+
+async function saveNodeSubmit() {
   const payload = nodePayload();
   const updating = Boolean(payload.id);
   if (!updating) delete payload.id;
@@ -145,8 +155,11 @@ function closeSubscriptionEditor() {
   $("subscriptionForm").reset();
 }
 
-async function saveSubscription(event) {
-  event.preventDefault();
+function saveSubscription(event) {
+  return guardForm(event, () => saveSubscriptionSubmit());
+}
+
+async function saveSubscriptionSubmit() {
   const id = $("subscriptionId").value;
   const existing = appState.subscriptions.find((sub) => sub.id === id);
   const payload = {
@@ -212,8 +225,11 @@ function closeStrategyEditor() {
   $("strategyForm").reset();
 }
 
-async function saveStrategy(event) {
-  event.preventDefault();
+function saveStrategy(event) {
+  return guardForm(event, () => saveStrategySubmit());
+}
+
+async function saveStrategySubmit() {
   const nodeIDs = [
     ...document.querySelectorAll(".strategy-member:checked"),
   ].map((input) => input.value);
@@ -239,15 +255,7 @@ async function saveStrategy(event) {
 }
 
 function aclOutboundOptions() {
-  const options = [
-    ["direct", "直连"],
-    ["block", "阻止"],
-  ];
-  for (const group of appState.strategy_groups || [])
-    options.push([group.id, `策略：${group.name}`]);
-  for (const node of appState.nodes.filter((item) => item.enabled))
-    options.push([node.id, `节点：${node.name || "未命名"}`]);
-  return options;
+  return outboundChoices({ block: true });
 }
 
 function openACLEditor(rule = null) {
@@ -273,8 +281,11 @@ function closeACLEditor() {
   $("aclForm").reset();
 }
 
-async function saveACL(event) {
-  event.preventDefault();
+function saveACL(event) {
+  return guardForm(event, () => saveACLSubmit());
+}
+
+async function saveACLSubmit() {
   const payload = {
     id: $("aclId").value,
     name: $("aclName").value.trim(),

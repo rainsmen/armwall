@@ -2,7 +2,10 @@
 
 const $ = (id) => document.getElementById(id);
 
-let token = sessionStorage.armwallToken || localStorage.armwallToken || "";
+let token = "";
+try {
+  token = sessionStorage.armwallToken || localStorage.armwallToken || "";
+} catch (_) {}
 let appState = { nodes: [], subscriptions: [] };
 const nodeTests = new Map();
 const strategyRuntime = new Map();
@@ -31,44 +34,75 @@ function toast(message, error = false) {
   toastTimer = setTimeout(() => box.classList.remove("show"), 3200);
 }
 
+// authBlocked is set when the server rejected the token and the user has not
+// supplied a new one. Background polling stops until a user action succeeds,
+// so a stale token neither re-opens the prompt every 15 seconds nor burns the
+// server's authentication failure budget.
+let authBlocked = false;
+let tokenPrompt = null;
+
+class AuthError extends Error {}
+
+function setToken(value) {
+  token = value || "";
+  try {
+    if (token) {
+      sessionStorage.armwallToken = token;
+      localStorage.armwallToken = token;
+    } else {
+      sessionStorage.removeItem("armwallToken");
+      localStorage.removeItem("armwallToken");
+    }
+  } catch (_) {}
+}
+
+function markUnauthorized() {
+  authBlocked = true;
+  $("connectionText").textContent = "未授权";
+  document.querySelector(".top-status").classList.remove("ready");
+}
+
+// promptToken shares one prompt between concurrent requests that hit 401.
+function promptToken() {
+  if (!tokenPrompt) {
+    tokenPrompt = Promise.resolve().then(() => {
+      const value = (window.prompt("请输入 ArmWall 管理 Token") || "").trim();
+      setToken(value);
+      return value;
+    });
+    tokenPrompt.finally(() => {
+      setTimeout(() => {
+        tokenPrompt = null;
+      }, 0);
+    });
+  }
+  return tokenPrompt;
+}
+
+// request sends an authenticated API call. options.background marks polling
+// calls: they never open the token prompt.
 async function request(path, options = {}, text = false, retry = true) {
-  const headers = new Headers(options.headers || {});
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const { background = false, timeoutMs = 30000, ...fetchOptions } = options;
+  const headers = new Headers(fetchOptions.headers || {});
+  const sentToken = token;
+  if (sentToken) headers.set("Authorization", `Bearer ${sentToken}`);
   if (
-    options.body &&
-    typeof options.body !== "string" &&
-    !(options.body instanceof FormData)
+    fetchOptions.body &&
+    typeof fetchOptions.body !== "string" &&
+    !(fetchOptions.body instanceof FormData)
   ) {
     headers.set("Content-Type", "application/json");
-    options.body = JSON.stringify(options.body);
+    fetchOptions.body = JSON.stringify(fetchOptions.body);
   }
   const controller = new AbortController();
-  const timeoutMs = options.timeoutMs || 30000;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
   try {
-    const response = await fetch(path, { ...options, headers, signal: controller.signal });
-    if (response.status === 401 && retry) {
-      token = window.prompt("请输入 ArmWall 管理 Token") || "";
-      if (token) {
-        sessionStorage.armwallToken = token;
-        localStorage.armwallToken = token;
-      } else {
-        sessionStorage.removeItem("armwallToken");
-        localStorage.removeItem("armwallToken");
-      }
-      return request(path, options, text, false);
-    }
-    if (response.status === 429) {
-      throw new Error("请求过于频繁，请稍候再试 (HTTP 429)");
-    }
-    if (!response.ok) {
-      const message =
-        (await response.text()).trim() || `请求失败 (${response.status})`;
-      throw new Error(message);
-    }
-    if (text) return await response.text();
-    const type = response.headers.get("content-type") || "";
-    return type.includes("application/json") ? await response.json() : await response.text();
+    response = await fetch(path, {
+      ...fetchOptions,
+      headers,
+      signal: controller.signal,
+    });
   } catch (err) {
     if (err.name === "AbortError") {
       throw new Error("请求超时，请检查网络或稍后重试");
@@ -77,6 +111,33 @@ async function request(path, options = {}, text = false, retry = true) {
   } finally {
     clearTimeout(timeoutId);
   }
+  if (response.status === 401) {
+    if (background) {
+      markUnauthorized();
+      throw new AuthError("Token 无效，请重新输入");
+    }
+    if (retry) {
+      // Another request may already have obtained a new token.
+      const next = token !== sentToken ? token : await promptToken();
+      if (next) return request(path, options, text, false);
+    }
+    markUnauthorized();
+    throw new AuthError("未授权：Token 无效或未输入");
+  }
+  if (response.status === 429) {
+    throw new Error("请求过于频繁，请稍候再试 (HTTP 429)");
+  }
+  if (!response.ok) {
+    const message =
+      (await response.text()).trim() || `请求失败 (${response.status})`;
+    throw new Error(message);
+  }
+  authBlocked = false;
+  if (text) return await response.text();
+  const type = response.headers.get("content-type") || "";
+  return type.includes("application/json")
+    ? await response.json()
+    : await response.text();
 }
 
 function escapeHTML(value) {
@@ -140,7 +201,27 @@ function downloadText(data, filename, type = "application/json") {
   link.href = url;
   link.download = filename;
   link.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+// guardForm runs submit for a form at most once at a time (F5).
+async function guardForm(event, submit) {
+  event.preventDefault();
+  const form = event.target;
+  if (form.dataset.busy === "1") return;
+  form.dataset.busy = "1";
+  const buttons = form.querySelectorAll('button[type="submit"]');
+  buttons.forEach((button) => {
+    button.disabled = true;
+  });
+  try {
+    await submit();
+  } finally {
+    delete form.dataset.busy;
+    buttons.forEach((button) => {
+      button.disabled = false;
+    });
+  }
 }
 
 function subscriptionMap() {
@@ -153,13 +234,15 @@ async function loadState(showErrors = true) {
     appState.nodes ||= [];
     appState.subscriptions ||= [];
     pruneNodeTests();
+    pruneNodeSelection();
     renderState();
     $("connectionText").textContent = "已连接";
     document.querySelector(".top-status").classList.add("ready");
     await refreshServiceStatus(false);
   } catch (error) {
-    $("connectionText").textContent = "连接失败";
+    if (!(error instanceof AuthError))
+      $("connectionText").textContent = "连接失败";
     document.querySelector(".top-status").classList.remove("ready");
-    if (showErrors) toast(error.message, true);
+    if (showErrors || error instanceof AuthError) toast(error.message, true);
   }
 }

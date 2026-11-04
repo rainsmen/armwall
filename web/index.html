@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>ArmWall</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=20261031-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20261104-1" />
   </head>
   <body>
     <header class="topbar">
@@ -129,7 +129,7 @@
               <button class="btn secondary" data-action="batch-test" data-method="ping" title="对选中节点（未选则为全部）测试 Ping 延迟">批量 Ping</button>
               <button class="btn secondary" data-action="batch-test" data-method="tcp" title="对选中节点（未选则为全部）测试 TCP 握手延迟">批量 TCP</button>
               <button class="btn secondary" data-action="batch-test" data-method="urltest" title="对选中节点（未选则为全部）测试经由节点访问目标站点的实际网络延迟">批量 URLTest</button>
-              <button class="btn secondary" data-action="sort-nodes-delay" title="按延迟由低到高/由高到低排序">按延迟排序</button>
+              <button class="btn secondary" id="nodeSortButton" data-action="sort-nodes-delay" title="依次切换：低→高、高→低、保存的顺序；只改变显示，不保存">按延迟排序</button>
               <button class="btn secondary" data-action="batch-enable">
                 启用选中</button
               ><button class="btn secondary" data-action="batch-disable">
@@ -144,6 +144,7 @@
               <table>
                 <thead>
                   <tr>
+                    <th class="drag-col" title="按住 ⋮⋮ 拖动调整顺序"></th>
                     <th class="check-col">
                       <input
                         id="selectAllNodes"
@@ -628,10 +629,9 @@
             <div id="ruleManager"></div>
             <div class="section-head gateway-head"><h2>透明网关</h2></div>
             <div class="inline wrap">
-              <input id="lanIf" value="eth0" placeholder="LAN 接口" /><input
+              <input id="lanIf" placeholder="LAN 接口（留空自动检测）" /><input
                 id="wanIf"
-                value="eth0"
-                placeholder="WAN 接口"
+                placeholder="WAN 接口（留空自动检测）"
               /><button class="btn primary" data-action="gateway-enable">
                 启用网关</button
               ><button class="btn secondary" data-action="gateway-status">
@@ -745,6 +745,45 @@
           </article>
           <article class="panel">
             <div class="panel-head">
+              <div><h2>管理 Token</h2></div>
+            </div>
+            <form id="tokenForm" autocomplete="off">
+              <div class="form-grid">
+                <label
+                  >当前 Token<input
+                    id="tokenCurrent"
+                    type="password"
+                    required
+                    autocomplete="current-password" /></label
+                ><label
+                  >新 Token<input
+                    id="tokenNew"
+                    type="password"
+                    minlength="8"
+                    maxlength="128"
+                    required
+                    autocomplete="new-password" /></label
+                ><label
+                  >确认新 Token<input
+                    id="tokenConfirm"
+                    type="password"
+                    minlength="8"
+                    maxlength="128"
+                    required
+                    autocomplete="new-password"
+                /></label>
+              </div>
+              <p class="hint">
+                至少 8 位，可用字母、数字和 -_.~@%+=:,!^*()[]{}/?。修改立即生效并写入
+                /etc/armwall/armwall.env，无需重启；其他已打开的页面需要重新输入。
+              </p>
+              <div class="form-actions">
+                <button class="btn primary" type="submit">修改 Token</button>
+              </div>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
               <div><h2>连通性诊断</h2></div>
               <button class="btn primary" data-action="run-diagnostics">
                 开始诊断
@@ -787,11 +826,12 @@
       </main>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/js/core.js?v=20261031-1" defer></script>
-    <script src="/static/js/render.js?v=20261031-1" defer></script>
-    <script src="/static/js/editors.js?v=20261031-1" defer></script>
-    <script src="/static/js/operations.js?v=20261031-1" defer></script>
-    <script src="/static/js/actions.js?v=20261031-1" defer></script>
-    <script src="/static/js/main.js?v=20261031-1" defer></script>
+    <script src="/static/js/core.js?v=20261104-1" defer></script>
+    <script src="/static/js/render.js?v=20261104-1" defer></script>
+    <script src="/static/js/editors.js?v=20261104-1" defer></script>
+    <script src="/static/js/operations.js?v=20261104-1" defer></script>
+    <script src="/static/js/drag.js?v=20261104-1" defer></script>
+    <script src="/static/js/actions.js?v=20261104-1" defer></script>
+    <script src="/static/js/main.js?v=20261104-1" defer></script>
   </body>
 </html>

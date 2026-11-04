@@ -21,7 +21,8 @@ import (
 
 const (
 	maxAPIJSONBodySize       = 1 << 20
-	minAuthTokenLength       = 16
+	minAuthTokenLength       = 8
+	maxAuthTokenLength       = 128
 	defaultWebListenLocal    = "127.0.0.1:8080"
 	defaultWebListenLAN      = "0.0.0.0:8080"
 	defaultWebAllowedPrivate = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
@@ -58,6 +59,23 @@ func validateAuthToken(raw string) (string, error) {
 		return "", fmt.Errorf("ARMWALL_TOKEN must not contain line breaks")
 	}
 	return token, nil
+}
+
+// authToken holds the admin token so it can be replaced at runtime without
+// restarting the web service.
+type authToken struct {
+	mu    sync.RWMutex
+	value string
+}
+
+func newAuthToken(value string) *authToken {
+	return &authToken{value: value}
+}
+
+func (t *authToken) get() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.value
 }
 
 func authorized(token, header string) bool {
@@ -264,9 +282,9 @@ func webAccessMiddleware(config webAccessConfig, next http.Handler) http.Handler
 	})
 }
 
-func authHandler(token string, next http.HandlerFunc) http.HandlerFunc {
+func authHandler(token *authToken, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(token, r.Header.Get("Authorization")) {
+		if !authorized(token.get(), r.Header.Get("Authorization")) {
 			limited := recordAuthFailure(r.RemoteAddr)
 			log.Printf("unauthorized API request from %s path=%s", r.RemoteAddr, r.URL.Path)
 			w.Header().Set("WWW-Authenticate", "Bearer")
@@ -309,8 +327,13 @@ func newHTTPServer(config webAccessConfig, token string, staticFS fs.FS) (*http.
 	if _, err := validateAuthToken(token); err != nil {
 		return nil, err
 	}
+	holder := newAuthToken(token)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/", authHandler(token, api))
+	mux.HandleFunc("/api/", authHandler(holder, api))
+	mux.HandleFunc(authTokenAPIPath, authHandler(holder, func(w http.ResponseWriter, r *http.Request) {
+		setSecurityHeaders(w)
+		apiAuthTokenChange(w, r, holder)
+	}))
 	if staticFS != nil {
 		mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")

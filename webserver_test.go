@@ -30,7 +30,7 @@ func TestAPIAuthAndServerHardening(t *testing.T) {
 	if server.ReadHeaderTimeout == 0 || server.ReadTimeout == 0 || server.WriteTimeout == 0 || server.IdleTimeout == 0 || server.MaxHeaderBytes == 0 {
 		t.Fatalf("server is missing hardening timeouts: %+v", server)
 	}
-	handler := authHandler(token, func(w http.ResponseWriter, r *http.Request) {
+	handler := authHandler(newAuthToken(token), func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	recorder := httptest.NewRecorder()
@@ -188,5 +188,26 @@ func TestLegacyListenDefaultsToPrivateClients(t *testing.T) {
 	cfg, err = loadWebAccessConfig()
 	if err != nil || !webClientAllowed("100.100.1.1:5000", cfg.AllowedPrefixes) || webClientAllowed("192.168.10.5:5000", cfg.AllowedPrefixes) {
 		t.Fatalf("legacy mode should honor explicit CIDRs: err=%v", err)
+	}
+}
+
+func TestHTTPServerRoutesTokenChange(t *testing.T) {
+	webConfig := webAccessConfig{
+		Mode:            "local",
+		ListenAddress:   "127.0.0.1:0",
+		AllowedPrefixes: mustWebPrefixes(t, "127.0.0.0/8,::1/128"),
+	}
+	server, err := newHTTPServer(webConfig, "0123456789abcdef", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, authTokenAPIPath, nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Authorization", "Bearer 0123456789abcdef")
+	rec := httptest.NewRecorder()
+	server.Handler.ServeHTTP(rec, req)
+	// GET reaches apiAuthTokenChange (405), not the generic API 404.
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
