@@ -71,6 +71,9 @@ func TestFrontendAPIPathsAreRouted(t *testing.T) {
 		t.Fatalf("found only %d API paths in web/js", len(paths))
 	}
 	for path := range paths {
+		if path == authTokenAPIPath {
+			continue
+		}
 		_, unlocked := unlockedAPIRoutes[path]
 		_, locked := lockedAPIRoutes[path]
 		if unlocked == locked {

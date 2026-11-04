@@ -122,7 +122,7 @@ if [ ! -f /etc/armwall/armwall.env ]; then
     > /etc/armwall/armwall.env
 else
   ARMWALL_ADMIN_TOKEN=$(sed -n 's/^ARMWALL_TOKEN=//p' /etc/armwall/armwall.env | tail -1)
-  if [ "${#ARMWALL_ADMIN_TOKEN}" -lt 16 ]; then
+  if [ "${#ARMWALL_ADMIN_TOKEN}" -lt 8 ]; then
     ARMWALL_ADMIN_TOKEN=$(generate_token)
     umask 077
     printf '\nARMWALL_TOKEN=%s\n' "$ARMWALL_ADMIN_TOKEN" >> /etc/armwall/armwall.env

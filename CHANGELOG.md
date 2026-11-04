@@ -2,6 +2,30 @@
 
 All notable changes to ArmWall will be documented in this file.
 
+## [0.7.0] - 2026-11-04
+
+### Added
+- **Drag-and-drop node ordering.** Hold the ⋮⋮ handle of a node row and drag it to a new position; the order is saved on release and does not restart any service. Pointer Events are used, so it works with a mouse and on touch screens; the page scrolls when the pointer is held near the top or bottom edge, and Esc cancels a drag. With a search or filter active only the visible nodes are reordered and hidden nodes keep their positions. The 上移/下移 buttons remain.
+- **Change the admin token from the Web UI** (「系统管理」→「管理 Token」, `POST /api/auth/token`). The current token must be entered again; the new token needs at least 8 characters from letters, digits and `-_.~@%+=:,!^*()[]{}/?` (characters that systemd's `EnvironmentFile` parser treats specially are rejected). It is written atomically to `/etc/armwall/armwall.env` (mode 0600, other lines kept) and takes effect immediately without a restart; the old token stops working at once.
+
+### Changed
+- The minimum token length is now 8 characters, both for the Web UI and for `ARMWALL_TOKEN` in the env file. The installer no longer replaces an existing token of 8 to 15 characters on upgrade.
+- 「按延迟排序」 now cycles 低→高 / 高→低 / 保存的顺序 and only changes the displayed order; dragging and 上移/下移 are disabled while it is active.
+- Stopping the proxy service and enabling or disabling the transparent gateway now ask for confirmation. The gateway LAN/WAN fields are empty by default and the gateway script detects the interfaces, instead of both defaulting to `eth0`.
+- Long operations (subscription, rule and core updates) show 「更新中...」 on their button.
+
+### Fixed
+- A rejected token no longer reopens the token prompt every 15 seconds: concurrent requests share one prompt, background polling never prompts, and polling pauses until a user action succeeds with a valid token. Previously cancelling the prompt (or clicking 「清除 Token」) made the page unusable and could trip the authentication failure limit.
+- A temporary delay sort could be saved as the permanent node order by the next 上移/下移.
+- A member chosen in a strategy-group dropdown was reset by the next status poll before 切换 was clicked.
+- Node checkboxes were cleared by every search, filter change or test result. Selection is now kept; batch actions apply to the selected nodes that are currently visible.
+- Double-clicking a save button or a form submit could create duplicate nodes, subscriptions, strategy groups or ACL rules.
+- Opening a node editor could overwrite a password or UUID typed before the stored credentials finished loading.
+- A failure to load the log when opening the 「运行日志」 view was not reported.
+
+### Internal
+- Outbound option lists for the TCP/UDP selectors, ACL editor and ACL table come from one builder; the log export uses the shared download helper.
+
 ## [0.6.1] - 2026-11-03
 
 ### Fixed

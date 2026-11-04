@@ -12,7 +12,8 @@ document.querySelectorAll(".nav-item").forEach((button) =>
       );
     if (button.dataset.view === "routing") renderRules();
     if (button.dataset.view === "system") loadBackups();
-    if (button.dataset.view === "logs") void refreshLogs();
+    if (button.dataset.view === "logs")
+      refreshLogs().catch((error) => toast(error.message, true));
   }),
 );
 
@@ -24,11 +25,27 @@ document.addEventListener("click", (event) => {
 $("nodeSearch").addEventListener("input", renderNodes);
 $("nodeGroupFilter").addEventListener("change", renderNodes);
 $("nodeStatusFilter").addEventListener("change", renderNodes);
-$("selectAllNodes").addEventListener("change", (event) =>
+$("selectAllNodes").addEventListener("change", (event) => {
   document.querySelectorAll(".node-check").forEach((checkbox) => {
     checkbox.checked = event.target.checked;
-  }),
-);
+    if (checkbox.checked) selectedNodes.add(checkbox.value);
+    else selectedNodes.delete(checkbox.value);
+  });
+  syncSelectAll();
+});
+$("nodesTable").addEventListener("change", (event) => {
+  const checkbox = event.target.closest(".node-check");
+  if (!checkbox) return;
+  if (checkbox.checked) selectedNodes.add(checkbox.value);
+  else selectedNodes.delete(checkbox.value);
+  syncSelectAll();
+});
+$("strategyManager").addEventListener("change", (event) => {
+  const select = event.target.closest(".strategy-runtime-select");
+  if (!select) return;
+  const id = select.closest("[data-strategy-id]").dataset.strategyId;
+  pendingStrategySelection.set(id, select.value);
+});
 $("nodeForm").addEventListener("submit", saveNode);
 $("nodeType").addEventListener("change", updateNodeFields);
 $("subscriptionForm").addEventListener("submit", saveSubscription);
@@ -37,6 +54,7 @@ $("strategyMembers").addEventListener("change", () =>
   refreshStrategySelected(),
 );
 $("aclForm").addEventListener("submit", saveACL);
+$("tokenForm").addEventListener("submit", changeToken);
 $("dnsMode").addEventListener("change", updateDNSFields);
 $("coreUploadFile").addEventListener("change", async (event) => {
   const file = event.target.files[0];
@@ -67,5 +85,6 @@ $("configImportFile").addEventListener("change", async (event) => {
 });
 
 renderSites();
+initNodeDrag();
 loadState();
 startAutoRefresh();

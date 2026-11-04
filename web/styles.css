@@ -420,6 +420,45 @@ th {
 .check-col {
   width: 38px;
 }
+.drag-col {
+  width: 26px;
+  padding-right: 0 !important;
+}
+.drag-handle {
+  display: inline-block;
+  padding: 4px 2px;
+  color: #8a97a8;
+  cursor: grab;
+  letter-spacing: -2px;
+  user-select: none;
+  touch-action: none;
+}
+.drag-handle:hover {
+  color: #2867b8;
+}
+.drag-handle.disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+body.node-dragging,
+body.node-dragging * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+#nodesTable tr.dragging {
+  opacity: 0.45;
+  background: #eef4fc;
+}
+#nodesTable tr.drop-before td {
+  box-shadow: inset 0 2px 0 #2867b8;
+}
+#nodesTable tr.drop-after td {
+  box-shadow: inset 0 -2px 0 #2867b8;
+}
+.small-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 tbody tr:hover {
   background: #fbfcfe;
 }

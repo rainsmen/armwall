@@ -63,18 +63,35 @@ async function batchTestNodes(method, button) {
   }
 }
 
-let delaySortAsc = true;
+// nodeSortMode only changes the displayed order ("" = stored order). Manual
+// reordering is disabled while it is set, so a temporary delay sort is never
+// persisted as the stored node order (F3).
+let nodeSortMode = "";
 function sortNodesByDelay() {
-  delaySortAsc = !delaySortAsc;
-  appState.nodes.sort((a, b) => {
-    const resA = nodeTests.get(a.id);
-    const resB = nodeTests.get(b.id);
-    const msA = resA && !resA.error && typeof resA.ms === "number" ? resA.ms : 999999;
-    const msB = resB && !resB.error && typeof resB.ms === "number" ? resB.ms : 999999;
-    return delaySortAsc ? msA - msB : msB - msA;
-  });
+  nodeSortMode = { "": "asc", asc: "desc", desc: "" }[nodeSortMode];
   renderNodes();
-  toast(delaySortAsc ? "已按延迟由低到高排序" : "已按延迟由高到低排序");
+  toast(
+    {
+      asc: "已按延迟由低到高显示（仅改变显示顺序）",
+      desc: "已按延迟由高到低显示（仅改变显示顺序）",
+      "": "已恢复保存的节点顺序",
+    }[nodeSortMode],
+  );
+}
+
+function sortedForDisplay(nodes) {
+  if (!nodeSortMode) return nodes;
+  const delay = (node) => {
+    const res = nodeTests.get(node.id);
+    return res && !res.error && typeof res.ms === "number" ? res.ms : null;
+  };
+  return [...nodes].sort((a, b) => {
+    const msA = delay(a);
+    const msB = delay(b);
+    // Untested and failed nodes always go last.
+    if (msA === null || msB === null) return (msA === null) - (msB === null);
+    return nodeSortMode === "asc" ? msA - msB : msB - msA;
+  });
 }
 
 async function testSite(site, card) {
@@ -99,22 +116,24 @@ async function testSite(site, card) {
   }
 }
 
-async function refreshServiceStatus(notify = true) {
+async function refreshServiceStatus(notify = true, background = false) {
   try {
     const status = (
-      await request("/api/service/status", {}, true)
+      await request("/api/service/status", { background }, true)
     ).trim();
     $("serviceMetric").textContent = status || "未知";
     $("serviceOutput").textContent = status || "未知";
     if (notify) toast(`代理服务：${status}`);
   } catch (error) {
-    $("serviceMetric").textContent = "异常";
+    $("serviceMetric").textContent =
+      error instanceof AuthError ? "未授权" : "异常";
     if (notify) toast(error.message, true);
+    if (background) throw error;
   }
 }
 
-async function refreshLogs() {
-  $("logOut").textContent = await request("/api/logs", {}, true);
+async function refreshLogs(background = false) {
+  $("logOut").textContent = await request("/api/logs", { background }, true);
 }
 
 function activeViewID() {
@@ -124,14 +143,16 @@ function activeViewID() {
 function startAutoRefresh() {
   clearInterval(refreshTimer);
   refreshTimer = setInterval(async () => {
-    if (document.hidden || refreshInProgress) return;
+    if (document.hidden || refreshInProgress || authBlocked) return;
     refreshInProgress = true;
     try {
-      const tasks = [refreshServiceStatus(false)];
-      if ((appState.strategy_groups || []).length) tasks.push(loadStrategyStatus());
-      if (activeViewID() === "logs") tasks.push(refreshLogs());
+      const tasks = [refreshServiceStatus(false, true)];
+      if ((appState.strategy_groups || []).length)
+        tasks.push(loadStrategyStatus(true));
+      if (activeViewID() === "logs") tasks.push(refreshLogs(true));
       await Promise.all(tasks);
     } catch (error) {
+      // An auth failure stops polling; one toast is enough.
       toast(error.message || "后台刷新失败", true);
     } finally {
       refreshInProgress = false;
@@ -368,4 +389,23 @@ function renderDiagnostics(data) {
     <dl class="diag-meta">${metaHTML}</dl>
     <div class="diag-block"><h3>直连失败目标</h3>${failuresHTML}</div>
     <div class="diag-block"><h3>最近错误</h3>${errorsHTML}</div>`;
+}
+
+function changeToken(event) {
+  return guardForm(event, async () => {
+    const current = $("tokenCurrent").value;
+    const next = $("tokenNew").value;
+    if (next.length < 8) throw new Error("新 Token 至少 8 位");
+    if (!/^[A-Za-z0-9\-_.~@%+=:,!^*()[\]{}/?]+$/.test(next))
+      throw new Error("新 Token 只能包含字母、数字和 -_.~@%+=:,!^*()[]{}/?");
+    if (next !== $("tokenConfirm").value)
+      throw new Error("两次输入的新 Token 不一致");
+    await request("/api/auth/token", {
+      method: "POST",
+      body: { current, token: next },
+    });
+    setToken(next);
+    $("tokenForm").reset();
+    toast("管理 Token 已修改，其他已打开的页面需要重新输入");
+  }).catch((error) => toast(error.message, true));
 }

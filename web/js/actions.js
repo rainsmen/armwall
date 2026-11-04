@@ -1,7 +1,26 @@
 // ArmWall web UI: dispatch for [data-action] buttons.
 
+// Actions that already manage their own button state (or are instant and
+// harmless to repeat) are not locked by handleAction.
+const unlockedActions = new Set([
+  "test-node",
+  "batch-test",
+  "test-site",
+  "run-diagnostics",
+  "sort-nodes-delay",
+  "select-core",
+]);
+
 async function handleAction(button) {
   const { action, id, method, direction, tag, name, core } = button.dataset;
+  // Ignore repeated clicks while the same control is still working (F5).
+  if (button.dataset.busy === "1") return;
+  const lock = !unlockedActions.has(action);
+  const oldLabel = button.textContent;
+  if (lock) {
+    button.dataset.busy = "1";
+    if ("disabled" in button) button.disabled = true;
+  }
   try {
     if (action === "new-node") openNodeEditor();
     else if (action === "close-node") closeNodeEditor();
@@ -40,6 +59,8 @@ async function handleAction(button) {
     else if (action === "batch-test") await batchTestNodes(method || "tcp", button);
     else if (action === "sort-nodes-delay") sortNodesByDelay();
     else if (action === "move-node") {
+      if (nodeSortMode)
+        throw new Error("按延迟显示时不能调整顺序，请先恢复保存的顺序");
       const visibleIDs = filteredNodes().map((node) => node.id);
       const visibleFrom = visibleIDs.indexOf(id);
       const visibleTo = visibleFrom + Number(direction);
@@ -50,8 +71,7 @@ async function handleAction(button) {
       const to = ids.indexOf(visibleIDs[visibleTo]);
       if (from < 0 || to < 0 || to >= ids.length) return;
       [ids[from], ids[to]] = [ids[to], ids[from]];
-      await request("/api/node/reorder", { method: "POST", body: { ids } });
-      await loadState(false);
+      await saveNodeOrder(ids);
     } else if (action === "batch-enable" || action === "batch-disable") {
       const ids = selectedNodeIDs();
       if (!ids.length) throw new Error("请先选择节点");
@@ -69,6 +89,7 @@ async function handleAction(button) {
         method: "POST",
         body: { ids },
       });
+      ids.forEach((nodeID) => selectedNodes.delete(nodeID));
       toast("选中节点已删除");
       await loadState(false);
     } else if (action === "new-subscription") openSubscriptionEditor();
@@ -86,7 +107,8 @@ async function handleAction(button) {
       toast(sub.enabled ? "订阅自动更新已停用" : "订阅自动更新已启用");
       await loadState(false);
     } else if (action === "update-subscription") {
-      button.disabled = true;
+      button.textContent = "更新中...";
+      toast("正在更新订阅，最长约 3 分钟...");
       await request("/api/subscription/update-one", {
         method: "POST",
         body: { id },
@@ -95,7 +117,8 @@ async function handleAction(button) {
       toast("订阅已更新");
       await loadState(false);
     } else if (action === "update-all-subscriptions") {
-      button.disabled = true;
+      button.textContent = "更新中...";
+      toast("正在更新全部订阅，最长约 3 分钟...");
       await request("/api/subscription/update", { method: "POST", timeoutMs: 180000 });
       toast("全部订阅已更新");
       await loadState(false);
@@ -136,6 +159,7 @@ async function handleAction(button) {
         method: "POST",
         body: { id, nodeID },
       });
+      pendingStrategySelection.delete(id);
       toast("策略组成员已切换");
       await loadState(false);
     } else if (action === "new-acl") openACLEditor();
@@ -173,7 +197,15 @@ async function handleAction(button) {
       await testSite(button.dataset.site, button.closest(".site-card"));
     else if (action === "restart-service" || action === "start-service")
       await service("start");
-    else if (action === "stop-service") await service("stop");
+    else if (action === "stop-service") {
+      if (
+        !confirm(
+          "确认停止代理服务？\n使用本机代理的设备（含经路由器转发的整个局域网）将无法访问境外网站，直到再次点击「启动」。",
+        )
+      )
+        return;
+      await service("stop");
+    }
     else if (action === "save-routing") {
       await request("/api/routing", {
         method: "POST",
@@ -191,11 +223,19 @@ async function handleAction(button) {
       toast("分流、DNS 与出站策略已保存");
       await loadState(false);
     } else if (action === "gateway-enable") {
+      const lan = $("lanIf").value.trim();
+      const wan = $("wanIf").value.trim();
+      if (
+        !confirm(
+          `确认启用透明网关？\nLAN：${lan || "自动检测"}，WAN：${wan || "自动检测"}\n本机会接管来自 LAN 接口的流量，接口填错可能导致局域网断网。`,
+        )
+      )
+        return;
       $("gatewayOut").textContent = await request(
         "/api/gateway/enable",
         {
           method: "POST",
-          body: { lan: $("lanIf").value, wan: $("wanIf").value },
+          body: { lan, wan },
         },
         true,
       );
@@ -206,6 +246,12 @@ async function handleAction(button) {
         true,
       );
     } else if (action === "gateway-disable") {
+      if (
+        !confirm(
+          "确认关闭透明网关？\n把本机设为网关或 DNS 的设备将失去代理，直到重新启用。",
+        )
+      )
+        return;
       $("gatewayOut").textContent = await request(
         "/api/gateway/disable",
         { method: "POST" },
@@ -227,7 +273,7 @@ async function handleAction(button) {
       toast("规则设置已保存");
       await renderRules();
     } else if (action === "update-rule") {
-      button.disabled = true;
+      button.textContent = "更新中...";
       await request("/api/rules/update", { method: "POST", body: { tag }, timeoutMs: 180000 });
       toast("规则已更新");
       await renderRules();
@@ -241,7 +287,8 @@ async function handleAction(button) {
         )
       ).trim();
     } else if (action === "core-latest") {
-      button.disabled = true;
+      button.textContent = "更新中...";
+      $("coreVersion").textContent = "正在下载并校验，最长约 3 分钟...";
       $("coreVersion").textContent = (
         await request(
           "/api/core/update",
@@ -300,23 +347,19 @@ async function handleAction(button) {
       toast("日志已清空");
     } else if (action === "export-logs") {
       const data = await request("/api/logs?download=1", {}, true);
-      const url = URL.createObjectURL(
-        new Blob([data], { type: "text/plain;charset=utf-8" }),
-      );
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "armwall.log";
-      link.click();
-      URL.revokeObjectURL(url);
+      downloadText(data, "armwall.log", "text/plain;charset=utf-8");
     } else if (action === "reset-token") {
-      token = "";
-      sessionStorage.removeItem("armwallToken");
-      localStorage.removeItem("armwallToken");
-      toast("本地 Token 已清除");
+      setToken("");
+      markUnauthorized();
+      toast("本地 Token 已清除，下次操作时会要求重新输入");
     }
   } catch (error) {
     toast(error.message, true);
   } finally {
-    if (button) button.disabled = false;
+    if (lock) {
+      delete button.dataset.busy;
+      if ("disabled" in button) button.disabled = false;
+      if (button.textContent !== oldLabel) button.textContent = oldLabel;
+    }
   }
 }

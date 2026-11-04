@@ -10,7 +10,8 @@ ArmWall 是面向 Armbian/Debian 设备的局域网代理网关。它使用 sing
 - sing-box 的 DNS 块始终生成：DNS 模块关闭时仍使用经代理的远程 DNS 与国内 DNS，并按国内域名分流，不再退化到主机的 `systemd-resolved`；每个出站带独立的 `domain_resolver`。
 - 当 UDP 出站是不支持 UDP 中继的 naive 节点时，UDP 自动改为 `block`，让 QUIC 快速失败并回落 TCP，而不是等待黑洞超时。
 - Selector、URLTest 策略组，显示实际运行成员与最近延迟。
-- 并发批量 Ping、TCP、URLTest 节点测速，支持按延迟升降序实时排序与动态分级标签。
+- 并发批量 Ping、TCP、URLTest 节点测速，支持按延迟升降序显示（不改变保存的顺序）与动态分级标签。
+- 节点列表按住 ⋮⋮ 拖动即可调整顺序，支持鼠标和触屏，筛选状态下只调整可见节点。
 - sing-box 1.14+ 协议嗅探（`action: sniff`）、DNS 劫持、FakeIP、GeoSite/GeoIP 规则与广告阻止规则；规则支持逐项备用地址、自动更新间隔、内容哈希免写与广告拦截开关。
 - 内置 4 套标准离线规则包（`geoip-cn`、`geosite-ads`、`geosite-cn`、`geosite-proxy`），支持纯离线首次引导（`--bootstrap-rules`）。
 - 按源 IP/CIDR、MAC、协议和目标端口设置 ACL。MAC ACL 由 nftables 分流到独立 TProxy 入口。
@@ -140,9 +141,10 @@ sudo ./install.sh ./armwall-linux-armv7
 | Clash API | `127.0.0.1:9090` | 随机 secret，仅供 ArmWall 后端访问 |
 | NaiveProxy 本地 SOCKS | `127.0.0.1:12000+` | 每个 Naive 节点占用一个端口 |
 
-管理 Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`。轮换 Token 或修改 Web
-访问配置后执行 `systemctl restart armwall.service`；浏览器中的旧 Token 需要在页面点击
-“清除 Token”后重新输入。
+管理 Token 保存在权限为 `0600` 的 `/etc/armwall/armwall.env`，至少 8 位。可以在「系统管理」→「管理 Token」
+页面修改：需要再次输入当前 Token，新 Token 只能使用字母、数字和 `-_.~@%+=:,!^*()[]{}/?`，修改后立即生效，
+无需重启，其他已打开的页面会提示重新输入。手动编辑该文件或修改 Web 访问配置后执行
+`systemctl restart armwall.service`。
 
 Web 访问由以下变量控制：
 
