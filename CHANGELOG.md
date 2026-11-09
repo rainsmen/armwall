@@ -2,6 +2,16 @@
 
 All notable changes to ArmWall will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **NaiveProxy relay nodes failed with `ERR_PROXY_CERTIFICATE_INVALID`.** A naive node whose TLS SNI differs from its server address (for example a share link `naive+https://user:pass@relay.example:4435?sni=origin.example`) had the SNI stored but dropped when the NaiveProxy client config was generated, so the client connected with the relay hostname as SNI and rejected the certificate. The proxy URL now uses the SNI and a `host-resolver-rules` entry (`MAP <sni> <server>`) sends the connection to the server address, the same as mobile clients. Ping and TCP tests passed while URL tests failed, because only the URL test goes through TLS.
+- The 「跳过证书验证」 flag had no effect on NaiveProxy nodes: neither the naive client nor sing-box's naive outbound can skip certificate verification. The checkbox is now disabled for NaiveProxy with an explanation; adding or editing a NaiveProxy node with the flag is rejected; share-link import, subscription refresh and backup restore clear the flag (link import reports how many were cleared).
+
+### Changed
+- The TLS SNI field is shown for NaiveProxy nodes. A NaiveProxy server address must be a hostname or IP address and the SNI must be a hostname.
+- Nodes that already have a different SNI get the corrected NaiveProxy config when the installer upgrade runs `armwall --write-config`, or on the next configuration change.
+
 ## [0.7.0] - 2026-11-04
 
 ### Added

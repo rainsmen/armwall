@@ -24,6 +24,10 @@ func TestValidateNodeRequiresProtocolCredentials(t *testing.T) {
 		{"vless valid", Node{Name: "n", Type: "vless", Server: "example.com", Port: 443, UUID: validUUID, TLS: true}, false},
 		{"shadowsocks missing method", Node{Name: "n", Type: "shadowsocks", Server: "example.com", Port: 8388, Password: "pw"}, true},
 		{"naive valid", Node{Name: "n", Type: "naive", Server: "example.com", Port: 443, Username: "user", Password: "pw"}, false},
+		{"naive relay sni", Node{Name: "n", Type: "naive", Server: "2001:db8::7", Port: 443, ServerName: " origin.example.com ", Username: "user", Password: "pw"}, false},
+		{"naive sni with rule separator", Node{Name: "n", Type: "naive", Server: "example.com", Port: 443, ServerName: "a.example.com,MAP * b", Username: "user", Password: "pw"}, true},
+		{"naive ip sni", Node{Name: "n", Type: "naive", Server: "example.com", Port: 443, ServerName: "203.0.113.7", Username: "user", Password: "pw"}, true},
+		{"naive server with space", Node{Name: "n", Type: "naive", Server: "a b.example.com", Port: 443, Username: "user", Password: "pw"}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -210,7 +210,7 @@
                   >UUID<input id="nodeUUID" /></label
                 ><label data-protocols="trojan shadowsocks ss hysteria2 anytls naive"
                   >密码<input id="nodePassword" /></label
-                ><label data-protocols="vless vmess trojan hysteria2 anytls"
+                ><label data-protocols="vless vmess trojan hysteria2 anytls naive"
                   >TLS SNI<input id="nodeSNI" /></label
                 ><label data-protocols="vless vmess trojan"
                   >HTTP Host<input id="nodeHost" /></label
@@ -256,11 +256,14 @@
                     placeholder="chrome" /></label
                 ><label class="check-label" data-protocols="vless vmess trojan hysteria2 anytls"
                   ><input id="nodeTLS" type="checkbox" checked />启用 TLS</label
-                ><label class="check-label" data-protocols="vless vmess trojan hysteria2 anytls"
+                ><label class="check-label" data-protocols="vless vmess trojan hysteria2 anytls naive"
                   ><input
                     id="nodeInsecure"
                     type="checkbox"
                   />跳过证书验证</label
+                ><p class="hint span-2" data-protocols="naive">
+                  NaiveProxy 不支持跳过证书验证；SNI 与服务器地址不同时，将以 SNI 握手并连接到服务器地址（中转节点）。
+                </p
                 ><label class="check-label"
                   ><input
                     id="nodeEnabled"

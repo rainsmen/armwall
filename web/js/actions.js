@@ -32,10 +32,15 @@ async function handleAction(button) {
     else if (action === "submit-import") {
       const links = $("shareLinks").value.trim();
       if (!links) throw new Error("请输入分享链接");
-      await request("/api/node/import", { method: "POST", body: { links } });
+      const result = await request("/api/node/import", { method: "POST", body: { links } });
       $("shareLinks").value = "";
       $("linkImporter").hidden = true;
-      toast("节点已导入");
+      const ignored = Number(result?.ignored_insecure) || 0;
+      toast(
+        ignored > 0
+          ? `节点已导入；${ignored} 个 NaiveProxy 节点不支持跳过证书验证，已忽略该设置`
+          : "节点已导入",
+      );
       await loadState(false);
     } else if (action === "edit-node") openNodeEditor(nodeByID(id));
     else if (action === "copy-node") {

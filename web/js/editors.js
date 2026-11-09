@@ -17,6 +17,11 @@ function updateNodeFields() {
   document.querySelectorAll("#nodeForm [data-protocols]").forEach((field) => {
     field.hidden = !field.dataset.protocols.split(/\s+/).includes(protocol);
   });
+  // NaiveProxy always verifies the server certificate, so the flag is shown
+  // but locked off instead of being silently ignored.
+  const insecure = $("nodeInsecure");
+  insecure.disabled = protocol === "naive";
+  if (insecure.disabled) insecure.checked = false;
 }
 
 async function openNodeEditor(node = null) {
@@ -110,7 +115,7 @@ function nodePayload() {
     down_mbps: Number($("nodeDownMbps").value) || 0,
     fingerprint: $("nodeFingerprint").value.trim(),
     tls: $("nodeTLS").checked,
-    insecure: $("nodeInsecure").checked,
+    insecure: $("nodeInsecure").checked && !$("nodeInsecure").disabled,
     enabled: $("nodeEnabled").checked,
   };
 }

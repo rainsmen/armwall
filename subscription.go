@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strconv"
 	"strings"
@@ -244,6 +245,9 @@ func fetchSubscription(ctx context.Context, rawURL string) ([]Node, error) {
 		if err != nil {
 			lastErr = err
 		} else if nodes := parseSubscription(string(body)); len(nodes) > 0 {
+			if cleared := clearNaiveInsecure(nodes); cleared > 0 {
+				log.Printf("subscription: ignored insecure flag on %d NaiveProxy nodes; NaiveProxy cannot skip certificate verification", cleared)
+			}
 			return nodes, nil
 		} else {
 			lastErr = fmt.Errorf("no supported nodes")

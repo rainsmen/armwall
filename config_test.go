@@ -118,6 +118,39 @@ func TestNaiveProxyUsesLocalSOCKSBridge(t *testing.T) {
 	}
 }
 
+func TestNaiveProxyMapsServerNameToDialAddress(t *testing.T) {
+	cases := []struct {
+		name      string
+		server    string
+		sni       string
+		wantProxy string
+		wantRule  string
+	}{
+		{"relay hostname", "relay.example.com", "origin.example.com", "https://u:p@origin.example.com:4435", "MAP origin.example.com relay.example.com"},
+		{"ipv4 server", "203.0.113.7", "origin.example.com", "https://u:p@origin.example.com:4435", "MAP origin.example.com 203.0.113.7"},
+		{"ipv6 server", "2001:db8::7", "origin.example.com", "https://u:p@origin.example.com:4435", "MAP origin.example.com [2001:db8::7]"},
+		{"sni equals server", "origin.example.com", "ORIGIN.example.com", "https://u:p@origin.example.com:4435", ""},
+		{"empty sni", "relay.example.com", "", "https://u:p@relay.example.com:4435", ""},
+		{"malformed sni", "relay.example.com", "a.example.com, MAP * evil", "https://u:p@relay.example.com:4435", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := Store{ProxyPort: 11080, Nodes: []Node{{ID: "n1", Type: "naive", Server: tc.server, Port: 4435, ServerName: tc.sni, Username: "u", Password: "p", Transport: "https", Enabled: true, NaivePort: 12000}}}
+			bindings := naiveBindings(s)
+			if len(bindings) != 1 {
+				t.Fatalf("bindings=%d", len(bindings))
+			}
+			var got map[string]string
+			if err := json.Unmarshal([]byte(bindings[0].Config), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["proxy"] != tc.wantProxy || got["host-resolver-rules"] != tc.wantRule {
+				t.Fatalf("unexpected NaiveProxy config: %s", bindings[0].Config)
+			}
+		})
+	}
+}
+
 func TestConfigRoutingModes(t *testing.T) {
 	s := Store{Mode: "bypass_cn", Nodes: []Node{{ID: "n1", Type: "anytls", Server: "example.com", Port: 443, Password: "pw", TLS: true, Enabled: true}}}
 	c := config(s)
