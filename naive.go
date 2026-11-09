@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 func macACLBindings(s Store) []macACLBinding {
@@ -42,17 +43,48 @@ func naiveBindings(s Store) []naiveBinding {
 		if transport != "quic" {
 			transport = "https"
 		}
-		proxy := &url.URL{Scheme: transport, Host: net.JoinHostPort(node.Server, strconv.Itoa(node.Port))}
+		config := map[string]string{"listen": fmt.Sprintf("socks://127.0.0.1:%d", port)}
+		proxyHost := node.Server
+		if sni := naiveServerName(node); sni != "" {
+			// NaiveProxy has no separate SNI option: the proxy URL host is used for
+			// both SNI and certificate verification. Put the SNI in the URL and map it
+			// back to the real server address, as relay links on mobile clients do.
+			proxyHost = sni
+			config["host-resolver-rules"] = "MAP " + sni + " " + naiveResolverTarget(node.Server)
+		}
+		proxy := &url.URL{Scheme: transport, Host: net.JoinHostPort(proxyHost, strconv.Itoa(node.Port))}
 		if node.Username != "" || node.Password != "" {
 			proxy.User = url.UserPassword(node.Username, node.Password)
 		}
-		configData, _ := json.MarshalIndent(map[string]string{
-			"listen": fmt.Sprintf("socks://127.0.0.1:%d", port),
-			"proxy":  proxy.String(),
-		}, "", "  ")
+		config["proxy"] = proxy.String()
+		configData, _ := json.MarshalIndent(config, "", "  ")
 		bindings = append(bindings, naiveBinding{Node: node, Port: port, Config: string(configData)})
 	}
 	return bindings
+}
+
+// naiveServerName returns the TLS server name that differs from the dial
+// address, or "" when the proxy URL host alone is sufficient. Subscription
+// refreshes bypass validateNode, so malformed values are dropped here instead
+// of being spliced into the resolver rule.
+func naiveServerName(node Node) string {
+	sni := strings.TrimSpace(node.ServerName)
+	if sni == "" || strings.EqualFold(sni, node.Server) || !isDNSHostname(sni) {
+		return ""
+	}
+	if net.ParseIP(node.Server) == nil && !isDNSHostname(node.Server) {
+		return ""
+	}
+	return sni
+}
+
+// naiveResolverTarget formats the dial address as a Chromium host resolver
+// rule replacement, which requires brackets around IPv6 literals.
+func naiveResolverTarget(server string) string {
+	if ip := net.ParseIP(server); ip != nil && ip.To4() == nil {
+		return "[" + server + "]"
+	}
+	return server
 }
 
 func assignNaivePorts(s *Store) error {

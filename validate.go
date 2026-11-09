@@ -67,6 +67,17 @@ func validateNode(n *Node) error {
 		if n.Transport != "https" && n.Transport != "quic" {
 			return fmt.Errorf("NaiveProxy transport must be https or quic")
 		}
+		if n.Insecure {
+			return fmt.Errorf("NaiveProxy does not support skipping certificate verification")
+		}
+		// Both values end up in the proxy URL and the host resolver rule.
+		n.ServerName = strings.TrimSpace(n.ServerName)
+		if net.ParseIP(n.Server) == nil && !isDNSHostname(n.Server) {
+			return fmt.Errorf("NaiveProxy server must be a hostname or IP address")
+		}
+		if n.ServerName != "" && !isDNSHostname(n.ServerName) {
+			return fmt.Errorf("NaiveProxy SNI must be a hostname")
+		}
 	} else {
 		n.Transport = normalizeTransport(n.Transport)
 		if n.Transport != "" {
@@ -83,6 +94,41 @@ func validateNode(n *Node) error {
 		}
 	}
 	return nil
+}
+
+// clearNaiveInsecure drops the insecure flag from NaiveProxy nodes, since
+// neither the naive binary nor sing-box's naive outbound can skip certificate
+// verification. Bulk paths (link import, subscriptions, backup restore) use it
+// so one such link does not fail the whole batch; it returns the change count.
+func clearNaiveInsecure(nodes []Node) int {
+	cleared := 0
+	for i := range nodes {
+		if nodes[i].Insecure && strings.EqualFold(strings.TrimSpace(nodes[i].Type), "naive") {
+			nodes[i].Insecure = false
+			cleared++
+		}
+	}
+	return cleared
+}
+
+// isDNSHostname reports whether value is a syntactically valid DNS name that is
+// not an IP literal.
+func isDNSHostname(value string) bool {
+	value = strings.TrimSuffix(value, ".")
+	if value == "" || len(value) > 253 || net.ParseIP(value) != nil {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validateStrategyGroup(group *StrategyGroup, s Store) error {

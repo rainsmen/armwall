@@ -351,3 +351,32 @@ func TestReplaceSubscriptionNodesKeepsPosition(t *testing.T) {
 		t.Fatalf("new subscription should append: %+v", got)
 	}
 }
+
+func TestShareLinkImportKeepsNaiveRelaySNIAndDropsInsecure(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080})
+	link := "naive+https://alice:secret@relay.example:4435?sni=origin.example&insecure=1#Relay"
+	recorder := callAPI(t, "/api/node/import", `{"links":"`+link+`"}`)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"ignored_insecure":1`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	got := load()
+	if len(got.Nodes) != 1 || got.Nodes[0].ServerName != "origin.example" || got.Nodes[0].Insecure {
+		t.Fatalf("unexpected imported node: %+v", got.Nodes)
+	}
+	data, err := os.ReadFile(filepath.Join(naiveConfigDir, "0001.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var naiveConfig map[string]string
+	if json.Unmarshal(data, &naiveConfig) != nil || naiveConfig["proxy"] != "https://alice:secret@origin.example:4435" || naiveConfig["host-resolver-rules"] != "MAP origin.example relay.example" {
+		t.Fatalf("unexpected NaiveProxy config: %s", data)
+	}
+}
+
+func TestNaiveNodeAPIRejectsInsecure(t *testing.T) {
+	setupAPITest(t, Store{Mode: "global", ProxyPort: 11080})
+	recorder := callAPI(t, "/api/node", `{"name":"n","type":"naive","server":"relay.example","port":443,"username":"u","password":"p","insecure":true,"enabled":true}`)
+	if recorder.Code == http.StatusOK || len(load().Nodes) != 0 {
+		t.Fatalf("insecure NaiveProxy node accepted: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}

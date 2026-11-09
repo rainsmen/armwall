@@ -41,6 +41,17 @@ func TestConfigArchiveAndBackupLifecycle(t *testing.T) {
 	}
 }
 
+func TestConfigArchiveClearsNaiveInsecure(t *testing.T) {
+	data := []byte(`{"Mode":"global","ProxyPort":11080,"Nodes":[{"ID":"n1","Name":"n","Type":"naive","Server":"relay.example","Port":443,"Username":"u","Password":"p","Insecure":true,"Enabled":true}]}`)
+	got, err := parseConfigArchive(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Nodes) != 1 || got.Nodes[0].Insecure {
+		t.Fatalf("NaiveProxy insecure flag survived restore: %+v", got.Nodes)
+	}
+}
+
 func TestCoreUploadUsesManagedTemporaryFile(t *testing.T) {
 	dir := t.TempDir()
 	oldUploadDir, oldUpdateCorePath := coreUploadDir, updateCorePath

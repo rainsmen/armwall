@@ -510,6 +510,7 @@ func apiNodeImport(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, "no supported links", http.StatusUnprocessableEntity)
 		return
 	}
+	ignoredInsecure := clearNaiveInsecure(nodes)
 	for i := range nodes {
 		nodes[i].SubscriptionID = ""
 		if err := validateNode(&nodes[i]); err != nil {
@@ -522,7 +523,7 @@ func apiNodeImport(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes)})
+	json.NewEncoder(w).Encode(map[string]any{"imported": len(nodes), "ignored_insecure": ignoredInsecure})
 }
 
 func runSingleNodeTest(n Node, method, customURL string) (int64, error) {

@@ -108,6 +108,7 @@ func validateImportedStore(s *Store) error {
 		}
 	}
 	seenNodes := map[string]bool{}
+	clearNaiveInsecure(s.Nodes)
 	for i := range s.Nodes {
 		node := &s.Nodes[i]
 		if node.ID == "" || node.ID == "direct" || node.ID == "block" || seenNodes[node.ID] {
