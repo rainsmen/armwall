@@ -6,13 +6,37 @@ PORT=${ARMWALL_TPROXY_PORT:-11081}
 MAC_ACL_FILE=${ARMWALL_MAC_ACL_FILE:-/etc/armwall/mac-acl.tsv}
 LAN_IF=${ARMWALL_LAN_IF:-}
 WAN_IF=${ARMWALL_WAN_IF:-}
+EXTRA_IFS=${ARMWALL_EXTRA_IFS-tailscale0}
 STATE_FILE=${ARMWALL_GATEWAY_STATE:-/var/lib/armwall/gateway.state}
 
 die(){ echo "armwall-gateway: $*" >&2; exit 1; }
-safe_iface(){
+safe_ifname(){
   case "$1" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac
-  [ "${#1}" -le 32 ] || return 1
+  [ "${#1}" -le 32 ]
+}
+safe_iface(){
+  safe_ifname "$1" || return 1
   ip link show dev "$1" >/dev/null 2>&1
+}
+tproxy_ifaces(){
+  seen=" $LAN_IF "
+  quoted="\"$LAN_IF\""
+  count=1
+  for extra in $(printf '%s' "$EXTRA_IFS" | tr ',' ' '); do
+    [ -n "$extra" ] || continue
+    safe_ifname "$extra" || die "invalid extra interface: $extra"
+    case "$seen" in
+      *" $extra "*) continue;;
+    esac
+    seen="$seen$extra "
+    quoted="$quoted, \"$extra\""
+    count=$((count + 1))
+  done
+  if [ "$count" -eq 1 ]; then
+    printf '%s' "$quoted"
+  else
+    printf '{ %s }' "$quoted"
+  fi
 }
 detect(){
   command -v nft >/dev/null || die "nftables is required"
@@ -42,6 +66,7 @@ load_state(){
   fi
 }
 apply_gateway(){
+  TPROXY_IF_MATCH=$(tproxy_ifaces)
   old_table=$(mktemp)
   had_table=0
   if nft list table inet "$TABLE" > "$old_table" 2>/dev/null; then had_table=1; fi
@@ -52,10 +77,10 @@ delete table inet $TABLE
 table inet $TABLE {
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
-    iifname "$LAN_IF" meta nfproto ipv6 fib daddr type local accept
-    iifname "$LAN_IF" meta nfproto ipv6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect } accept
-    iifname "$LAN_IF" meta nfproto ipv6 drop
-    iifname "$LAN_IF" meta nfproto ipv4 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } return
+    iifname $TPROXY_IF_MATCH meta nfproto ipv6 fib daddr type local accept
+    iifname $TPROXY_IF_MATCH meta nfproto ipv6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect } accept
+    iifname $TPROXY_IF_MATCH meta nfproto ipv6 drop
+    iifname $TPROXY_IF_MATCH meta nfproto ipv4 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } return
 EOF
 
   if [ -r "$MAC_ACL_FILE" ]; then
@@ -76,7 +101,7 @@ EOF
   fi
 
   cat <<EOF >> "$tmp_rules"
-    iifname "$LAN_IF" meta nfproto ipv4 meta l4proto { tcp, udp } meta mark set $MARK tproxy ip to :$PORT accept
+    iifname $TPROXY_IF_MATCH meta nfproto ipv4 meta l4proto { tcp, udp } meta mark set $MARK tproxy ip to :$PORT accept
   }
 }
 EOF
@@ -89,6 +114,13 @@ EOF
   fi
   rm -f "$tmp_rules"
   rule_added=0
+  main_suppress_added=0
+  ts_suppress_added=0
+  rollback_rules(){
+    [ "$ts_suppress_added" -eq 0 ] || ip rule del fwmark "$MARK" table 52 suppress_prefixlength 0 2>/dev/null || true
+    [ "$main_suppress_added" -eq 0 ] || ip rule del fwmark "$MARK" table main suppress_prefixlength 0 2>/dev/null || true
+    [ "$rule_added" -eq 0 ] || ip rule del fwmark "$MARK" table 233 2>/dev/null || true
+  }
   if ! ip rule show | grep -F "fwmark $MARK lookup 233" >/dev/null 2>&1; then
     if ip rule add fwmark "$MARK" table 233; then rule_added=1; else
       restore_network_table "$old_table" "$had_table"
@@ -96,9 +128,25 @@ EOF
       return 1
     fi
   fi
+  if ! ip rule show | grep -F "fwmark $MARK lookup main suppress_prefixlength 0" >/dev/null 2>&1; then
+    if ip rule add fwmark "$MARK" table main suppress_prefixlength 0; then main_suppress_added=1; else
+      rollback_rules
+      restore_network_table "$old_table" "$had_table"
+      echo "armwall-gateway: failed to add main suppress policy rule; previous network state restored" >&2
+      return 1
+    fi
+  fi
+  if ! ip rule show | grep -F "fwmark $MARK lookup 52 suppress_prefixlength 0" >/dev/null 2>&1; then
+    if ip rule add fwmark "$MARK" table 52 suppress_prefixlength 0; then ts_suppress_added=1; else
+      rollback_rules
+      restore_network_table "$old_table" "$had_table"
+      echo "armwall-gateway: failed to add table 52 suppress policy rule; previous network state restored" >&2
+      return 1
+    fi
+  fi
   if ! ip route show table 233 | grep -F "local default dev lo" >/dev/null 2>&1; then
     if ! ip route add local 0.0.0.0/0 dev lo table 233; then
-      [ "$rule_added" -eq 0 ] || ip rule del fwmark "$MARK" table 233 2>/dev/null || true
+      rollback_rules
       restore_network_table "$old_table" "$had_table"
       echo "armwall-gateway: failed to add policy route; previous network state restored" >&2
       return 1
@@ -151,6 +199,8 @@ reload(){
 }
 suspend_gateway(){
   nft delete table inet $TABLE 2>/dev/null || true
+  while ip rule del fwmark $MARK table 52 suppress_prefixlength 0 2>/dev/null; do :; done
+  while ip rule del fwmark $MARK table main suppress_prefixlength 0 2>/dev/null; do :; done
   while ip rule del fwmark $MARK table 233 2>/dev/null; do :; done
   ip route del local 0.0.0.0/0 dev lo table 233 2>/dev/null || true
   echo suspended

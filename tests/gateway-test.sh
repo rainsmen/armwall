@@ -43,6 +43,10 @@ if FAIL_ROUTE=1 "$ROOT/gateway.sh" enable >/dev/null 2>&1; then
   exit 1
 fi
 grep -F 'ip route add local 0.0.0.0/0 dev lo table 233' "$TEST_LOG" >/dev/null
+grep -F 'ip rule add fwmark 0x2333 table main suppress_prefixlength 0' "$TEST_LOG" >/dev/null
+grep -F 'ip rule add fwmark 0x2333 table 52 suppress_prefixlength 0' "$TEST_LOG" >/dev/null
+grep -F 'ip rule del fwmark 0x2333 table 52 suppress_prefixlength 0' "$TEST_LOG" >/dev/null
+grep -F 'ip rule del fwmark 0x2333 table main suppress_prefixlength 0' "$TEST_LOG" >/dev/null
 grep -F 'ip rule del fwmark 0x2333 table 233' "$TEST_LOG" >/dev/null
 grep -F 'nft delete table inet armwall' "$TEST_LOG" >/dev/null
 grep -F 'sysctl -q -w net.ipv4.ip_forward=0' "$TEST_LOG" >/dev/null
@@ -55,6 +59,23 @@ grep -F 'meta nfproto ipv6 fib daddr type local accept' "$NFT_LOG" >/dev/null
 grep -F 'icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect } accept' "$NFT_LOG" >/dev/null
 grep -F '100.64.0.0/10' "$NFT_LOG" >/dev/null
 grep -F '169.254.0.0/16' "$NFT_LOG" >/dev/null
+grep -F 'iifname { "lan0", "tailscale0" }' "$NFT_LOG" >/dev/null
 [ ! -e "$TMP/state/nft.backup" ] || { echo "gateway wrote an unused nft.backup" >&2; exit 1; }
 [ -r "$ARMWALL_GATEWAY_STATE" ]
+
+: > "$NFT_LOG"
+ARMWALL_EXTRA_IFS="" "$ROOT/gateway.sh" reload >/dev/null
+grep -F 'iifname "lan0" meta nfproto ipv4' "$NFT_LOG" >/dev/null
+if grep -F 'tailscale0' "$NFT_LOG" >/dev/null; then
+  echo "gateway included tailscale0 when ARMWALL_EXTRA_IFS was empty" >&2
+  exit 1
+fi
+
+: > "$NFT_LOG"
+ARMWALL_LAN_IF=tailscale0 "$ROOT/gateway.sh" enable >/dev/null
+grep -F 'iifname "tailscale0" meta nfproto ipv4' "$NFT_LOG" >/dev/null
+if grep -F '{ "tailscale0", "tailscale0" }' "$NFT_LOG" >/dev/null; then
+  echo "gateway produced duplicate tailscale0 interface in nft set" >&2
+  exit 1
+fi
 printf 'gateway tests passed\n'

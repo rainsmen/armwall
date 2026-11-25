@@ -11,7 +11,10 @@ HEALTH_URL=${ARMWALL_HEALTH_URL:-http://cp.cloudflare.com/generate_204}
 # restarted forever every few minutes.
 BACKOFF_BASE=${ARMWALL_HEALTH_BACKOFF_BASE:-300}
 BACKOFF_MAX=${ARMWALL_HEALTH_BACKOFF_MAX:-1800}
-STARTUP_GRACE=${ARMWALL_HEALTH_STARTUP_GRACE:-15}
+STARTUP_GRACE=${ARMWALL_HEALTH_STARTUP_GRACE:-30}
+PROBE_CONNECT_TIMEOUT=${ARMWALL_HEALTH_CONNECT_TIMEOUT:-5}
+PROBE_MAX_TIME=${ARMWALL_HEALTH_PROBE_TIMEOUT:-12}
+PROBE_STAGGER=${ARMWALL_HEALTH_STAGGER:-0.2}
 RUN_DIR=""
 
 PIDS=""
@@ -134,10 +137,14 @@ health_round(){
     eval "skip_until=\${skip_$port:-0}"
     [ "$now" -ge "$skip_until" ] || continue
     (
-      code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 4 -m 6 -x "socks5h://127.0.0.1:$port" "$HEALTH_URL" 2>/dev/null || true)
+      code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_MAX_TIME" -x "socks5h://127.0.0.1:$port" "$HEALTH_URL" 2>/dev/null || true)
       printf '%s\n' "${code:-000}" > "$RUN_DIR/$port.code"
     ) &
     probe_pids="$probe_pids $!"
+    case "$PROBE_STAGGER" in
+      ''|0|0.0) ;;
+      *) sleep "$PROBE_STAGGER" 2>/dev/null || true;;
+    esac
   done
   # Wait only for the probes; a bare wait would also block on run_instance.
   for probe_pid in $probe_pids; do
