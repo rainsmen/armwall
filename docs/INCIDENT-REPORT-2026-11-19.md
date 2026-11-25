@@ -5,7 +5,7 @@
 > - `192.168.10.1`（ImmortalWrt `21.02-SNAPSHOT`，`luci-app-passwall` 4.68）  
 > - `192.168.10.233`（`armbian`，`aarch64`，`armwall 0.7.1-dev` + `sing-box 1.14.4`）  
 > - `192.168.10.217`（`onecloud`，`armv7l`，`armwall v0.7.0+dirty` + `sing-box 1.14.4`）  
-> **当前状态**：现场已止血恢复（`.233` 已关闭 DNS 劫持并切至可用配置、`.233` 上冗余的 `daed` 已卸载清理、路由器 `192.168.10.1` 已添加基于 MAC 的 IPv4/IPv6 直连放行规则）；仓库源码暂未修改，本文档记录待实施的代码根治方案。
+> **当前状态**：✅ 现场处置与代码根治方案**已全部落地并随 `v0.8.0` 发布验收**（2026-11-25 已在 `.217` 与 `.233` 真机验证通过）。
 
 ---
 
@@ -65,9 +65,9 @@
 
 ---
 
-## 四、待实施的代码根治方案（后续修改仓库）
+## 四、代码根治方案（✅ 已于 `v0.8.0` 全部落地并真机验收）
 
-### 1. 修复 `hijack-dns` 公共解析器排除规则（高优先级）
+### 1. 修复 `hijack-dns` 公共解析器排除规则（✅ 已完成）
 
 - **问题位置**：[`config.go`](../config.go#L535-L543) 与 [`config_test.go`](../config_test.go#L629-L662)。
 - **修改方案**：将扁平带 `invert: true` 的规则改为 `sing-box` 的 `logical`（`mode: "and"`）复合规则，仅对 `ip_cidr` 子规则取反，确保 `protocol: "dns"` 本身不被取反：
@@ -87,7 +87,7 @@
 - **已预验证语法**：已在 `.233` 使用 `sing-box check`（v1.14.4）确认该 `logical` `hijack-dns` 规则结构校验返回 `0`。
 - **测试补齐**：在 `config_test.go` 的 `TestConfigDNSHijackSkipsPublicResolvers` 中，断言生成规则为 `type: "logical"`、`mode: "and"`，且不能在顶层出现 `invert: true` + `protocol: "dns"`；如有条件可增加 `sing-box` 路由/规则匹配测试，确保非 DNS（如 `tls` / `www.google.com:443`）不会命中 `hijack-dns`。
 
-### 2. 扩充内置强制代理域名后缀 `defaultForceProxyDomainSuffixes`（中优先级）
+### 2. 扩充内置强制代理域名后缀 `defaultForceProxyDomainSuffixes`（✅ 已完成）
 
 - **问题位置**：[`config.go`](../config.go#L201-L210)（同时作用于 `route.rules` 与 `dns.rules`）。
 - **修改方案**：在 `defaultForceProxyDomainSuffixes` 中评估补充被 `geosite-cn` 收录但 Google Play / Android 连通性检查依赖的域名后缀：
@@ -96,6 +96,6 @@
   - `gstatic.com`（替代/扩展现有的 `www.gstatic.com`，覆盖 `connectivitycheck.gstatic.com` 等）
 - **注意点**：放开 `gstatic.com` / `googleapis.cn` 到强制代理后，所有子域名流量和解析都将走代理节点（若希望某地区特定服务直连需确认无副作用）；至少应先覆盖 `services.googleapis.cn`、`xn--ngstr-lra8j.com`、`connectivitycheck.gstatic.com`（或整个 `gstatic.com`）。
 
-### 3. 自动绕过代理节点自身地址（高优先级，延续 2026-11-17 遗留项）
+### 3. 自动绕过代理节点自身地址（✅ 已完成，延续 2026-11-17 遗留项）
 
 - 参见 [INCIDENT-REPORT-2026-11-17.md](INCIDENT-REPORT-2026-11-17.md#五后续待修改事项代码层面长期根治)：在 [`config.go`](../config.go) 生成 `route.rules` 时，遍历已启用节点的 `Server` 与 `ServerName`（区分 IP/CIDR 与域名），在 `final` 与代理规则之前自动插入高优先级 `direct` 绕过规则，从 ArmWall 侧彻底杜绝自回环。

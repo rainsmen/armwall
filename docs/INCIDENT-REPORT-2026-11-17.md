@@ -4,7 +4,8 @@
 > **受影响主机**：`192.168.10.217`（`onecloud`，Linux `6.12.28-current-meson`，`armv7l`）  
 > **涉及节点**：`wikih gost`（节点 ID：`sub-1794905429698841162`，`naive` 中转节点）  
 > **故障时间**：2026-11-17 16:50:32 ~ 16:58:15 CST  
-> **当前状态**：根因已定位；系统 FD 限制与探活参数已完成热修复并同步至仓库；`sing-box` 路由兜底规则待后续在源码中补齐。
+> **当前状态**：✅ 已彻底根治并随 `v0.8.0` 发布验收（系统 FD 限制、探活参数、`sing-box` 节点自绕过规则及 `armwall-sing-box.service` `LimitNOFILE=65535` 均已落地并在 `.217`/`.233` 验证通过）。  
+> **脱敏说明**：公开仓库中已对个人域名、节点 IP 与账号凭据脱敏。
 
 ---
 
@@ -23,7 +24,7 @@
 * **基础连通性实测**（从 `192.168.10.217` 直接测试）：
   * `hknat.<域名>` 解析为 IPv6 `<中转IPv6>`，`ping -6` 10 包 0% 丢包（平均 0.595 ms）。
   * `openssl s_client` 连 `hknat.<域名>:4441`（SNI `wikih.<域名>`）证书验证通过（`Verify return code: 0 (ok)`）。
-  * 直接通过 `socks5h://127.0.0.1:12010` 访问：`cp.cloudflare.com/generate_204` 5 并发全部返回 `204`（1.26s ~ 1.43s）；`www.google.com/generate_204` 10 次全部 `204`（1.31s ~ 1.91s）；DoH `1.1.1.1/dns-query`（2.46s）、`google.com`（2.15s）、`youtube.com`（2.01s）均返回 `200`；出口 IP 为 `<出口IPv4>` / `<出口IPv6>`。
+  * 直接通过 `socks5h://127.0.0.1:12010` 访问：`cp.cloudflare.com/generate_204` 5 并发全部返回 `204`（1.26s ~ 1.43s）；`www.google.com/generate_204` 10 次全部 `204`（1.31s ~ 1.91s）；DoH `1.1.1.1/dns-query`（2.46s）、`google.com`（2.15s）、`youtube.com`（2.01s）均返回 `200`；出口 IP 正常。
 
 ---
 
@@ -80,10 +81,9 @@
 
 ---
 
-## 五、后续待修改事项（代码层面长期根治）
+## 五、代码层面长期根治（✅ 已于 `v0.8.0` 落地验收）
 
-1. **`sing-box` 路由生成逻辑自动绕过代理节点自身地址（高优先级）**：
-   * 现状：[`config.go`](../config.go) 生成的 `route.rules` 在 `global` / `bypass_cn` 模式下未绕过节点自身服务器，一旦上游漏配、规则按域名未命中映射 IP（如 `wikih.<域名>` 映射至 `<中转IPv6>`）或局域网终端直连 `192.168.10.217:11080`，仍存在自回环风险。
-   * 后续方案：在 [`config.go`](../config.go) 生成 `route.rules` 时，遍历 `s.Nodes` 中所有已启用节点，提取 `Server` 与 `ServerName`（区分 IP CIDR 与域名），在 `final` 与代理规则之前自动插入高优先级 `direct` 绕过规则（并避免影响 `dns-in` / `sniff`）。
-2. **`armwall-sing-box.service` 文件描述符限制评估（低优先级）**：
-   * 评估在 [`armwall-sing-box.service`](../armwall-sing-box.service) 中同样显式声明 `LimitNOFILE=65535`，避免高并发连接时受限于 systemd 默认值。
+1. **`sing-box` 路由生成逻辑自动绕过代理节点自身地址（✅ 已完成）**：
+   * 在 [`config.go`](../config.go) 生成 `route.rules` 与 `dns.rules` 时，自动遍历所有已启用节点，提取公网 IP CIDR、服务器域名及 NaiveProxy 真实 SNI（排除 Reality / 第三方伪装 SNI），在 `ip_is_private` 之后插入 `direct` 绕过规则与 `direct-dns` 解析规则。
+2. **`armwall-sing-box.service` 文件描述符限制（✅ 已完成）**：
+   * 已在 [`armwall-sing-box.service`](../armwall-sing-box.service) 显式声明 `LimitNOFILE=65535`，并在 `.217` 与 `.233` 实测 `/proc/<pid>/limits` 生效。

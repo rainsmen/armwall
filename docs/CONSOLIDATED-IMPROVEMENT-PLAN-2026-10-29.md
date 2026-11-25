@@ -327,7 +327,7 @@ flowchart TD
 | **ISSUE-26** | 最新复评 P1-4 | 工作区打包发布产物滞后过期 | **P1** | ✅ **已修复** | 重新执行 `make release` 生成同步包与校验和，解包校验比对 100% 一致。 |
 | **ISSUE-27** | 最新复评 P1-5 | `install.sh` 依赖列表遗漏 `readelf` | **P1** | ✅ **已修复** | 安装脚本依赖列表中补充 `binutils` 与 `readelf` 命令检查。 |
 | **ISSUE-28** | 最新复评 P2-1 | 路由规则中 `action: sniff` 顺序倒置 | **P2** | ✅ **已修复** | 将嗅探规则调整至协议规则之前；真机 sing-box 生成规则验证确认首位。 |
-| **ISSUE-29** | 2026-10-29 实战复盘 | 缺乏后台自动故障转移与链路熔断切流机制 | **P1** | 📋 **下版本规划** | 建立独立后台探活协程（Goroutine），主节点不可用时自动熔断并切换至设置的备用节点（详见提案文档 [`docs/PROPOSAL-BACKGROUND-FAILOVER.md`](PROPOSAL-BACKGROUND-FAILOVER.md)）。 |
+| **ISSUE-29** | 2026-10-29 实战复盘 | 缺乏后台自动故障转移与链路熔断切流机制 | **P1** | ✅ **已修复（v0.8.0）** | 已实现全局有序多级故障转移（主 → 备 1 → 备 2…）、托管 `failover-auto` Clash API 零重启热切与 `auto_failback` 开关，并在 `.217`/`.233` 真机验收（详见 [`docs/PROPOSAL-BACKGROUND-FAILOVER.md`](PROPOSAL-BACKGROUND-FAILOVER.md)）。 |
 | **ISSUE-30** | 2026-10-31 复评 | 规则内容未变化仍重启 sing-box | **P1** | ✅ **已修复** | 见 4.10 节。 |
 | **ISSUE-31** | 2026-10-31 复评 | naive supervisor `pkill -f` 误杀无关进程、停止需 90 秒超时 | **P1** | ✅ **已修复** | 见 4.10 节。 |
 | **ISSUE-32** | 2026-10-31 复评 | 健康检查串行探测、宕机节点无限重启 | **P2** | ✅ **已修复** | 见 4.10 节。 |
@@ -411,4 +411,4 @@ flowchart TD
 1. **多配置跨资源事务日志与崩溃恢复（ISSUE-05）**：建立更完善的跨进程崩溃恢复日志。
 2. **数据存储增量写入（P2-7）**：将 SQLite 全量清空写入优化为差量 Upsert，进一步降低大节点量下的写入磨损。
 3. **多架构与真实网络命名空间自动化矩阵（ISSUE-08）**：在 CI 中构建轻量 Network Namespace 仿真环境，验证 nftables 与策略路由完整生命周期。
-4. **后台自动故障转移与链路熔断机制（ISSUE-29）**：在后台建立独立的定时探活协程（Goroutine），当主选节点不可用时自动触发熔断并切换至设置的备用节点，并在主节点恢复后支持平滑回切（详见提案文档 [`docs/PROPOSAL-BACKGROUND-FAILOVER.md`](PROPOSAL-BACKGROUND-FAILOVER.md)）。
+4. **后台自动故障转移与链路熔断机制（ISSUE-29，✅ 已于 v0.8.0 落地）**：已在 [`failover.go`](../failover.go) 实现后台探活协程、有序多级备选热切与可选自动回切，并完成真机验收（详见 [`docs/PROPOSAL-BACKGROUND-FAILOVER.md`](PROPOSAL-BACKGROUND-FAILOVER.md)）。

@@ -2,10 +2,18 @@
 
 ## Supported Versions
 
+Security fixes are released on the latest minor version series.
+
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.3.x   | :white_check_mark: |
-| < 0.3.0 | :x:                |
+| 0.8.x   | :white_check_mark: |
+| < 0.8.0 | :x:                |
+
+## Built-in Security Boundaries
+
+- Web management defaults to private LAN access (`ARMWALL_WEB_ACCESS=lan`) with strict CIDR allowlists, constant-time Bearer Token verification, per-IP rate limiting, and strict CSP (`default-src 'self'`).
+- Core updates and installations enforce HTTPS (including redirects), SHA256 checksum verification, ELF architecture checks, and safe archive extraction.
+- Sensitive node credentials are masked on `/api/state` and stored in SQLite / `/etc/armwall/armwall.env` with restrictive file permissions (`0600`).
 
 ## Reporting a Vulnerability
 
