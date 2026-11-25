@@ -186,7 +186,7 @@ func apiNode(w http.ResponseWriter, r *http.Request, s Store) {
 	} else {
 		n.ID = strings.TrimSpace(n.ID)
 		lowerID := strings.ToLower(n.ID)
-		if lowerID == "direct" || lowerID == "block" || lowerID == "dns-in" || lowerID == "tproxy-in" || strings.HasPrefix(lowerID, "tproxy-mac-") {
+		if lowerID == "direct" || lowerID == "block" || lowerID == failoverOutboundTag || lowerID == "dns-in" || lowerID == "tproxy-in" || strings.HasPrefix(lowerID, "tproxy-mac-") {
 			http.Error(w, "reserved node id", 400)
 			return
 		}
@@ -492,6 +492,7 @@ func apiNodeSelect(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	defaultFailover.notify()
 	json.NewEncoder(w).Encode(s)
 }
 
@@ -537,9 +538,16 @@ func runSingleNodeTest(n Node, method, customURL string) (int64, error) {
 		if strings.HasPrefix(host, "-") {
 			return 0, fmt.Errorf("invalid host")
 		}
-		out, err := runCommandTimeout(3*time.Second, "ping", "-c", "1", "-W", "2", host)
+		out, err := runCommandTimeout(5*time.Second, "ping", "-n", "-c", "3", "-W", "2", host)
 		if err != nil {
-			return 0, fmt.Errorf("ping failed: %s", strings.TrimSpace(string(out)))
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			return 0, fmt.Errorf("ping failed: %s", msg)
+		}
+		if avg, ok := parsePingAvgMS(string(out)); ok {
+			return avg, nil
 		}
 		return time.Since(start).Milliseconds(), nil
 	case "tcp":
@@ -568,4 +576,32 @@ func runSingleNodeTest(n Node, method, customURL string) (int64, error) {
 	default:
 		return 0, fmt.Errorf("invalid method")
 	}
+}
+
+func parsePingAvgMS(output string) (int64, bool) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		idx := strings.Index(line, "=")
+		if idx < 0 || (!strings.Contains(line, "min/avg/max") && !strings.Contains(line, "rtt ")) {
+			continue
+		}
+		fields := strings.Fields(strings.TrimSpace(line[idx+1:]))
+		if len(fields) == 0 {
+			continue
+		}
+		parts := strings.Split(fields[0], "/")
+		if len(parts) < 2 {
+			continue
+		}
+		avg, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil || avg < 0 {
+			continue
+		}
+		ms := int64(avg + 0.5)
+		if ms == 0 && avg > 0 {
+			ms = 1
+		}
+		return ms, true
+	}
+	return 0, false
 }

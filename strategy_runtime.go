@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -93,11 +94,22 @@ func strategyRuntimeStatuses(s Store) []strategyRuntimeStatus {
 }
 
 func clashDelay(tag, testURL string) (int64, error) {
+	return clashDelayTimeout(tag, testURL, 10*time.Second)
+}
+
+func clashDelayTimeout(tag, testURL string, timeout time.Duration) (int64, error) {
 	if testURL == "" {
 		testURL = "https://www.gstatic.com/generate_204"
 	}
-	endpoint := clashAPIBase + "/proxies/" + url.PathEscape(tag) + "/delay?url=" + url.QueryEscape(testURL) + "&timeout=10000"
-	client := &http.Client{Timeout: 12 * time.Second}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	timeoutMS := timeout.Milliseconds()
+	if timeoutMS < 1000 {
+		timeoutMS = 1000
+	}
+	endpoint := fmt.Sprintf("%s/proxies/%s/delay?url=%s&timeout=%d", clashAPIBase, url.PathEscape(tag), url.QueryEscape(testURL), timeoutMS)
+	client := &http.Client{Timeout: timeout + 2*time.Second}
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return 0, err
@@ -127,4 +139,50 @@ func clashDelay(tag, testURL string) (int64, error) {
 		return 0, fmt.Errorf("urltest returned no delay")
 	}
 	return result.MS, nil
+}
+
+func clashProxyNow(tag string) (string, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := clashRequest(http.MethodGet, "/proxies/"+url.PathEscape(tag))
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("clash proxy lookup failed: %d", resp.StatusCode)
+	}
+	var info clashProxyInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return "", err
+	}
+	return info.Now, nil
+}
+
+func clashSelectProxy(groupTag, targetTag string) error {
+	body, err := json.Marshal(map[string]string{"name": targetTag})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPut, clashAPIBase+"/proxies/"+url.PathEscape(groupTag), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if secret := currentClashAPISecret(); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("clash select proxy failed: %d", resp.StatusCode)
+	}
+	return nil
 }

@@ -31,6 +31,7 @@ function renderState() {
     `mixed SOCKS5 / HTTP · ${appState.proxy_port || 11080}`;
   $("logLevel").value = appState.log_level || "info";
   renderNodeSelector();
+  renderFailover();
   renderNodeFilters();
   renderNodes();
   renderSubscriptions();
@@ -103,10 +104,17 @@ function renderNodes() {
           delay = `<span class="pill ${color}">${methodLabel}${measured}ms</span>`;
         }
       }
+      const failoverActiveBackup =
+        failoverRuntime?.managing &&
+        failoverRuntime.active_node_id &&
+        failoverRuntime.active_node_id !== failoverRuntime.primary_node_id &&
+        node.id === failoverRuntime.active_node_id;
       const selected =
         node.id === appState.selected_node
           ? '<span class="pill green">当前</span>'
-          : "";
+          : failoverActiveBackup
+            ? '<span class="pill yellow">当前(备用)</span>'
+            : "";
       const checked = selectedNodes.has(node.id) ? " checked" : "";
       const handle = sorted
         ? `<span class="drag-handle disabled"${moveTitle}>⋮⋮</span>`
@@ -121,7 +129,7 @@ function renderNodes() {
       <td><div>${escapeHTML(node.server || "-")}</div><div class="node-server">端口 ${escapeHTML(node.port || "-")}</div></td>
       <td><button class="small-btn" data-action="toggle-node" data-id="${escapeHTML(node.id)}">${node.enabled ? "已启用" : "已停用"}</button></td>
       <td class="delay">${delay}</td>
-      <td><div class="row-actions"><button class="small-btn" data-action="test-node" data-method="ping" data-id="${escapeHTML(node.id)}">Ping</button><button class="small-btn" data-action="test-node" data-method="tcp" data-id="${escapeHTML(node.id)}">TCP</button><button class="small-btn" data-action="test-node" data-method="urltest" data-id="${escapeHTML(node.id)}">URLTest</button><button class="small-btn" data-action="edit-node" data-id="${escapeHTML(node.id)}">编辑</button><button class="small-btn" data-action="copy-node" data-id="${escapeHTML(node.id)}">复制</button><button class="small-btn" data-action="move-node" data-direction="-1" data-id="${escapeHTML(node.id)}"${moveDisabled}${moveTitle}>上移</button><button class="small-btn" data-action="move-node" data-direction="1" data-id="${escapeHTML(node.id)}"${moveDisabled}${moveTitle}>下移</button><button class="small-btn danger" data-action="delete-node" data-id="${escapeHTML(node.id)}">删除</button></div></td>
+      <td><div class="row-actions"><button class="small-btn" data-action="test-node" data-method="ping" data-id="${escapeHTML(node.id)}" title="测试 Ping 平均延迟；注意境外节点可能由上游路由器代答，建议优先用 TCP 或 URLTest">Ping</button><button class="small-btn" data-action="test-node" data-method="tcp" data-id="${escapeHTML(node.id)}">TCP</button><button class="small-btn" data-action="test-node" data-method="urltest" data-id="${escapeHTML(node.id)}">URLTest</button><button class="small-btn" data-action="edit-node" data-id="${escapeHTML(node.id)}">编辑</button><button class="small-btn" data-action="copy-node" data-id="${escapeHTML(node.id)}">复制</button><button class="small-btn" data-action="move-node" data-direction="-1" data-id="${escapeHTML(node.id)}"${moveDisabled}${moveTitle}>上移</button><button class="small-btn" data-action="move-node" data-direction="1" data-id="${escapeHTML(node.id)}"${moveDisabled}${moveTitle}>下移</button><button class="small-btn danger" data-action="delete-node" data-id="${escapeHTML(node.id)}">删除</button></div></td>
     </tr>`;
     })
     .join("");
@@ -330,4 +338,188 @@ function renderSites() {
       { once: true },
     );
   });
+}
+
+function nodeLabelByID(id) {
+  if (!id) return "-";
+  const node = (appState.nodes || []).find((item) => item.id === id);
+  return node ? `${node.name || "未命名"} [${node.type}]` : id;
+}
+
+function renderFailover() {
+  const cfg = appState.failover || {};
+  $("failoverEnabled").checked = Boolean(cfg.enabled);
+  $("failoverAutoFailback").checked = cfg.auto_failback !== false;
+  $("failoverInterval").value = cfg.check_interval_sec || 30;
+  $("failoverFailureThreshold").value = cfg.failure_threshold || 3;
+  $("failoverRecoveryThreshold").value = cfg.recovery_threshold || 2;
+  $("failoverTestURL").value =
+    cfg.test_url || "https://www.gstatic.com/generate_204";
+  const existing = new Set((appState.nodes || []).map((n) => n.id));
+  failoverDraftBackups = (cfg.backup_node_ids || []).filter((id) =>
+    existing.has(id),
+  );
+  renderFailoverBackupList();
+  renderFailoverStatus();
+}
+
+function renderFailoverBackupList() {
+  const enabledNodes = (appState.nodes || []).filter((n) => n.enabled);
+  const chosen = new Set(failoverDraftBackups);
+  const addSelect = $("failoverBackupAdd");
+  const candidates = enabledNodes.filter((n) => !chosen.has(n.id));
+  addSelect.innerHTML = candidates.length
+    ? candidates
+        .map(
+          (node) =>
+            `<option value="${escapeHTML(node.id)}">${escapeHTML(node.name || "未命名")} [${escapeHTML(node.type)}]</option>`,
+        )
+        .join("")
+    : '<option value="">无更多可选节点</option>';
+  addSelect.disabled = candidates.length === 0;
+
+  const list = $("failoverBackupList");
+  if (!failoverDraftBackups.length) {
+    list.innerHTML =
+      '<div class="empty">尚未添加备用节点（启用故障转移前请至少添加 1 个）</div>';
+    return;
+  }
+  const byID = new Map((appState.nodes || []).map((n) => [n.id, n]));
+  list.innerHTML = failoverDraftBackups
+    .map((id, index) => {
+      const node = byID.get(id);
+      const name = node ? node.name || "未命名" : id;
+      const meta = node
+        ? `${node.type}${node.enabled ? "" : " · 已停用"}`
+        : "节点不存在";
+      const upDisabled = index === 0 ? " disabled" : "";
+      const downDisabled =
+        index === failoverDraftBackups.length - 1 ? " disabled" : "";
+      return `<div class="failover-backup-row" data-backup-index="${index}">
+        <div class="failover-backup-info">
+          <span class="pill">备用 ${index + 1}</span>
+          <div>
+            <div class="node-title">${escapeHTML(name)}</div>
+            <div class="node-server">${escapeHTML(meta)}</div>
+          </div>
+        </div>
+        <div class="row-actions">
+          <button class="small-btn" type="button" data-action="move-failover-backup" data-id="${escapeHTML(id)}" data-direction="-1"${upDisabled}>上移</button>
+          <button class="small-btn" type="button" data-action="move-failover-backup" data-id="${escapeHTML(id)}" data-direction="1"${downDisabled}>下移</button>
+          <button class="small-btn danger" type="button" data-action="remove-failover-backup" data-id="${escapeHTML(id)}">移除</button>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+function renderFailoverStatus() {
+  const st = failoverRuntime;
+  const badge = $("failoverBadge");
+  const summary = $("failoverSummary");
+  const banner = $("failoverBanner");
+  const failbackBtn = $("failoverFailbackBtn");
+  const eventsWrap = $("failoverEventsWrap");
+  const eventsList = $("failoverEvents");
+
+  if (!st || !st.enabled) {
+    badge.className = "pill";
+    badge.textContent = "未启用";
+    summary.textContent = "未启用自动故障转移";
+    banner.hidden = true;
+    banner.innerHTML = "";
+    failbackBtn.hidden = true;
+    eventsWrap.hidden = true;
+    return;
+  }
+
+  const badgeMap = {
+    healthy: ["green", "监控正常"],
+    degraded: ["yellow", "主节点异常"],
+    failed_over: ["yellow", "已切至备用"],
+    all_down: ["red", "全部不可用"],
+    inactive: ["", "未接管"],
+    stopped: ["", "服务已停止"],
+    disabled: ["", "未启用"],
+  };
+  const [color, label] = badgeMap[st.state] || ["", st.state || "未知"];
+  badge.className = color ? `pill ${color}` : "pill";
+  badge.textContent = label;
+
+  const isFailedOver =
+    st.managing &&
+    st.active_node_id &&
+    st.primary_node_id &&
+    st.active_node_id !== st.primary_node_id;
+  failbackBtn.hidden = !isFailedOver;
+
+  if (!st.managing) {
+    summary.textContent = st.inactive_reason || "当前未接管默认出站";
+    banner.hidden = true;
+    banner.innerHTML = "";
+  } else {
+    const parts = [
+      `原主节点：${nodeLabelByID(st.primary_node_id)}`,
+      `当前生效：${nodeLabelByID(st.active_node_id)}${st.last_active_delay_ms > 0 ? ` (${st.last_active_delay_ms}ms)` : ""}`,
+    ];
+    if (st.consecutive_failures > 0) {
+      parts.push(
+        `连续失败：${st.consecutive_failures}/${st.failure_threshold || 3}`,
+      );
+    }
+    if (isFailedOver) {
+      if (st.auto_failback) {
+        parts.push(
+          `主节点恢复探测：${st.primary_recovery_count || 0}/${st.recovery_threshold || 2}`,
+        );
+      } else {
+        parts.push("自动切回：已关闭");
+      }
+    }
+    if (st.last_check_at && !String(st.last_check_at).startsWith("0001-")) {
+      parts.push(`最近检查：${formatDate(st.last_check_at)}`);
+    }
+    if (st.last_error) {
+      parts.push(`最近错误：${st.last_error}`);
+    }
+    summary.textContent = parts.join(" · ");
+
+    if (isFailedOver) {
+      banner.hidden = false;
+      banner.className = "failover-banner";
+      banner.innerHTML = `<span><strong>故障转移生效中：</strong>原主节点「${escapeHTML(nodeLabelByID(st.primary_node_id))}」不可用，当前实际流量已热切至备用节点「${escapeHTML(nodeLabelByID(st.active_node_id))}」${st.auto_failback ? "（持续探活原主节点中）" : "（已关闭自动回切）"}</span><button class="small-btn" type="button" data-action="failover-failback">立即切回主节点</button>`;
+    } else if (st.state === "all_down") {
+      banner.hidden = false;
+      banner.className = "failover-banner danger";
+      banner.innerHTML = `<span><strong>故障转移告警：</strong>主节点及全部备用节点探测失败，当前停留在「${escapeHTML(nodeLabelByID(st.active_node_id))}」等待网络恢复。</span>`;
+    } else {
+      banner.hidden = true;
+      banner.innerHTML = "";
+    }
+  }
+
+  const events = Array.isArray(st.events) ? [...st.events].reverse() : [];
+  if (events.length) {
+    eventsWrap.hidden = false;
+    eventsList.innerHTML = events
+      .slice(0, 8)
+      .map(
+        (ev) =>
+          `<li><span class="failover-event-time">${escapeHTML(formatDate(ev.time))}</span><span>${escapeHTML(ev.message)}</span></li>`,
+      )
+      .join("");
+  } else {
+    eventsWrap.hidden = true;
+    eventsList.innerHTML = "";
+  }
+}
+
+async function loadFailoverStatus(background = false) {
+  try {
+    failoverRuntime = await request("/api/failover/status", { background });
+    renderFailoverStatus();
+    if (activeViewID() === "nodes") renderNodes();
+  } catch (error) {
+    if (!background) toast(error.message, true);
+  }
 }

@@ -289,8 +289,8 @@ func TestConfigACLAndDNS(t *testing.T) {
 		if outbound["tag"] == "direct" && outbound["domain_resolver"] != "direct-dns" {
 			t.Fatalf("direct outbound must resolve through the domestic resolver: %+v", outbound)
 		}
-		if outbound["tag"] == "n1" && outbound["domain_resolver"] != "remote-dns" {
-			t.Fatalf("proxy outbound must resolve through the remote resolver: %+v", outbound)
+		if outbound["tag"] == "n1" && outbound["domain_resolver"] != "direct-dns" {
+			t.Fatalf("proxy outbound must resolve its own server through direct-dns to avoid failover DNS deadlocks: %+v", outbound)
 		}
 	}
 	rules := route["rules"].([]any)
@@ -442,7 +442,7 @@ func TestRouteRulesHaveSniffing(t *testing.T) {
 			if rule["action"] == "sniff" {
 				sniffIdx = idx
 			}
-			if rule["protocol"] == "dns" {
+			if rule["action"] == "hijack-dns" && rule["type"] == "logical" {
 				dnsProtoIdx = idx
 			}
 		}
@@ -507,8 +507,8 @@ func TestConfigAlwaysEmitsDNSResolver(t *testing.T) {
 	if resolvers["direct"] != "direct-dns" {
 		t.Fatalf("direct resolver=%q", resolvers["direct"])
 	}
-	if resolvers["n1"] != "remote-dns" {
-		t.Fatalf("proxy resolver=%q", resolvers["n1"])
+	if resolvers["n1"] != "direct-dns" {
+		t.Fatalf("proxy resolver=%q, want direct-dns", resolvers["n1"])
 	}
 }
 
@@ -632,16 +632,34 @@ func TestConfigDNSHijackSkipsPublicResolvers(t *testing.T) {
 	hijackIndex := -1
 	for i, raw := range rules {
 		rule := raw.(map[string]any)
-		if rule["action"] != "hijack-dns" || rule["protocol"] != "dns" {
+		if rule["action"] != "hijack-dns" {
+			continue
+		}
+		if rule["protocol"] == "dns" && rule["invert"] == true {
+			t.Fatalf("top-level invert with protocol=dns hijacks all non-DNS traffic: %+v", rule)
+		}
+		if rule["type"] != "logical" {
 			continue
 		}
 		hijackIndex = i
-		if inverted, isBool := rule["invert"].(bool); !isBool || !inverted {
-			t.Fatalf("the protocol hijack rule must invert the public resolver list: %+v", rule)
+		if rule["mode"] != "and" {
+			t.Fatalf("logical hijack rule must use mode=and: %+v", rule)
 		}
-		cidrs, isList := rule["ip_cidr"].([]string)
+		subRules, ok := rule["rules"].([]any)
+		if !ok || len(subRules) != 2 {
+			t.Fatalf("unexpected logical hijack sub-rules: %+v", rule)
+		}
+		first := subRules[0].(map[string]any)
+		second := subRules[1].(map[string]any)
+		if first["protocol"] != "dns" || first["invert"] != nil {
+			t.Fatalf("first sub-rule must match protocol=dns without invert: %+v", first)
+		}
+		if inverted, isBool := second["invert"].(bool); !isBool || !inverted {
+			t.Fatalf("second sub-rule must invert the public resolver list: %+v", second)
+		}
+		cidrs, isList := second["ip_cidr"].([]string)
 		if !isList {
-			t.Fatalf("the protocol hijack rule needs the resolver list: %+v", rule)
+			t.Fatalf("second sub-rule needs the resolver list: %+v", second)
 		}
 		found := false
 		for _, cidr := range cidrs {
@@ -654,9 +672,74 @@ func TestConfigDNSHijackSkipsPublicResolvers(t *testing.T) {
 		}
 	}
 	if hijackIndex < 0 {
-		t.Fatalf("missing protocol dns hijack rule: %+v", rules)
+		t.Fatalf("missing logical protocol dns hijack rule: %+v", rules)
 	}
 	if hijackIndex < 2 {
 		t.Fatalf("the dns-in hijack rule must stay first: %d", hijackIndex)
+	}
+}
+
+func TestConfigBypassesProxyNodeAddressesAndIncludesPlayDomains(t *testing.T) {
+	s := Store{
+		Mode:         "global",
+		SelectedNode: "n1",
+		Nodes: []Node{
+			{ID: "n1", Name: "relay", Type: "naive", Server: "relay.example.com", Port: 4435, ServerName: "origin.example.com", Username: "u", Password: "p", Enabled: true},
+			{ID: "n2", Name: "ip4", Type: "anytls", Server: "203.0.113.10", Port: 443, Password: "pw", TLS: true, Enabled: true},
+			{ID: "n3", Name: "ip6", Type: "anytls", Server: "2001:db8::9", Port: 443, Password: "pw", TLS: true, Enabled: true},
+			{ID: "n4", Name: "reality", Type: "vless", Server: "vps.example.com", Port: 443, UUID: "11111111-1111-1111-1111-111111111111", TLS: true, ServerName: "www.apple.com", RealityPublicKey: "pub", Enabled: true},
+			{ID: "n4b", Name: "spoofed-anytls", Type: "anytls", Server: "anytls.example.com", Port: 443, Password: "pw", TLS: true, Insecure: true, ServerName: "cdn.thirdparty.example", Enabled: true},
+			{ID: "n5", Name: "disabled", Type: "anytls", Server: "disabled.example.com", Port: 443, Password: "pw", TLS: true, Enabled: false},
+		},
+	}
+	generated := config(s)
+	rules := generated["route"].(map[string]any)["rules"].([]any)
+	var bypassDomains, bypassCIDRs []string
+	var forceSuffixes []string
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		if rule["outbound"] == "direct" {
+			if d, ok := rule["domain"].([]string); ok {
+				bypassDomains = d
+			}
+			if c, ok := rule["ip_cidr"].([]string); ok {
+				bypassCIDRs = c
+			}
+		}
+		if d, ok := rule["domain_suffix"].([]string); ok {
+			forceSuffixes = d
+		}
+	}
+	for _, want := range []string{"origin.example.com", "relay.example.com", "vps.example.com"} {
+		found := false
+		for _, got := range bypassDomains {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing node bypass domain %q in %v", want, bypassDomains)
+		}
+	}
+	for _, forbidden := range []string{"www.apple.com", "cdn.thirdparty.example", "disabled.example.com"} {
+		for _, got := range bypassDomains {
+			if got == forbidden {
+				t.Fatalf("domain %q must not be bypassed: %v", forbidden, bypassDomains)
+			}
+		}
+	}
+	if len(bypassCIDRs) != 2 || bypassCIDRs[0] != "2001:db8::9/128" || bypassCIDRs[1] != "203.0.113.10/32" {
+		t.Fatalf("unexpected bypass CIDRs: %v", bypassCIDRs)
+	}
+	for _, want := range []string{"googleapis.cn", "xn--ngstr-lra8j.com", "connectivitycheck.gstatic.com"} {
+		found := false
+		for _, got := range forceSuffixes {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing built-in force proxy suffix %q in %v", want, forceSuffixes)
+		}
 	}
 }

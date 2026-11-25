@@ -326,3 +326,32 @@ function dnsPayload() {
     fake_ip: mode === "fakeip",
   };
 }
+
+function saveFailover(event) {
+  return guardForm(event, () => saveFailoverSubmit());
+}
+
+async function saveFailoverSubmit() {
+  const payload = {
+    enabled: $("failoverEnabled").checked,
+    auto_failback: $("failoverAutoFailback").checked,
+    check_interval_sec: Number($("failoverInterval").value),
+    failure_threshold: Number($("failoverFailureThreshold").value),
+    recovery_threshold: Number($("failoverRecoveryThreshold").value),
+    test_url: $("failoverTestURL").value.trim(),
+    backup_node_ids: [...failoverDraftBackups],
+  };
+  try {
+    const res = await request("/api/failover", {
+      method: "POST",
+      body: payload,
+    });
+    if (res && res.status) {
+      failoverRuntime = res.status;
+    }
+    toast("故障转移设置已保存");
+    await loadState(false);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}

@@ -336,6 +336,10 @@ func newHTTPServer(config webAccessConfig, token string, staticFS fs.FS) (*http.
 	}))
 	if staticFS != nil {
 		mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/") {
+				http.NotFound(w, r)
+				return
+			}
 			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 			http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))).ServeHTTP(w, r)
 		}))

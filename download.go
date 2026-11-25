@@ -16,6 +16,16 @@ func httpsURL(raw string) bool {
 	return err == nil && u.Scheme == "https" && u.Hostname() != ""
 }
 
+func enforceHTTPSRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	if req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") {
+		return fmt.Errorf("redirect URL must use https")
+	}
+	return nil
+}
+
 func outboundHTTPClients(timeout time.Duration) []*http.Client {
 	clients := make([]*http.Client, 0, 2)
 	address := fmt.Sprintf("127.0.0.1:%d", getProxyPort())
@@ -23,11 +33,11 @@ func outboundHTTPClients(timeout time.Duration) []*http.Client {
 		_ = conn.Close()
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.Proxy = http.ProxyURL(&url.URL{Scheme: "socks5", Host: address})
-		clients = append(clients, &http.Client{Transport: transport, Timeout: timeout})
+		clients = append(clients, &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: enforceHTTPSRedirect})
 	}
 	direct := http.DefaultTransport.(*http.Transport).Clone()
 	direct.Proxy = nil
-	return append(clients, &http.Client{Transport: direct, Timeout: timeout})
+	return append(clients, &http.Client{Transport: direct, Timeout: timeout, CheckRedirect: enforceHTTPSRedirect})
 }
 
 func downloadResource(raw string, limit int64, timeout time.Duration) ([]byte, error) {

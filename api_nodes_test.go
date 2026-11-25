@@ -177,3 +177,19 @@ func TestBatchNodeTestAndCredentialMasking(t *testing.T) {
 		t.Fatalf("expected preserved password, got: %+v", saved.Nodes[0])
 	}
 }
+
+func TestParsePingAvgMS(t *testing.T) {
+	sample := "PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.\n3 packets transmitted, 3 received, 0% packet loss, time 2003ms\nrtt min/avg/max/mdev = 14.123/18.650/24.900/4.512 ms\n"
+	avg, ok := parsePingAvgMS(sample)
+	if !ok || avg != 19 {
+		t.Fatalf("avg=%d ok=%v want 19, true", avg, ok)
+	}
+	subMS := "round-trip min/avg/max = 0.2/0.4/0.6 ms\n"
+	avg, ok = parsePingAvgMS(subMS)
+	if !ok || avg != 1 {
+		t.Fatalf("sub-ms avg=%d ok=%v want 1, true", avg, ok)
+	}
+	if _, ok := parsePingAvgMS("no stats here"); ok {
+		t.Fatal("expected parse failure for missing stats")
+	}
+}

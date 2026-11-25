@@ -4,7 +4,16 @@ All notable changes to ArmWall will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Background automatic failover with ordered backups and optional auto-failback** (`POST /api/failover`, `GET /api/failover/status`, `POST /api/failover/check`, `POST /api/failover/failback`, Dashboard「自动故障转移」面板): periodically probes the active node via Clash API URLTest, hot-switches zero-downtime through a managed `failover-auto` selector (`Primary -> Backup 1 -> Backup 2 -> ...`) after consecutive failures, skips unreachable backups, keeps probing the original primary node when `auto_failback` is enabled, and smoothly switches back after consecutive recovery successes.
+- **Automatic proxy node bypass rules**: `config()` inserts `direct` rules (and `direct-dns` DNS rules) for enabled nodes' public server IPs/hostnames (plus NaiveProxy relay SNIs, excluding Reality / third-party spoofed SNIs) to prevent self-loop storms in `global` and `bypass_cn` modes.
+
 ### Fixed
+- **DNS hijack rule inverted all non-DNS traffic**: changed `{"protocol": "dns", "ip_cidr": ..., "invert": true, "action": "hijack-dns"}` to a `logical` `and` rule so only `ip_cidr` is inverted, preventing normal HTTPS/TCP connections from hanging when `dns.hijack` is enabled.
+- **Proxy outbound `domain_resolver` deadlock during failover**: proxy outbounds now resolve their own upstream server hostname via `direct-dns` (while `route.default_domain_resolver` and `dns.final` remain `remote-dns`), preventing backup node probing/dialing from deadlocking on `remote-dns` when the primary node fails.
+- **Expanded built-in forced-proxy Google Play domains**: added `googleapis.cn`, `xn--ngstr-lra8j.com`, and `connectivitycheck.gstatic.com` to `defaultForceProxyDomainSuffixes`.
+- **Node ping test**: added `-n` (disable reverse PTR lookup), send 3 packets with a 5-second timeout, and parse average RTT from ping output; added UI tooltip noting upstream routers may answer ICMP directly.
+- **Static directory listing & HTTPS redirect hardening**: blocked `/static/` directory listing paths ending with `/` (404), enforced HTTPS on download redirects, passed `ARMWALL_PROXY_PORT` to `armwall-update-core` in `install.sh`, and set `LimitNOFILE=65535` on `armwall-sing-box.service`.
 - **NaiveProxy relay nodes failed with `ERR_PROXY_CERTIFICATE_INVALID`.** A naive node whose TLS SNI differs from its server address (for example a share link `naive+https://user:pass@relay.example:4435?sni=origin.example`) had the SNI stored but dropped when the NaiveProxy client config was generated, so the client connected with the relay hostname as SNI and rejected the certificate. The proxy URL now uses the SNI and a `host-resolver-rules` entry (`MAP <sni> <server>`) sends the connection to the server address, the same as mobile clients. Ping and TCP tests passed while URL tests failed, because only the URL test goes through TLS.
 - The 「跳过证书验证」 flag had no effect on NaiveProxy nodes: neither the naive client nor sing-box's naive outbound can skip certificate verification. The checkbox is now disabled for NaiveProxy with an explanation; adding or editing a NaiveProxy node with the flag is rejected; share-link import, subscription refresh and backup restore clear the flag (link import reports how many were cleared).
 

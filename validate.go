@@ -140,6 +140,9 @@ func validateStrategyGroup(group *StrategyGroup, s Store) error {
 	if group.Name == "" || (group.Type != "selector" && group.Type != "urltest") {
 		return fmt.Errorf("strategy name and valid type are required")
 	}
+	if group.ID == failoverOutboundTag {
+		return fmt.Errorf("reserved strategy id")
+	}
 	existing := make(map[string]bool, len(s.Nodes))
 	for _, node := range s.Nodes {
 		existing[node.ID] = true
@@ -386,6 +389,97 @@ func validateDNSSettings(settings *DNSSettings) error {
 	}
 	if settings.FakeIP {
 		settings.Hijack = true
+	}
+	return nil
+}
+
+func normalizeFailoverSettings(cfg *FailoverSettings, existingNodes map[string]bool) {
+	ensureDefaultBool(&cfg.AutoFailback, true)
+	if cfg.CheckIntervalSec <= 0 {
+		cfg.CheckIntervalSec = defaultFailoverIntervalSec
+	}
+	if cfg.FailureThreshold <= 0 {
+		cfg.FailureThreshold = defaultFailoverFailureThreshold
+	}
+	if cfg.RecoveryThreshold <= 0 {
+		cfg.RecoveryThreshold = defaultFailoverRecoveryThreshold
+	}
+	cfg.TestURL = strings.TrimSpace(cfg.TestURL)
+	if cfg.TestURL == "" {
+		cfg.TestURL = defaultFailoverTestURL
+	}
+	kept := make([]string, 0, len(cfg.BackupNodeIDs))
+	seen := make(map[string]bool, len(cfg.BackupNodeIDs))
+	for _, raw := range cfg.BackupNodeIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		if existingNodes != nil && !existingNodes[id] {
+			continue
+		}
+		seen[id] = true
+		kept = append(kept, id)
+	}
+	cfg.BackupNodeIDs = kept
+}
+
+func validateFailoverSettings(cfg *FailoverSettings, s Store) error {
+	ensureDefaultBool(&cfg.AutoFailback, true)
+	if cfg.CheckIntervalSec == 0 {
+		cfg.CheckIntervalSec = defaultFailoverIntervalSec
+	}
+	if cfg.CheckIntervalSec < 10 || cfg.CheckIntervalSec > 3600 {
+		return fmt.Errorf("failover check interval must be between 10 and 3600 seconds")
+	}
+	if cfg.FailureThreshold == 0 {
+		cfg.FailureThreshold = defaultFailoverFailureThreshold
+	}
+	if cfg.FailureThreshold < 1 || cfg.FailureThreshold > 20 {
+		return fmt.Errorf("failover failure threshold must be between 1 and 20")
+	}
+	if cfg.RecoveryThreshold == 0 {
+		cfg.RecoveryThreshold = defaultFailoverRecoveryThreshold
+	}
+	if cfg.RecoveryThreshold < 1 || cfg.RecoveryThreshold > 20 {
+		return fmt.Errorf("failover recovery threshold must be between 1 and 20")
+	}
+	cfg.TestURL = strings.TrimSpace(cfg.TestURL)
+	if cfg.TestURL == "" {
+		cfg.TestURL = defaultFailoverTestURL
+	}
+	u, err := url.Parse(cfg.TestURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("failover test url must be a valid http or https url")
+	}
+	existing := make(map[string]bool, len(s.Nodes))
+	enabled := make(map[string]bool, len(s.Nodes))
+	for _, node := range s.Nodes {
+		existing[node.ID] = true
+		if node.Enabled {
+			enabled[node.ID] = true
+		}
+	}
+	cleaned := make([]string, 0, len(cfg.BackupNodeIDs))
+	seen := make(map[string]bool, len(cfg.BackupNodeIDs))
+	enabledBackups := 0
+	for _, raw := range cfg.BackupNodeIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		if id == "direct" || id == "block" || id == failoverOutboundTag || !existing[id] {
+			return fmt.Errorf("backup node does not exist: %s", id)
+		}
+		seen[id] = true
+		cleaned = append(cleaned, id)
+		if enabled[id] {
+			enabledBackups++
+		}
+	}
+	cfg.BackupNodeIDs = cleaned
+	if cfg.Enabled && enabledBackups == 0 {
+		return fmt.Errorf("failover requires at least one enabled backup node")
 	}
 	return nil
 }

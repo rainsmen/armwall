@@ -68,7 +68,7 @@ func apiStrategy(w http.ResponseWriter, r *http.Request, s Store) {
 	if creating {
 		group.ID = fmt.Sprintf("strategy-%d", time.Now().UnixNano())
 	}
-	if group.ID == "direct" || group.ID == "block" {
+	if group.ID == "direct" || group.ID == "block" || group.ID == failoverOutboundTag {
 		http.Error(w, "reserved strategy id", 400)
 		return
 	}

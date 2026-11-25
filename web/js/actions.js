@@ -9,6 +9,9 @@ const unlockedActions = new Set([
   "run-diagnostics",
   "sort-nodes-delay",
   "select-core",
+  "add-failover-backup",
+  "move-failover-backup",
+  "remove-failover-backup",
 ]);
 
 async function handleAction(button) {
@@ -191,6 +194,38 @@ async function handleAction(button) {
       });
       toast("运行节点已切换");
       await loadState(false);
+    } else if (action === "add-failover-backup") {
+      const idToAdd = $("failoverBackupAdd").value;
+      if (!idToAdd) throw new Error("没有可添加的备用节点");
+      if (!failoverDraftBackups.includes(idToAdd)) {
+        failoverDraftBackups.push(idToAdd);
+        renderFailoverBackupList();
+      }
+    } else if (action === "move-failover-backup") {
+      const from = failoverDraftBackups.indexOf(id);
+      const to = from + Number(direction);
+      if (from < 0 || to < 0 || to >= failoverDraftBackups.length) return;
+      [failoverDraftBackups[from], failoverDraftBackups[to]] = [
+        failoverDraftBackups[to],
+        failoverDraftBackups[from],
+      ];
+      renderFailoverBackupList();
+    } else if (action === "remove-failover-backup") {
+      failoverDraftBackups = failoverDraftBackups.filter((item) => item !== id);
+      renderFailoverBackupList();
+    } else if (action === "failover-check") {
+      button.textContent = "探测中...";
+      failoverRuntime = await request("/api/failover/check", {
+        method: "POST",
+      });
+      renderFailoverStatus();
+      toast("故障转移探测已完成");
+    } else if (action === "failover-failback") {
+      failoverRuntime = await request("/api/failover/failback", {
+        method: "POST",
+      });
+      renderFailoverStatus();
+      toast("已切回原主节点");
     } else if (action === "save-port") {
       await request("/api/settings", {
         method: "POST",

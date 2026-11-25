@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>ArmWall</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=20261104-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20261125-1" />
   </head>
   <body>
     <header class="topbar">
@@ -68,11 +68,135 @@
                 </button>
               </div>
             </div>
+            <div id="failoverBanner" class="failover-banner" hidden></div>
             <div class="section-head">
               <h2>网络测试</h2>
               <span class="muted">通过当前代理测量访问延迟</span>
             </div>
             <div class="site-grid" id="siteGrid"></div>
+          </article>
+          <article class="panel" id="failoverPanel">
+            <div class="panel-head">
+              <div>
+                <h2>
+                  自动故障转移
+                  <span id="failoverBadge" class="pill">未启用</span>
+                </h2>
+                <p class="muted">
+                  定时对在用节点执行 URLTest，连续失效后按顺序热切至备用节点
+                </p>
+              </div>
+              <div class="toolbar">
+                <button
+                  class="btn secondary"
+                  type="button"
+                  data-action="failover-check"
+                >
+                  立即探测
+                </button>
+                <button
+                  id="failoverFailbackBtn"
+                  class="btn secondary"
+                  type="button"
+                  data-action="failover-failback"
+                  hidden
+                >
+                  切回主节点
+                </button>
+              </div>
+            </div>
+            <div id="failoverSummary" class="failover-summary muted">
+              未启用自动故障转移
+            </div>
+            <form id="failoverForm">
+              <div class="form-grid">
+                <label class="check-label">
+                  <input id="failoverEnabled" type="checkbox" />启用自动故障转移
+                </label>
+                <label class="check-label">
+                  <input
+                    id="failoverAutoFailback"
+                    type="checkbox"
+                    checked
+                  />原主节点恢复后自动切回
+                </label>
+                <label>
+                  探测间隔（秒）
+                  <input
+                    id="failoverInterval"
+                    type="number"
+                    min="10"
+                    max="3600"
+                    value="30"
+                    required
+                  />
+                </label>
+                <label>
+                  连续失败切换次数
+                  <input
+                    id="failoverFailureThreshold"
+                    type="number"
+                    min="1"
+                    max="20"
+                    value="3"
+                    required
+                  />
+                </label>
+                <label>
+                  主节点恢复确认次数
+                  <input
+                    id="failoverRecoveryThreshold"
+                    type="number"
+                    min="1"
+                    max="20"
+                    value="2"
+                    required
+                  />
+                </label>
+                <label class="span-2">
+                  URLTest 地址
+                  <input
+                    id="failoverTestURL"
+                    type="url"
+                    value="https://www.gstatic.com/generate_204"
+                    required
+                  />
+                </label>
+              </div>
+              <div class="failover-backups-block">
+                <div class="section-head compact-head">
+                  <div>
+                    <h3>备用节点顺序</h3>
+                    <span class="muted"
+                      >主节点失效时依次探测备用 1、备用 2……，切至首个可用节点</span
+                    >
+                  </div>
+                  <div class="inline">
+                    <select id="failoverBackupAdd"></select>
+                    <button
+                      class="btn secondary"
+                      type="button"
+                      data-action="add-failover-backup"
+                    >
+                      添加备用节点
+                    </button>
+                  </div>
+                </div>
+                <div id="failoverBackupList" class="failover-backups"></div>
+              </div>
+              <p class="hint">
+                说明：仅当「分流与 DNS → TCP 默认出站」为「当前运行节点」时生效；切换通过本地 Clash API 热切，不重启 sing-box。若主备混用 NaiveProxy 与支持 UDP 的节点，请留意 UDP 出站配置。
+              </p>
+              <div class="form-actions">
+                <button class="btn primary" type="submit">
+                  保存故障转移设置
+                </button>
+              </div>
+            </form>
+            <div id="failoverEventsWrap" class="failover-events-wrap" hidden>
+              <h3>最近切换记录</h3>
+              <ul id="failoverEvents" class="failover-events"></ul>
+            </div>
           </article>
           <article class="panel">
             <div class="panel-head">
@@ -126,7 +250,7 @@
               </select>
             </div>
             <div class="toolbar">
-              <button class="btn secondary" data-action="batch-test" data-method="ping" title="对选中节点（未选则为全部）测试 Ping 延迟">批量 Ping</button>
+              <button class="btn secondary" data-action="batch-test" data-method="ping" title="对选中节点（未选则为全部）测试 Ping 平均延迟；注意境外节点可能由上游路由器代答，建议优先用 TCP 或 URLTest">批量 Ping</button>
               <button class="btn secondary" data-action="batch-test" data-method="tcp" title="对选中节点（未选则为全部）测试 TCP 握手延迟">批量 TCP</button>
               <button class="btn secondary" data-action="batch-test" data-method="urltest" title="对选中节点（未选则为全部）测试经由节点访问目标站点的实际网络延迟">批量 URLTest</button>
               <button class="btn secondary" id="nodeSortButton" data-action="sort-nodes-delay" title="依次切换：低→高、高→低、保存的顺序；只改变显示，不保存">按延迟排序</button>
@@ -829,12 +953,12 @@
       </main>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/js/core.js?v=20261104-1" defer></script>
-    <script src="/static/js/render.js?v=20261104-1" defer></script>
-    <script src="/static/js/editors.js?v=20261104-1" defer></script>
-    <script src="/static/js/operations.js?v=20261104-1" defer></script>
-    <script src="/static/js/drag.js?v=20261104-1" defer></script>
-    <script src="/static/js/actions.js?v=20261104-1" defer></script>
-    <script src="/static/js/main.js?v=20261104-1" defer></script>
+    <script src="/static/js/core.js?v=20261125-1" defer></script>
+    <script src="/static/js/render.js?v=20261125-1" defer></script>
+    <script src="/static/js/editors.js?v=20261125-1" defer></script>
+    <script src="/static/js/operations.js?v=20261125-1" defer></script>
+    <script src="/static/js/drag.js?v=20261125-1" defer></script>
+    <script src="/static/js/actions.js?v=20261125-1" defer></script>
+    <script src="/static/js/main.js?v=20261125-1" defer></script>
   </body>
 </html>

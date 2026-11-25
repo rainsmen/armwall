@@ -54,6 +54,7 @@ $("strategyMembers").addEventListener("change", () =>
   refreshStrategySelected(),
 );
 $("aclForm").addEventListener("submit", saveACL);
+$("failoverForm").addEventListener("submit", saveFailover);
 $("tokenForm").addEventListener("submit", changeToken);
 $("dnsMode").addEventListener("change", updateDNSFields);
 $("coreUploadFile").addEventListener("change", async (event) => {

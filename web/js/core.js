@@ -9,6 +9,8 @@ try {
 let appState = { nodes: [], subscriptions: [] };
 const nodeTests = new Map();
 const strategyRuntime = new Map();
+let failoverRuntime = null;
+let failoverDraftBackups = [];
 let selectedCore = "sing-box";
 let toastTimer;
 let refreshTimer;
@@ -238,7 +240,10 @@ async function loadState(showErrors = true) {
     renderState();
     $("connectionText").textContent = "已连接";
     document.querySelector(".top-status").classList.add("ready");
-    await refreshServiceStatus(false);
+    await Promise.all([
+      refreshServiceStatus(false),
+      loadFailoverStatus(true),
+    ]);
   } catch (error) {
     if (!(error instanceof AuthError))
       $("connectionText").textContent = "连接失败";

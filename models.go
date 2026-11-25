@@ -100,6 +100,16 @@ type RuleUpdateSetting struct {
 	LastUpdated time.Time `json:"last_updated"`
 }
 
+type FailoverSettings struct {
+	Enabled           bool     `json:"enabled"`
+	BackupNodeIDs     []string `json:"backup_node_ids"`
+	CheckIntervalSec  int      `json:"check_interval_sec"`
+	FailureThreshold  int      `json:"failure_threshold"`
+	RecoveryThreshold int      `json:"recovery_threshold"`
+	AutoFailback      *bool    `json:"auto_failback,omitempty"`
+	TestURL           string   `json:"test_url"`
+}
+
 type Store struct {
 	Revision         int64                        `json:"revision,omitempty"`
 	SchemaVersion    int                          `json:"schema_version,omitempty"`
@@ -123,5 +133,6 @@ type Store struct {
 	// ForceProxyDomains lists extra domains (bare names, matched as suffixes)
 	// that must always be proxied before the China-direct rules. Built-in
 	// defaults cover the Google Play / Google APIs download hosts.
-	ForceProxyDomains []string `json:"force_proxy_domains,omitempty"`
+	ForceProxyDomains []string         `json:"force_proxy_domains,omitempty"`
+	Failover          FailoverSettings `json:"failover"`
 }

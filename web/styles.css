@@ -506,6 +506,10 @@ td .row-actions {
   background: #e3f5e9;
   color: #19733d;
 }
+.pill.yellow {
+  background: #fef5e2;
+  color: #9a6510;
+}
 .pill.red {
   background: #fbe9e9;
   color: #a43f3f;
@@ -938,4 +942,98 @@ th.delay {
   border-radius: 6px;
   padding: 12px;
   margin: 0;
+}
+.failover-banner {
+  margin-top: 12px;
+  padding: 10px 13px;
+  border-radius: 6px;
+  border: 1px solid #f0d7a3;
+  background: #fef9ec;
+  color: #7c510a;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.failover-banner.danger {
+  border-color: #eababa;
+  background: #fdf0f0;
+  color: #962f2f;
+}
+.failover-summary {
+  margin-top: 10px;
+  padding: 9px 12px;
+  border-radius: 5px;
+  background: #f7f9fc;
+  border: 1px solid #e2e8f0;
+  font-size: 13px;
+  color: #36475f;
+}
+.failover-backups-block {
+  margin-top: 16px;
+}
+.section-head.compact-head {
+  margin-top: 0;
+  margin-bottom: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.section-head.compact-head h3 {
+  margin: 0 0 2px;
+  font-size: 14px;
+  color: #1e2d43;
+}
+.failover-backups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.failover-backup-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid #e0e6ee;
+  border-radius: 6px;
+  background: #fbfcfe;
+}
+.failover-backup-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.failover-events-wrap {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #e6ebf2;
+}
+.failover-events-wrap h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: #1e2d43;
+}
+.failover-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+.failover-events li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: #34455c;
+}
+.failover-event-time {
+  color: #718096;
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }

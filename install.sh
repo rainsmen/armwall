@@ -97,7 +97,8 @@ resolve_web_settings(){
 }
 
 install -d -m 0750 /etc/armwall /var/lib/armwall /var/lib/armwall/backups/config /var/lib/armwall/uploads /var/lib/armwall/rules /var/log/armwall
-install -d -m 0755 /etc/logrotate.d
+install -d -m 0755 /etc/logrotate.d /etc/tmpfiles.d
+printf 'd /var/log/armwall 0750 root root -\n' > /etc/tmpfiles.d/armwall.conf
 install -m 0755 "$ARMWALL_BINARY" /usr/local/bin/armwall
 /usr/local/bin/armwall --version
 install -m 0755 "$SRC_DIR/gateway.sh" /usr/local/bin/armwall-gateway
@@ -144,7 +145,7 @@ if ! command -v sing-box >/dev/null 2>&1; then
   if [ "$ARMWALL_ARCH" = armv6 ]; then
     echo "sing-box has no official ARMv6 release; upload a compatible binary in the Web UI" >&2
   else
-    /usr/local/bin/armwall-update-core sing-box latest || echo "sing-box installation failed; retry from the Web UI" >&2
+    ARMWALL_PROXY_PORT=${ARMWALL_PROXY_PORT:-11080} /usr/local/bin/armwall-update-core sing-box latest || echo "sing-box installation failed; retry from the Web UI" >&2
   fi
 fi
 ARMWALL_CHECK_WEB_ACCESS=$(env_value ARMWALL_WEB_ACCESS)

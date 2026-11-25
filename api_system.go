@@ -191,6 +191,7 @@ func apiServiceStart(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	defaultFailover.notify()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("active\n"))
 }
@@ -216,6 +217,7 @@ func apiServiceStop(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, strings.TrimSpace(string(out)), 500)
 		return
 	}
+	defaultFailover.notify()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("inactive\n"))
 }

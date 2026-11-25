@@ -84,6 +84,7 @@ func normalizeStore(s *Store) {
 			s.ACLRules[i].Enabled = false
 		}
 	}
+	normalizeFailoverSettings(&s.Failover, existingNodes)
 	if selectedOK {
 		return
 	}

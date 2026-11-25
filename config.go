@@ -193,20 +193,26 @@ func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+const failoverOutboundTag = "failover-auto"
+
 // defaultForceProxyDomainSuffixes covers the Google Play / Google APIs
 // download and check-in hosts. Several of them (www.gstatic.com,
-// android.clients.google.com) are listed in geosite-cn, so without this
-// override a domain-based China bypass would dial them directly and black-hole
-// Google Play downloads on a censored uplink.
+// services.googleapis.cn, connectivitycheck.gstatic.com,
+// *.xn--ngstr-lra8j.com) are listed in geosite-cn, so without this override
+// a domain-based China bypass would dial them directly and black-hole Google
+// Play downloads on a censored uplink.
 var defaultForceProxyDomainSuffixes = []string{
 	"googleapis.com",
+	"googleapis.cn",
 	"clients.google.com",
 	"gvt1.com",
 	"gvt2.com",
 	"dl.google.com",
 	"www.gstatic.com",
+	"connectivitycheck.gstatic.com",
 	"redirector.gvt1.com",
 	"redirector.c.play.google.com",
+	"xn--ngstr-lra8j.com",
 }
 
 func forceProxyDomainSuffixes(s Store) []string {
@@ -223,12 +229,123 @@ func forceProxyDomainSuffixes(s Store) []string {
 	return suffixes
 }
 
+// proxyNodeBypassTargets returns sorted unique public IP CIDRs and hostnames
+// belonging to enabled proxy nodes so inbound traffic to the proxy servers
+// themselves bypasses the proxy and cannot form a forwarding loop. For SNI
+// (ServerName), only NaiveProxy relay nodes are included because NaiveProxy
+// always verifies certificates (so ServerName is the proxy's own origin
+// domain), whereas Reality / insecure subscription nodes often spoof
+// third-party public sites in ServerName.
+func proxyNodeBypassTargets(s Store) (domains []string, cidrs []string) {
+	seenDomains := map[string]bool{}
+	seenCIDRs := map[string]bool{}
+	addDomain := func(raw string) {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+		if host == "" || !isDNSHostname(host) || seenDomains[host] {
+			return
+		}
+		seenDomains[host] = true
+		domains = append(domains, host)
+	}
+	for _, n := range s.Nodes {
+		if !n.Enabled {
+			continue
+		}
+		server := strings.TrimSpace(n.Server)
+		if ip := net.ParseIP(server); ip != nil {
+			if !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsUnspecified() {
+				cidr := ip.String() + "/128"
+				if v4 := ip.To4(); v4 != nil {
+					cidr = v4.String() + "/32"
+				}
+				if !seenCIDRs[cidr] {
+					seenCIDRs[cidr] = true
+					cidrs = append(cidrs, cidr)
+				}
+			}
+		} else {
+			addDomain(server)
+		}
+		if n.Type == "naive" {
+			addDomain(n.ServerName)
+		}
+	}
+	sort.Strings(domains)
+	sort.Strings(cidrs)
+	return domains, cidrs
+}
+
+// resolvePrimaryNode returns the currently selected enabled node, falling back
+// to the first enabled node, or "" when no nodes are enabled.
+func resolvePrimaryNode(s Store) string {
+	if s.SelectedNode != "" {
+		for _, n := range s.Nodes {
+			if n.ID == s.SelectedNode && n.Enabled {
+				return n.ID
+			}
+		}
+	}
+	for _, n := range s.Nodes {
+		if n.Enabled {
+			return n.ID
+		}
+	}
+	return ""
+}
+
+// failoverChain returns the ordered failover chain [primary, backup1, backup2, ...]
+// when global failover is enabled, TCPOutbound follows the active node, and at
+// least one distinct enabled backup node is available.
+func failoverChain(s Store) []string {
+	if !s.Failover.Enabled {
+		return nil
+	}
+	if s.TCPOutbound != "" && s.TCPOutbound != "same" {
+		return nil
+	}
+	primary := resolvePrimaryNode(s)
+	if primary == "" {
+		return nil
+	}
+	enabled := make(map[string]bool, len(s.Nodes))
+	for _, n := range s.Nodes {
+		if n.Enabled {
+			enabled[n.ID] = true
+		}
+	}
+	chain := []string{primary}
+	seen := map[string]bool{primary: true}
+	for _, raw := range s.Failover.BackupNodeIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] || !enabled[id] {
+			continue
+		}
+		seen[id] = true
+		chain = append(chain, id)
+	}
+	if len(chain) < 2 {
+		return nil
+	}
+	return chain
+}
+
 // udpOutboundCannotRelay reports whether an outbound can never carry UDP
 // datagrams: naive nodes are exposed through a local SOCKS bridge that rejects
 // UDP ASSOCIATE, so QUIC would be black-holed instead of failing fast.
 func udpOutboundCannotRelay(s Store, tag string) bool {
 	if tag == "" || tag == "direct" || tag == "block" {
 		return false
+	}
+	if tag == failoverOutboundTag {
+		chain := failoverChain(s)
+		for _, id := range chain {
+			for _, n := range s.Nodes {
+				if n.ID == id && n.Enabled && n.Type != "naive" {
+					return false
+				}
+			}
+		}
+		return len(chain) > 0
 	}
 	for _, n := range s.Nodes {
 		if n.ID == tag {
@@ -270,29 +387,23 @@ func effectiveDNS(s Store) (remote, direct, sni, strategy string) {
 }
 
 // resolveOutbounds mirrors the outbound selection used by config(): the TCP
-// outbound falls back to the selected (or first enabled) node, and the UDP
-// outbound falls back to the TCP outbound.
+// outbound falls back to the managed failover selector (when active) or the
+// selected (or first enabled) node, and the UDP outbound falls back to the TCP
+// outbound.
 func resolveOutbounds(s Store) (tcpOutbound, udpOutbound string) {
 	proxy := "direct"
-	for _, n := range s.Nodes {
-		if n.Enabled {
-			proxy = n.ID
-			break
-		}
-	}
-	if s.SelectedNode != "" {
-		for _, n := range s.Nodes {
-			if n.ID == s.SelectedNode && n.Enabled {
-				proxy = n.ID
-				break
-			}
-		}
+	if primary := resolvePrimaryNode(s); primary != "" {
+		proxy = primary
 	}
 	valid := map[string]bool{"direct": true}
 	for _, n := range s.Nodes {
 		if n.Enabled {
 			valid[n.ID] = true
 		}
+	}
+	if len(failoverChain(s)) >= 2 {
+		proxy = failoverOutboundTag
+		valid[failoverOutboundTag] = true
 	}
 	for _, group := range s.StrategyGroups {
 		if group.ID == "" || group.Name == "" || (group.Type != "selector" && group.Type != "urltest") {
@@ -396,11 +507,14 @@ func config(s Store) map[string]any {
 			continue
 		}
 		nodeTags[n.ID] = true
+		// Proxy outbounds resolve their own upstream server hostname via
+		// direct-dns so dialing a backup node cannot deadlock on remote-dns
+		// (which detours through the proxy itself) when the primary node fails.
 		if n.Type == "naive" {
-			outs = append(outs, map[string]any{"type": "socks", "tag": n.ID, "server": "127.0.0.1", "server_port": naivePorts[n.ID], "domain_resolver": "remote-dns"})
+			outs = append(outs, map[string]any{"type": "socks", "tag": n.ID, "server": "127.0.0.1", "server_port": naivePorts[n.ID], "domain_resolver": "direct-dns"})
 			continue
 		}
-		o := map[string]any{"type": n.Type, "tag": n.ID, "server": n.Server, "server_port": n.Port, "domain_resolver": "remote-dns"}
+		o := map[string]any{"type": n.Type, "tag": n.ID, "server": n.Server, "server_port": n.Port, "domain_resolver": "direct-dns"}
 		if n.UUID != "" {
 			o["uuid"] = n.UUID
 		}
@@ -525,6 +639,14 @@ func config(s Store) map[string]any {
 		}
 		outs = append(outs, o)
 	}
+	if chain := failoverChain(s); len(chain) >= 2 {
+		outs = append(outs, map[string]any{
+			"type":      "selector",
+			"tag":       failoverOutboundTag,
+			"outbounds": chain,
+			"default":   chain[0],
+		})
+	}
 	tcpOutbound, udpOutbound := resolveOutbounds(s)
 	proxy := tcpOutbound
 	rules := []any{}
@@ -535,11 +657,17 @@ func config(s Store) map[string]any {
 	if s.DNS.Enabled && s.DNS.Hijack {
 		// Plaintext DNS from clients is hijacked so that they cannot bypass the
 		// configured resolver, but queries addressed to a well-known public
-		// resolver are forwarded. An upstream gateway (an OpenWrt router running
-		// passwall, for instance) sends its own upstream queries through this
-		// proxy, and silently answering them from here replaces its resolver and
-		// changes the answers for every client behind it.
-		rules = append(rules, map[string]any{"protocol": "dns", "ip_cidr": publicResolverCIDRs, "invert": true, "action": "hijack-dns"})
+		// resolver are forwarded. Use a logical AND rule so only ip_cidr is
+		// inverted; a top-level invert would match every non-DNS connection.
+		rules = append(rules, map[string]any{
+			"type": "logical",
+			"mode": "and",
+			"rules": []any{
+				map[string]any{"protocol": "dns"},
+				map[string]any{"ip_cidr": publicResolverCIDRs, "invert": true},
+			},
+			"action": "hijack-dns",
+		})
 	}
 	for _, acl := range s.ACLRules {
 		if !acl.Enabled {
@@ -568,6 +696,13 @@ func config(s Store) map[string]any {
 		rules = append(rules, map[string]any{"inbound": []string{binding.Tag}, "outbound": binding.Outbound})
 	}
 	rules = append(rules, map[string]any{"ip_is_private": true, "outbound": "direct"})
+	nodeDomains, nodeCIDRs := proxyNodeBypassTargets(s)
+	if len(nodeDomains) > 0 {
+		rules = append(rules, map[string]any{"domain": nodeDomains, "outbound": "direct"})
+	}
+	if len(nodeCIDRs) > 0 {
+		rules = append(rules, map[string]any{"ip_cidr": nodeCIDRs, "outbound": "direct"})
+	}
 	ruleSets := []any{}
 	ruleSetTags := map[string]bool{}
 	addRuleSet := func(tag string) {
@@ -667,6 +802,9 @@ func config(s Store) map[string]any {
 	remoteDNS["domain_resolver"] = "direct-dns"
 	dnsServers := []any{remoteDNS, dnsServerConfig("direct-dns", directServer, "", "")}
 	dnsRules := []any{}
+	if len(nodeDomains) > 0 {
+		dnsRules = append(dnsRules, map[string]any{"domain": nodeDomains, "action": "route", "server": "direct-dns"})
+	}
 	if suffixes := forceProxyDomainSuffixes(s); len(suffixes) > 0 {
 		// Domains that are forced through the proxy must also be resolved by the
 		// remote resolver. Several of them are listed in geosite-cn

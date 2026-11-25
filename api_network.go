@@ -106,6 +106,7 @@ func apiAclToggle(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	defaultFailover.notify()
 	json.NewEncoder(w).Encode(s)
 }
 
@@ -135,6 +136,7 @@ func apiAclDelete(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	defaultFailover.notify()
 	json.NewEncoder(w).Encode(s)
 }
 
@@ -209,6 +211,7 @@ func apiRouting(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	defaultFailover.notify()
 	json.NewEncoder(w).Encode(s)
 }
 
@@ -231,6 +234,7 @@ func apiMode(w http.ResponseWriter, r *http.Request, s Store) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	defaultFailover.notify()
 	json.NewEncoder(w).Encode(s)
 }
 

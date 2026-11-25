@@ -147,6 +147,8 @@ function startAutoRefresh() {
     refreshInProgress = true;
     try {
       const tasks = [refreshServiceStatus(false, true)];
+      if (appState.failover?.enabled || activeViewID() === "dashboard")
+        tasks.push(loadFailoverStatus(true));
       if ((appState.strategy_groups || []).length)
         tasks.push(loadStrategyStatus(true));
       if (activeViewID() === "logs") tasks.push(refreshLogs(true));

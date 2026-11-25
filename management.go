@@ -111,7 +111,7 @@ func validateImportedStore(s *Store) error {
 	clearNaiveInsecure(s.Nodes)
 	for i := range s.Nodes {
 		node := &s.Nodes[i]
-		if node.ID == "" || node.ID == "direct" || node.ID == "block" || seenNodes[node.ID] {
+		if node.ID == "" || node.ID == "direct" || node.ID == "block" || node.ID == failoverOutboundTag || seenNodes[node.ID] {
 			return fmt.Errorf("invalid or duplicate node id")
 		}
 		if err := validateNode(node); err != nil {
@@ -142,7 +142,7 @@ func validateImportedStore(s *Store) error {
 	seenGroups := map[string]bool{}
 	for i := range s.StrategyGroups {
 		group := &s.StrategyGroups[i]
-		if group.ID == "" || group.ID == "direct" || group.ID == "block" || seenNodes[group.ID] || seenGroups[group.ID] {
+		if group.ID == "" || group.ID == "direct" || group.ID == "block" || group.ID == failoverOutboundTag || seenNodes[group.ID] || seenGroups[group.ID] {
 			return fmt.Errorf("invalid or duplicate strategy id")
 		}
 		if err := validateStrategyGroup(group, *s); err != nil {
@@ -159,6 +159,9 @@ func validateImportedStore(s *Store) error {
 		}
 	}
 	if err := validateDNSSettings(&s.DNS); err != nil {
+		return err
+	}
+	if err := validateFailoverSettings(&s.Failover, *s); err != nil {
 		return err
 	}
 	normalizeStore(s)

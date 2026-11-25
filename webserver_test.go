@@ -211,3 +211,31 @@ func TestHTTPServerRoutesTokenChange(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestStaticDirectoryListingBlockedAndHTTPSRedirectEnforced(t *testing.T) {
+	webConfig := webAccessConfig{
+		Mode:            "local",
+		ListenAddress:   "127.0.0.1:0",
+		AllowedPrefixes: mustWebPrefixes(t, "127.0.0.0/8,::1/128"),
+	}
+	server, err := newHTTPServer(webConfig, "0123456789abcdef", webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/static/web/js/", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	server.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("directory listing must return 404, got %d", rec.Code)
+	}
+
+	httpRedirectReq := httptest.NewRequest(http.MethodGet, "http://example.com/file", nil)
+	if err := enforceHTTPSRedirect(httpRedirectReq, nil); err == nil {
+		t.Fatal("expected HTTP redirect to be rejected")
+	}
+	httpsRedirectReq := httptest.NewRequest(http.MethodGet, "https://example.com/file", nil)
+	if err := enforceHTTPSRedirect(httpsRedirectReq, nil); err != nil {
+		t.Fatalf("expected HTTPS redirect to be allowed, got %v", err)
+	}
+}
