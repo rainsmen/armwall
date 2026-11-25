@@ -2,7 +2,7 @@
 
 All notable changes to ArmWall will be documented in this file.
 
-## [Unreleased]
+## [0.8.0] - 2026-11-25
 
 ### Added
 - **Background automatic failover with ordered backups and optional auto-failback** (`POST /api/failover`, `GET /api/failover/status`, `POST /api/failover/check`, `POST /api/failover/failback`, Dashboard「自动故障转移」面板): periodically probes the active node via Clash API URLTest, hot-switches zero-downtime through a managed `failover-auto` selector (`Primary -> Backup 1 -> Backup 2 -> ...`) after consecutive failures, skips unreachable backups, keeps probing the original primary node when `auto_failback` is enabled, and smoothly switches back after consecutive recovery successes.

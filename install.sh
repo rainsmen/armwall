@@ -145,7 +145,7 @@ if ! command -v sing-box >/dev/null 2>&1; then
   if [ "$ARMWALL_ARCH" = armv6 ]; then
     echo "sing-box has no official ARMv6 release; upload a compatible binary in the Web UI" >&2
   else
-    ARMWALL_PROXY_PORT=${ARMWALL_PROXY_PORT:-11080} /usr/local/bin/armwall-update-core sing-box latest || echo "sing-box installation failed; retry from the Web UI" >&2
+    ARMWALL_PROXY_PORT="${ARMWALL_PROXY_PORT:-11080}" /usr/local/bin/armwall-update-core sing-box latest || echo "sing-box installation failed; retry from the Web UI" >&2
   fi
 fi
 ARMWALL_CHECK_WEB_ACCESS=$(env_value ARMWALL_WEB_ACCESS)
